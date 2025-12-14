@@ -50,6 +50,8 @@ _is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
+    import sgl_kernel_npu
+    from sgl_kernel_npu.repack_int4 import repack_qweight_inplace_npu
 
 if _is_cuda:
     from sgl_kernel import (
@@ -606,7 +608,6 @@ class AWQLinearAscendMethod(AWQLinearMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
-        qweight_tmp = torch.zeros_like(layer.qweight.data)
         qzeros_tmp = layer.qzeros.data
         qzeros_list = []
         shifts = [0, 4, 1, 5, 2, 6, 3, 7]
@@ -614,18 +615,13 @@ class AWQLinearAscendMethod(AWQLinearMethod):
         for i in range(0, self.quant_config.pack_factor):
             shift_num = shifts[i] * 4
             qzeros_list.append((qzeros_tmp.reshape(-1, 1) >> shift_num) & 0xF)
-            qweight_tmp.bitwise_or_(
-                ((layer.qweight.data >> shift_num) * (2 ** (4 * i))) & (0xF << (4 * i))
-            )
-
-        qweight_tmp.bitwise_xor_(0x88888888)
 
         qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(qzeros_tmp.shape[0], -1)
         qzeros_tmp = -(qzeros_tmp - 8)
         qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
 
-        layer.qzeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
-        layer.qweight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
+        replace_parameter(layer, "qzeros", qzeros_tmp)
+        repack_qweight_inplace_npu(layer.qweight.data)
 
     def apply(
         self,
@@ -640,6 +636,15 @@ class AWQLinearAscendMethod(AWQLinearMethod):
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
+        # BS=1 Optimization using custom kernel
+        if reshaped_x.shape[0] == 1:
+            out = torch.ops.npu.gemv_w4a16(
+                reshaped_x.squeeze(0), qweight, scales, qzeros
+            )
+            if bias is not None:
+                out.add_(bias)
+            return out.reshape(out_shape)
+
         if bias is not None and bias.dtype == torch.bfloat16:
             bias = bias.float()
 
@@ -653,7 +658,6 @@ class AWQLinearAscendMethod(AWQLinearMethod):
         )
 
         return out.reshape(out_shape)
-
 
 class AWQMoEMethod(FusedMoEMethodBase):
 
@@ -870,11 +874,12 @@ class AWQMoEAscendMethod(AWQMoEMethod):
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        w13_qweight_tmp = torch.zeros_like(layer.w13_qweight.data)
-        w2_qweight_tmp = torch.zeros_like(layer.w2_qweight.data)
+        # === 1. 处理 qzeros (显存占用小，保持原有逻辑) ===
         w13_qzeros_list = []
         w2_qzeros_list = []
         shifts = [0, 4, 1, 5, 2, 6, 3, 7]
+        
+        # 提取 qzeros
         for i in range(0, self.quant_config.pack_factor):
             shift_num = shifts[i] * 4
             w13_qzeros_list.append(
@@ -883,41 +888,33 @@ class AWQMoEAscendMethod(AWQMoEMethod):
             w2_qzeros_list.append(
                 (layer.w2_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
             )
-            w13_qweight_tmp.bitwise_or_(
-                ((layer.w13_qweight.data >> shift_num) * (2 ** (4 * i)))
-                & (0xF << (4 * i))
-            )
-            w2_qweight_tmp.bitwise_or_(
-                ((layer.w2_qweight.data >> shift_num) * (2 ** (4 * i)))
-                & (0xF << (4 * i))
-            )
 
-        w13_qweight_tmp.bitwise_xor_(0x88888888)
-        w2_qweight_tmp.bitwise_xor_(0x88888888)
-
+        # 合并处理 w13_qzeros
         w13_qzeros_tmp = torch.cat(w13_qzeros_list, dim=-1).reshape(
             layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1
         )
         w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
         w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
+        # 合并处理 w2_qzeros
         w2_qzeros_tmp = torch.cat(w2_qzeros_list, dim=-1).reshape(
             layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1
         )
         w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
         w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
 
-        layer.register_parameter(
-            "w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w13_qweight", torch.nn.Parameter(w13_qweight_tmp, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w2_qzeros", torch.nn.Parameter(w2_qzeros_tmp, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w2_qweight", torch.nn.Parameter(w2_qweight_tmp, requires_grad=False)
-        )
+        # 替换 qzeros 参数
+        replace_parameter(layer, "w13_qzeros", w13_qzeros_tmp)
+        replace_parameter(layer, "w2_qzeros", w2_qzeros_tmp)
+
+        # === 2. 处理 qweight (显存占用大，使用分块原地替换) ===
+        repack_qweight_inplace_npu(layer.w13_qweight.data)
+        
+        # print("Repacking w2_qweight inplace...")
+        repack_qweight_inplace_npu(layer.w2_qweight.data)
+
+        # 清理一下显存碎片
+        torch.npu.empty_cache()
+
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -941,6 +938,22 @@ class AWQMoEAscendMethod(AWQMoEMethod):
         topk_weights, topk_ids, _ = topk_output
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
+
+        # # BS=1 Optimization using custom kernel
+        if x.shape[0] == 1:
+            output = torch.ops.npu.fused_moe_w4a16_bs1(
+                x,
+                layer.w13_qweight,
+                layer.w13_scales,
+                layer.w13_qzeros,
+                layer.w2_qweight,
+                layer.w2_scales,
+                layer.w2_qzeros,
+                topk_ids,
+                topk_weights.float(),
+            )
+            return StandardCombineInput(hidden_states=output)
+
         output = npu_fused_experts(
             hidden_states=x,
             w13=layer.w13_qweight,
