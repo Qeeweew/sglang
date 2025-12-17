@@ -937,11 +937,10 @@ class AWQMoEAscendMethod(AWQMoEMethod):
 
         topk_weights, topk_ids, _ = topk_output
         topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
 
         # # BS=1 Optimization using custom kernel
-        if x.shape[0] == 1:
-            output = torch.ops.npu.fused_moe_w4a16_bs1(
+        if x.shape[0] <= 8:
+            output = torch.ops.npu.fused_moe_w4a16_small_bs(
                 x,
                 layer.w13_qweight,
                 layer.w13_scales,
@@ -954,6 +953,7 @@ class AWQMoEAscendMethod(AWQMoEMethod):
             )
             return StandardCombineInput(hidden_states=output)
 
+        topk_weights = topk_weights.to(x.dtype)
         output = npu_fused_experts(
             hidden_states=x,
             w13=layer.w13_qweight,

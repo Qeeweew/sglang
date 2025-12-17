@@ -83,6 +83,7 @@ if _use_aiter:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 if _is_npu:
     import torch_npu
+    from sgl_kernel_npu.moe.gating_softmax import triton_moe_gating_topk_softmax 
 
 # -------------------------------- TopKConfig ---------------------------------------
 
@@ -336,20 +337,11 @@ class TopK(CustomOp):
         renormalize = self.topk_config.renormalize
 
         if not use_grouped_topk and not torch_native:
-            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k_softmax(
+            topk_weights, topk_ids, _ = triton_moe_gating_topk_softmax(
                 router_logits,
                 k=self.topk_config.top_k,
+                renormalize=renormalize
             )
-            topk_weights = topk_weights.to(torch.float32)
-
-            if renormalize:
-                topk_weights_sum = (
-                    topk_weights.sum(dim=-1, keepdim=True)
-                    if self.topk_config.num_fused_shared_experts == 0
-                    else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
-                )
-                topk_weights = topk_weights / topk_weights_sum
-
             if expert_location_dispatch_info is not None:
                 topk_ids = topk_ids_logical_to_physical(
                     topk_ids, expert_location_dispatch_info
