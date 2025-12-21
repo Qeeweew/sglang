@@ -370,9 +370,9 @@ class Qwen3MoeAttention(nn.Module):
                 k_by_head = self.k_norm(k_by_head)
             current_stream.wait_stream(self.alt_stream)
         else:
-            q_by_head = q.reshape(-1, self.head_dim)
+            q_by_head = q.reshape(-1, self.num_heads, self.head_dim)
             q_by_head = self.q_norm(q_by_head)
-            k_by_head = k.reshape(-1, self.head_dim)
+            k_by_head = k.reshape(-1, self.num_kv_heads, self.head_dim)
             k_by_head = self.k_norm(k_by_head)
         q = q_by_head.view(q.shape)
         k = k_by_head.view(k.shape)
