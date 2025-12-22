@@ -20,7 +20,6 @@ runtime_common = [
   "IPython",
   "aiohttp",
   "anthropic>=0.20.0",
-  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' and platform_machine == 'armv7l')",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
@@ -28,6 +27,7 @@ runtime_common = [
   "datasets",
   "einops",
   "fastapi",
+  "gguf",
   "hf_transfer",
   "huggingface_hub",
   "interegular",
@@ -63,7 +63,6 @@ runtime_common = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
-
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
@@ -85,7 +84,7 @@ srt_hip = [
   "wave-lang==3.8.2",
 ]
 
-# https://docs.sglang.ai/platforms/ascend_npu.html
+# https://docs.sglang.io/platforms/ascend_npu.html
 srt_npu = ["sglang[runtime_common]"]
 
 # For Intel Gaudi(device : hpu) follow the installation guide
@@ -94,7 +93,6 @@ srt_hpu = ["sglang[runtime_common]"]
 
 test = [
   "accelerate",
-  "bitsandbytes",
   "expecttest",
   "gguf",
   "jsonlines",

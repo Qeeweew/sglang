@@ -399,8 +399,8 @@ class AscendAttnBackend(AttentionBackend):
             self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
             // self.page_size
         )
-        metadata.block_tables[:bs, max_seq_pages:].fill_(0)
-        metadata.block_tables[bs:, :].fill_(0)
+        # metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+        # metadata.block_tables[bs:, :].fill_(0)
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
