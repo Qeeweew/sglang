@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 from sgl_kernel_npu.norm.l1_norm import l1_norm
+from sgl_kernel_npu.moe.gating_softmax import triton_moe_gating_topk_softmax 
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
@@ -25,18 +26,11 @@ def fused_topk_npu(
     correction_bias = topk_config.correction_bias
 
     if not use_grouped_topk:
-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
+        topk_weights, topk_ids, _ = triton_moe_gating_topk_softmax(
             router_logits,
-            k=topk_config.top_k,
+            topk_config.top_k,
+            renormalize
         )
-
-        if renormalize:
-            topk_weights = l1_norm(
-                topk_weights
-                if topk_config.num_fused_shared_experts == 0
-                else topk_weights[:, :-1]
-            )
-        topk_weights = topk_weights.to(torch.float32)
 
     elif use_grouped_topk and correction_bias is not None:
         routed_scaling_factor = topk_config.routed_scaling_factor or 1

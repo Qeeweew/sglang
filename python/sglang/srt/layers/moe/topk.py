@@ -91,9 +91,6 @@ if _use_aiter:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
-if _is_npu:
-    import torch_npu
-    from sgl_kernel_npu.moe.gating_softmax import triton_moe_gating_topk_softmax 
 
 # -------------------------------- TopKConfig ---------------------------------------
 
