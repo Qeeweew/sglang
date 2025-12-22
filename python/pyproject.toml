@@ -98,6 +98,7 @@ test = [
   "jsonlines",
   "matplotlib",
   "pandas",
+  "parameterized",
   "peft",
   "pytest",
   "sentence_transformers",
