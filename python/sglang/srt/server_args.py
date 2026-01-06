@@ -497,6 +497,10 @@ class ServerArgs:
     kt_num_gpu_experts: Optional[int] = None
     kt_max_deferred_experts_per_token: Optional[int] = None
 
+    # ARM offload
+    enable_arm_ep: bool = False
+    arm_ep_start_layer: int = 0
+
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
     dllm_algorithm_config: Optional[str] = None
@@ -3753,6 +3757,20 @@ class ServerArgs:
             type=int,
             default=ServerArgs.kt_max_deferred_experts_per_token,
             help="[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+        )
+
+        # Offload ARM
+        parser.add_argument(
+            "--enable-arm-ep",
+            action="store_true",
+            help="Enable offloading expert parallelism to ARM CPUs",
+        )
+
+        parser.add_argument(
+            "--arm-ep-start-layer",
+            type=int,
+            default=ServerArgs.arm_ep_start_layer,
+            help="The layer index to start offloading expert parallelism to ARM CPUs",
         )
 
         # Diffusion LLM

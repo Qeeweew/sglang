@@ -35,6 +35,9 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
 )
+
+from python.sglang.srt.layers.moe.arm_ep_wrapper import create_arm_ep_config_from_server_args, ArmEpWrapperMethod
+
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -238,6 +241,20 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
         server_args = get_global_server_args()
+
+        npu_ep_config = create_arm_ep_config_from_server_args(server_args, layer_id)
+        if npu_ep_config is not None and npu_ep_config.enabled:
+            if quant_config is not None:
+                # Create the base NPU method (e.g., Unquantized or specific NPU quant method)
+                # We will wrap this.
+                npu_method = quant_config.get_quant_method(self, prefix)
+            else:
+                # Default NPU method
+                npu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+         
+            # Wrap it
+            self.quant_method = ArmEpWrapperMethod(npu_method, npu_ep_config)
+
         kt_config = create_kt_config_from_server_args(server_args, layer_id)
         if kt_config is not None:
             if quant_config is not None:
