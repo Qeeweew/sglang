@@ -176,9 +176,6 @@ class ArmEpWrapperMethod(FusedMoEMethodBase):
         if w.device.type != "cpu":
             w = w.cpu()
 
-        # 转 float32 contiguous（quantize_and_store 常用 fp32 输入）
-        w = w.to(torch.float32).contiguous()
-
         if shard_id == "w1":
             self.moe_infer_handle.quantize_and_store_expert(expert_id, "gate_proj", w)
         elif shard_id == "w3":
