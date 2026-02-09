@@ -633,9 +633,9 @@ class AWQLinearAscendMethod(AWQLinearMethod):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qweight = layer.weight
+        qweight = layer.qweight
         scales = layer.scales
-        qzeros = layer.zeros
+        qzeros = layer.qzeros
         pack_factor = self.quant_config.pack_factor
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
