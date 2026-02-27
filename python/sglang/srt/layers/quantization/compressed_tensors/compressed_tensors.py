@@ -51,6 +51,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
     NPUCompressedTensorsW4A8Int8DynamicMoE,
+    NPUCompressedTensorsW4A16,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
@@ -547,12 +548,26 @@ class CompressedTensorsConfig(QuantizationConfig):
                 self.quant_format == CompressionFormat.pack_quantized.value
                 and weight_quant.num_bits in WNA16_SUPPORTED_BITS
             ):
-                return CompressedTensorsWNA16(
-                    num_bits=weight_quant.num_bits,
-                    strategy=weight_quant.strategy,
-                    group_size=weight_quant.group_size,
-                    actorder=weight_quant.actorder,
-                )
+                if _is_npu:
+                    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+                        NPUCompressedTensorsW4A16,
+                    )
+
+                    logger.info_once("Using NPUCompressedTensorsW4A16")
+                    return NPUCompressedTensorsW4A16(
+                        num_bits=weight_quant.num_bits,
+                        strategy=weight_quant.strategy,
+                        group_size=weight_quant.group_size,
+                        symmetric=weight_quant.symmetric,
+                        actorder=weight_quant.actorder,
+                    )
+                else:
+                    return CompressedTensorsWNA16(
+                        num_bits=weight_quant.num_bits,
+                        strategy=weight_quant.strategy,
+                        group_size=weight_quant.group_size,
+                        actorder=weight_quant.actorder,
+                    )
             else:
                 raise ImportError(
                     "Other method (CompressedTensorsW4A16Sparse24) is not supported now"

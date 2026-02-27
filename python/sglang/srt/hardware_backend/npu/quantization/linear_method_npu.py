@@ -18,6 +18,141 @@ class _NPULinearMethodBase(LinearMethodBase):
         self.quant_config = quant_config
 
 
+class NPUW4A16LinearMethod(_NPULinearMethodBase):
+    """Linear method for Ascend NPU W4A16 quantization.
+
+    Uses npu_weight_quant_batchmatmul for W4A16 computation.
+    Weight is packed int4 stored in int32 format.
+    """
+
+    def __init__(
+        self,
+        quant_config: Optional["QuantizationConfig"] = None,
+        group_size: int = 128,
+    ):
+        super().__init__(quant_config)
+        self.num_bits = 4
+        self.pack_factor = 8  # 32 // 4 = 8
+        self.group_size = group_size
+
+    def _unpack_from_int32(
+        self,
+        weight: torch.Tensor,
+        shape: torch.Size,
+        num_bits: int,
+        packed_dim: int = 1,
+    ) -> torch.Tensor:
+        """
+        Unpacks quantized weights from int32 format back to original bits.
+
+        :param weight: The packed int32 tensor containing quantized weights
+        :param shape: Original shape to restore
+        :param num_bits: The number of bits used for quantization (<= 8)
+        :param packed_dim: Dimension along which weights are packed (0 or 1)
+        :return: Unpacked tensor with int8 dtype after applying offset correction
+        """
+        assert weight.dtype == torch.int32, f"Expecting `weight.dtype` is torch.int32 but got {weight.dtype}."
+        assert num_bits <= 8, f"Expecting `num_bits` should not be larger than 8 but got {num_bits}."
+
+        pack_factor = 32 // num_bits
+        mask = (1 << num_bits) - 1
+
+        if packed_dim == 1:
+            unpacked_weight = torch.zeros(
+                (weight.shape[0], weight.shape[1] * pack_factor),
+                device=weight.device,
+                dtype=torch.int32,
+            )
+            for i in range(pack_factor):
+                unpacked_weight[:, i::pack_factor] = (weight >>
+                                                      (num_bits * i)) & mask
+            original_row_size = int(shape[1])
+            unpacked_weight = unpacked_weight[:, :original_row_size]
+        else:
+            unpacked_weight = torch.zeros(
+                (weight.shape[0] * pack_factor, weight.shape[1]),
+                device=weight.device,
+                dtype=torch.int32,
+            )
+            for i in range(pack_factor):
+                unpacked_weight[i::pack_factor, :] = (weight >>
+                                                      (num_bits * i)) & mask
+            original_row_size = int(shape[0])
+            unpacked_weight = unpacked_weight[:original_row_size, :]
+
+        offset = pow(2, num_bits) // 2
+        unpacked_weight = (unpacked_weight - offset).to(torch.int8)
+
+        return unpacked_weight
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Process weights after loading from checkpoint.
+
+        Convert from Marlin/compressed-tensors format to Ascend NPU format.
+        Uses npu_convert_weight_to_int4pack for efficient int4 packing.
+        Only symmetric quantization is supported.
+        """
+        # weight shape from checkpoint: [output_size, input_size // pack_factor]
+        # After loading, we need to transpose to [input_size, output_size] and repack
+
+        weight_shape = layer.weight_packed.data.shape
+        output_size = weight_shape[0]
+        packed_input_size = weight_shape[1]
+        input_size = packed_input_size * self.pack_factor
+
+        # Unpack from int32 to int8 (with int4 range)
+        unpacked_weight = self._unpack_from_int32(
+            layer.weight_packed.data,
+            torch.Size([output_size, input_size]),
+            self.num_bits,
+            packed_dim=1,
+        )
+
+        # Transpose: [output_size, input_size] -> [input_size, output_size]
+        unpacked_weight = unpacked_weight.transpose(0, 1).contiguous().int()
+
+        # Repack using NPU int4 packing
+        layer.weight_packed.data = torch.ops.npu.npu_convert_weight_to_int4pack(
+            unpacked_weight)
+
+        # Transpose scale from [output_size, num_groups] to [num_groups, output_size]
+        layer.weight_scale.data = layer.weight_scale.data.transpose(
+            0, 1).contiguous()
+
+        # For symmetric quantization, create zero offset (antiquant_offset must not be None)
+        # Create zeros_like weight_scale for antiquant_offset
+        layer.weight_offset = torch.nn.Parameter(
+            torch.zeros_like(layer.weight_scale.data),
+            requires_grad=False
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply W4A16 linear transformation.
+
+        Uses npu_weight_quant_batchmatmul for W4A16 computation.
+        The weight is already packed by process_weights_after_loading.
+        Only symmetric quantization is supported (weight_offset should be zeros).
+        """
+        # Use npu_weight_quant_batchmatmul with antiquant_group_size
+        # weight_packed is already in NPU int4pack format after process_weights_after_loading
+
+        # For symmetric quantization, weight_offset should be zeros (created in process_weights_after_loading)
+        output = torch.ops.npu.npu_weight_quant_batchmatmul(
+            x=x,
+            weight=layer.weight_packed,
+            antiquant_scale=layer.weight_scale,
+            antiquant_offset=layer.weight_offset,
+            antiquant_group_size=self.group_size,
+            bias=bias,
+        )
+        return output
+
+
 class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module):

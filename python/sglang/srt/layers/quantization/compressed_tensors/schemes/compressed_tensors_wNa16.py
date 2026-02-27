@@ -38,9 +38,10 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_npu
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 if _is_cuda:
     from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
@@ -50,7 +51,7 @@ ScalarType, scalar_types = get_scalar_types()
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CompressedTensorsWNA16"]
+__all__ = ["CompressedTensorsWNA16", "NPUCompressedTensorsW4A16"]
 WNA16_SUPPORTED_TYPES_MAP = {
     4: scalar_types.uint4b8,
     8: scalar_types.uint8b128
@@ -337,3 +338,169 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             is_k_full=self.is_k_full,
             bias=bias,
         )
+
+
+class NPUCompressedTensorsW4A16(CompressedTensorsLinearScheme):
+    """NPU-compatible W4A16 linear scheme using Ascend int4 operations.
+
+    This scheme converts weights from compressed-tensors format to Ascend NPU
+    int4pack format and uses npu_weight_quant_batchmatmul for computation.
+    """
+
+    def __init__(
+        self,
+        strategy: str,
+        num_bits: int,
+        group_size: Optional[int] = None,
+        symmetric: Optional[bool] = True,
+        actorder: Optional[ActivationOrdering] = None,
+    ):
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            NPUW4A16LinearMethod,
+        )
+
+        self.pack_factor = 32 // num_bits
+        self.strategy = strategy
+        self.symmetric = symmetric
+        self.group_size = -1 if group_size is None else group_size
+        self.has_g_idx = actorder == ActivationOrdering.GROUP
+
+        if self.group_size == -1 and self.strategy != "channel":
+            raise ValueError(
+                "NPU W4A16 kernels require group quantization or "
+                "channelwise quantization, but found no group "
+                "size and strategy is not channelwise."
+            )
+
+        if num_bits != 4:
+            raise ValueError(
+                f"NPUCompressedTensorsW4A16 only supports 4-bit quantization, "
+                f"but got {num_bits} bits."
+            )
+
+        if not self.symmetric:
+            raise ValueError(
+                "NPUCompressedTensorsW4A16 only supports symmetric quantization."
+            )
+
+        # Initialize the NPU kernel method
+        self.kernel = NPUW4A16LinearMethod(group_size=self.group_size)
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        # NPU doesn't use CUDA capability
+        return 0
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        output_size: int,
+        input_size: int,
+        output_partition_sizes: list[int],
+        input_size_per_partition: int,
+        params_dtype: torch.dtype,
+        weight_loader: Callable,
+        **kwargs,
+    ):
+        """Create weights for NPU W4A16 linear layer.
+
+        Weight is packed int4 stored in int32 format.
+        """
+        output_size_per_partition = sum(output_partition_sizes)
+
+        # If group_size is -1, we are in channelwise case
+        group_size = self.group_size if self.group_size != -1 else input_size
+
+        # For TP sharding, use input_size_per_partition to calculate scales
+        scales_and_zp_size = input_size_per_partition // group_size
+
+        # Weight packed in int32, shape: [output_size, input_size // pack_factor]
+        weight = PackedvLLMParameter(
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+            packed_factor=self.pack_factor,
+            packed_dim=1,
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition // self.pack_factor,
+                dtype=torch.int32,
+            ),
+        )
+
+        # Scale parameter
+        weight_scale_args = {
+            "weight_loader": weight_loader,
+            "data": torch.empty(
+                output_size_per_partition,
+                scales_and_zp_size,
+                dtype=params_dtype,
+            ),
+        }
+
+        if self.strategy == "channel":
+            weight_scale = ChannelQuantScaleParameter(
+                output_dim=0, **weight_scale_args
+            )
+        else:
+            weight_scale = GroupQuantScaleParameter(
+                output_dim=0, input_dim=1, **weight_scale_args
+            )
+
+        # Zero point for asymmetric quantization
+        if not self.symmetric:
+            zeros_args = {
+                "weight_loader": weight_loader,
+                "data": torch.zeros(
+                    output_size_per_partition,
+                    scales_and_zp_size,
+                    dtype=params_dtype,
+                ),
+            }
+            if self.strategy == "channel":
+                weight_zero_point = ChannelQuantScaleParameter(
+                    output_dim=0, **zeros_args
+                )
+            else:
+                weight_zero_point = GroupQuantScaleParameter(
+                    output_dim=0, input_dim=1, **zeros_args
+                )
+
+        # A 2D array defining the original shape of the weights before packing
+        weight_shape = BasevLLMParameter(
+            data=torch.empty(2, dtype=torch.int64),
+            weight_loader=weight_loader,
+        )
+
+        layer.register_parameter("weight_packed", weight)
+        layer.register_parameter("weight_scale", weight_scale)
+        layer.register_parameter("weight_shape", weight_shape)
+
+        if not self.symmetric:
+            layer.register_parameter("weight_zero_point", weight_zero_point)
+
+        # group index (for activation reordering)
+        if self.has_g_idx:
+            weight_g_idx = RowvLLMParameter(
+                data=torch.empty(
+                    input_size_per_partition,
+                    dtype=torch.int32,
+                ),
+                input_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight_g_idx", weight_g_idx)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Process weights after loading for NPU computation."""
+        # Delegate to the kernel's process_weights_after_loading method
+        self.kernel.process_weights_after_loading(layer)
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply W4A16 linear transformation using NPU ops."""
+        return self.kernel.apply(layer, x, bias)

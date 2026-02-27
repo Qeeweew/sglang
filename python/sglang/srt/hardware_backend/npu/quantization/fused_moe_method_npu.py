@@ -677,28 +677,28 @@ class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
         )
 
         # w = [n, k // 8]  --> [k, n // 8]
-        # w13_weight = layer.w13_weight.data.transpose(1, 2).contiguous()
-        # w2_weight = layer.w2_weight.data.transpose(1, 2).contiguous()
+        # w13_weight_packed = layer.w13_weight_packed.data.transpose(1, 2).contiguous()
+        # w2_weight_packed = layer.w2_weight_packed.data.transpose(1, 2).contiguous()
         unpacked_w13_weight = (
-            self._unpack_from_int32(layer.w13_weight.data.flatten(0, 1), 4)
-            .view(layer.w13_weight.data.shape[0], layer.w13_weight.data.shape[1], -1)
+            self._unpack_from_int32(layer.w13_weight_packed.data.flatten(0, 1), 4)
+            .view(layer.w13_weight_packed.data.shape[0], layer.w13_weight_packed.data.shape[1], -1)
             .transpose(1, 2)
             .contiguous()
             .int()
         )
         unpacked_w2_weight = (
-            self._unpack_from_int32(layer.w2_weight.data.flatten(0, 1), 4)
-            .view(layer.w2_weight.data.shape[0], layer.w2_weight.data.shape[1], -1)
+            self._unpack_from_int32(layer.w2_weight_packed.data.flatten(0, 1), 4)
+            .view(layer.w2_weight_packed.data.shape[0], layer.w2_weight_packed.data.shape[1], -1)
             .transpose(1, 2)
             .contiguous()
             .int()
         )
 
-        w13_weight = self._pack_to_int32(unpacked_w13_weight)
-        w2_weight = self._pack_to_int32(unpacked_w2_weight)
+        w13_weight_packed = self._pack_to_int32(unpacked_w13_weight)
+        w2_weight_packed = self._pack_to_int32(unpacked_w2_weight)
 
-        layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+        layer.w13_weight_packed = torch.nn.Parameter(w13_weight_packed, requires_grad=False)
+        layer.w2_weight_packed = torch.nn.Parameter(w2_weight_packed, requires_grad=False)
 
     def apply(
         self,
@@ -712,20 +712,37 @@ class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
         topk_weights, topk_ids, _ = topk_output
         topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
-        output = npu_fused_experts(
-            hidden_states=x,
-            w13=layer.w13_weight,
-            w13_scale=layer.w13_weight_scale,
-            w13_offset=layer.w13_weight_offset,
-            w2=layer.w2_weight,
-            w2_scale=layer.w2_weight_scale,
-            w2_offset=layer.w2_weight_offset,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=topk_ids.shape[1],
-            use_wna16=True,
-        )
+
+        # Calculate batch size for choosing optimized kernel
+        batch_size, _ = x.shape
+
+        # Use fused_moe_w4a16_small_bs for small batch size (<= 8)
+        if batch_size <= 8:
+            topk_weights = topk_weights.to(torch.float)
+            output = torch.ops.npu.fused_moe_w4a16_small_bs(
+                x,
+                layer.w13_weight_packed,
+                layer.w13_weight_scale,
+                layer.w2_weight_packed,
+                layer.w2_weight_scale,
+                topk_ids,
+                topk_weights,
+            )
+        else:
+            topk_weights = topk_weights.to(x.dtype)
+            output = npu_fused_experts(
+                hidden_states=x,
+                w13=layer.w13_weight_packed,
+                w13_scale=layer.w13_weight_scale,
+                w13_offset=layer.w13_weight_offset,
+                w2=layer.w2_weight_packed,
+                w2_scale=layer.w2_weight_scale,
+                w2_offset=layer.w2_weight_offset,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                top_k=topk_ids.shape[1],
+                use_wna16=True,
+            )
         return StandardCombineInput(hidden_states=output)
 
     def apply_without_routing_weights(
@@ -741,7 +758,7 @@ class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
             # gmm1: gate_up_proj
             hidden_states = torch.ops.npu.npu_grouped_matmul(
                 x=[hidden_states],
-                weight=[layer.w13_weight],
+                weight=[layer.w13_weight_packed],
                 antiquant_scale=[layer.w13_weight_scale],
                 antiquant_offset=[layer.w13_weight_offset],
                 split_item=2,
@@ -757,7 +774,7 @@ class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
             # gmm2: down_proj
             out_hidden = torch.ops.npu.npu_grouped_matmul(
                 x=[hidden_states],
-                weight=[layer.w2_weight],
+                weight=[layer.w2_weight_packed],
                 antiquant_scale=[layer.w2_weight_scale],
                 antiquant_offset=[layer.w2_weight_offset],
                 split_item=2,

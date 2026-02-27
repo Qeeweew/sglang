@@ -159,7 +159,7 @@ def rmsnorm_apply_kernel_serial(
 
 
 def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-    assert x1.is_cuda and x2.is_cuda
+    # assert x1.is_cuda and x2.is_cuda
     B, D1 = x1.shape
     B2, D2 = x2.shape
     assert B == B2
@@ -205,7 +205,7 @@ def rms_apply_serial(
     tp_world: int = 1,
     eps: float = 1e-5,
 ) -> torch.Tensor:
-    assert x1.is_cuda and x2.is_cuda and w1.is_cuda and w2.is_cuda and sum_sq.is_cuda
+    # assert x1.is_cuda and x2.is_cuda and w1.is_cuda and w2.is_cuda and sum_sq.is_cuda
     B, D1 = x1.shape
     B2, D2 = x2.shape
     assert B == B2

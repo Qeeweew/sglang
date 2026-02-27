@@ -472,7 +472,7 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
 
 class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
 
-    def __init__(self, quantization_config) -> None:
+    def __init__(self, quantization_config: CompressedTensorsConfig) -> None:
         self.pack_factor = 8  # weight dtype is int4,  but use int32 to create
         target = (
             "MoEGMM" if "MoEGMM" in quantization_config.target_scheme_map else "Linear"
@@ -485,6 +485,8 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
             self.group_size = 128
 
         self.kernel = NPUW4A16Int4DynamicMoEMethod()
+        config = quantization_config.target_scheme_map["Linear"].get("weights")
+        self.strategy = config.strategy
 
     # TODO: See if we can merge this method's logic
     # with CompressedTensorsWNA16MoE. Need more models and tests.
@@ -501,17 +503,7 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         self.num_experts = num_experts
-        if (
-            extra_weight_attrs.get(
-                "intermediate_size_full", intermediate_size_per_partition
-            )
-            // intermediate_size_per_partition
-            > 1
-        ):
-            quant_method = FusedMoeWeightScaleSupported.GROUP.value
-        else:
-            quant_method = FusedMoeWeightScaleSupported.CHANNEL.value
-        extra_weight_attrs.update({"quant_method": quant_method})
+        extra_weight_attrs.update({"quant_method": self.strategy})
         # weight
         w13_weight = torch.nn.Parameter(
             torch.empty(
@@ -522,7 +514,7 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w13_weight", w13_weight)
+        layer.register_parameter("w13_weight_packed", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
         w2_weight = torch.nn.Parameter(
             torch.empty(
@@ -533,11 +525,11 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w2_weight", w2_weight)
+        layer.register_parameter("w2_weight_packed", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # scale
-        weight_scale_dtype = torch.bfloat16
+        weight_scale_dtype = params_dtype #torch.bfloat16
         w13_weight_scale = torch.nn.Parameter(
             torch.empty(
                 num_experts,
@@ -585,6 +577,26 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
         )
         layer.register_parameter("w2_weight_offset", w2_weight_offset)
         set_weight_attrs(w2_weight_offset, extra_weight_attrs)
+
+        w13_weight_shape = torch.nn.Parameter(
+            torch.empty(num_experts,
+            2,
+            dtype=torch.int64,
+            device="cpu"),
+            requires_grad=False
+        )
+        layer.register_parameter("w13_weight_shape", w13_weight_shape)
+        set_weight_attrs(w13_weight_shape, extra_weight_attrs)
+
+        w2_weight_shape = torch.nn.Parameter(
+            torch.empty(num_experts,
+            2,
+            dtype=torch.int64,
+            device="cpu"),
+            requires_grad=False
+        )
+        layer.register_parameter("w2_weight_shape", w2_weight_shape)
+        set_weight_attrs(w2_weight_shape, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)
