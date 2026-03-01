@@ -551,6 +551,11 @@ class ServerArgs:
     kt_num_gpu_experts: Optional[int] = None
     kt_max_deferred_experts_per_token: Optional[int] = None
 
+    # MoE CPU Offload (for NPU)
+    enable_moe_offload: bool = False
+    moe_offload_start_layer: int = 0
+    moe_offload_quant_type: str = "q8_0"
+
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
     dllm_algorithm_config: Optional[str] = None
@@ -4431,6 +4436,30 @@ class ServerArgs:
             type=int,
             default=ServerArgs.kt_max_deferred_experts_per_token,
             help="[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+        )
+
+        # MoE Offload server args
+        parser.add_argument(
+            "--enable-moe-offload",
+            action="store_true",
+            help="Enable MoE computation offload to CPU using Int8/Int4 quantization. "
+            "Requires nanovllm_ext to be installed.",
+        )
+        parser.add_argument(
+            "--moe-offload-start-layer",
+            type=int,
+            default=0,
+            help="The layer index from which to start offloading MoE computation to CPU. "
+            "Only layers with index >= this value will be offloaded.",
+        )
+        parser.add_argument(
+            "--moe-offload-quant-type",
+            type=str,
+            default="q8_0",
+            choices=["q8_0", "q4_0"],
+            help="Quantization type for MoE offload. "
+            '"q8_0" uses online Int8 quantization. '
+            '"q4_0" uses pre-quantized Int4 weights (compressed-tensors format).',
         )
 
         # Diffusion LLM

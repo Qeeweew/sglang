@@ -273,7 +273,22 @@ class FusedMoE(torch.nn.Module):
                 gpu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
             self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
         else:
-            if quant_config is not None:
+            # Check for MoE offload configuration
+            from sglang.srt.layers.moe.moe_offload import (
+                MoEOffloadFusedMoEMethod,
+                MoEOffloadInt4FusedMoEMethod,
+                create_moe_offload_config,
+            )
+
+            moe_offload_config = create_moe_offload_config(layer_id, server_args, quant_config)
+            if moe_offload_config is not None:
+                if moe_offload_config.quant_type == "q4_0":
+                    self.quant_method = MoEOffloadInt4FusedMoEMethod()
+                else:
+                    self.quant_method = MoEOffloadFusedMoEMethod()
+                self.quant_method.offload_config = moe_offload_config
+                self.quant_method.layer_idx = layer_id
+            elif quant_config is not None:
                 self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method is None:
                 self.quant_method = UnquantizedFusedMoEMethod(

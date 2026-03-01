@@ -134,22 +134,34 @@ class NPUW4A16LinearMethod(_NPULinearMethodBase):
     ) -> torch.Tensor:
         """Apply W4A16 linear transformation.
 
-        Uses npu_weight_quant_batchmatmul for W4A16 computation.
+        Uses batch_gemm_w4a16_small_bs for batch_size <= 4,
+        otherwise uses npu_weight_quant_batchmatmul for W4A16 computation.
         The weight is already packed by process_weights_after_loading.
         Only symmetric quantization is supported (weight_offset should be zeros).
         """
-        # Use npu_weight_quant_batchmatmul with antiquant_group_size
-        # weight_packed is already in NPU int4pack format after process_weights_after_loading
+        # Get batch size (first dimension of input x)
+        batch_size = x.shape[0]
 
-        # For symmetric quantization, weight_offset should be zeros (created in process_weights_after_loading)
-        output = torch.ops.npu.npu_weight_quant_batchmatmul(
-            x=x,
-            weight=layer.weight_packed,
-            antiquant_scale=layer.weight_scale,
-            antiquant_offset=layer.weight_offset,
-            antiquant_group_size=self.group_size,
-            bias=bias,
-        )
+        if batch_size <= 4:
+            # Use custom batch_gemm_w4a16_small_bs for small batch sizes
+            output = torch.ops.npu.batch_gemm_w4a16_small_bs(
+                x,
+                layer.weight_packed,
+                layer.weight_scale,
+            )
+            # Add bias if provided (batch_gemm_w4a16_small_bs doesn't handle bias)
+            if bias is not None:
+                output = output + bias
+        else:
+            # Use npu_weight_quant_batchmatmul for larger batch sizes
+            output = torch.ops.npu.npu_weight_quant_batchmatmul(
+                x=x,
+                weight=layer.weight_packed,
+                antiquant_scale=layer.weight_scale,
+                antiquant_offset=layer.weight_offset,
+                antiquant_group_size=self.group_size,
+                bias=bias,
+            )
         return output
 
 
