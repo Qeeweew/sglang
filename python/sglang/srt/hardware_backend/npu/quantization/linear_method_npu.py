@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
+from sgl_kernel_npu.quantization.repack import repack_int4_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -89,31 +90,24 @@ class NPUW4A16LinearMethod(_NPULinearMethodBase):
         """Process weights after loading from checkpoint.
 
         Convert from Marlin/compressed-tensors format to Ascend NPU format.
-        Uses npu_convert_weight_to_int4pack for efficient int4 packing.
+        Uses optimized Triton kernel for efficient int4 repacking (unpack + transpose + repack).
         Only symmetric quantization is supported.
         """
-        # weight shape from checkpoint: [output_size, input_size // pack_factor]
-        # After loading, we need to transpose to [input_size, output_size] and repack
+        # weight shape from checkpoint: [output_size, input_size // pack_factor] = [N, K//8]
+        # After loading, we need to convert to [K, N//8] for NPU format
 
         weight_shape = layer.weight_packed.data.shape
-        output_size = weight_shape[0]
-        packed_input_size = weight_shape[1]
-        input_size = packed_input_size * self.pack_factor
+        output_size = weight_shape[0]  # N
+        packed_input_size = weight_shape[1]  # K//8
+        input_size = packed_input_size * self.pack_factor  # K
 
-        # Unpack from int32 to int8 (with int4 range)
-        unpacked_weight = self._unpack_from_int32(
-            layer.weight_packed.data,
-            torch.Size([output_size, input_size]),
-            self.num_bits,
-            packed_dim=1,
-        )
+        # Current weight shape: [N, K//8] (int32 packed)
+        # Step 1: Transpose to [K//8, N] for the optimized kernel
+        weight_t = layer.weight_packed.data.transpose(0, 1).contiguous()
 
-        # Transpose: [output_size, input_size] -> [input_size, output_size]
-        unpacked_weight = unpacked_weight.transpose(0, 1).contiguous().int()
-
-        # Repack using NPU int4 packing
-        layer.weight_packed.data = torch.ops.npu.npu_convert_weight_to_int4pack(
-            unpacked_weight)
+        # Step 2: Use optimized Triton kernel to fuse unpack + transpose + repack
+        # Input: [K//8, N], Output: [K, N//8]
+        layer.weight_packed.data = repack_int4_npu(weight_t)
 
         # Transpose scale from [output_size, num_groups] to [num_groups, output_size]
         layer.weight_scale.data = layer.weight_scale.data.transpose(

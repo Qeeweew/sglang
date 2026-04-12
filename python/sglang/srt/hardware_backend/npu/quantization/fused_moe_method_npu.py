@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sgl_kernel_npu.quantization.repack import repack_int4_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -574,6 +575,31 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
 class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
+    def _transpose_and_repack_int4(self, weight_packed: torch.Tensor) -> torch.Tensor:
+        """
+        Transpose weight from [E, N, K//8] to [E, K, N//8] using optimized Triton kernel.
+
+        Args:
+            weight_packed: Input weight tensor of shape [E, N, K//8] in int32 packed format
+                          where K is the input dimension (already divided by 8 for int4 packing)
+
+        Returns:
+            Transposed and repacked weight of shape [E, K, N//8]
+        """
+        E, N, K_div_8 = weight_packed.shape
+        K = K_div_8 * 8
+
+        # Step 1: Transpose from [E, N, K//8] to [E, K//8, N]
+        weight_t = weight_packed.transpose(1, 2).contiguous()
+        # Step 2: Flatten to [E*K//8, N] for the optimized kernel
+        weight_t_flat = weight_t.view(E * K_div_8, N)
+        # Step 3: Use optimized Triton kernel, output is [E*K, N//8]
+        weight_repacked_flat = repack_int4_npu(weight_t_flat)
+        # Step 4: Reshape back to [E, K, N//8]
+        weight_result = weight_repacked_flat.view(E, K, N // 8)
+
+        return weight_result
+
     def _pack_to_int32(self, weight: torch.Tensor):
         assert weight.dim() == 3
         if weight.dtype == torch.int32:
@@ -676,26 +702,11 @@ class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
             requires_grad=False,
         )
 
-        # w = [n, k // 8]  --> [k, n // 8]
-        # w13_weight_packed = layer.w13_weight_packed.data.transpose(1, 2).contiguous()
-        # w2_weight_packed = layer.w2_weight_packed.data.transpose(1, 2).contiguous()
-        unpacked_w13_weight = (
-            self._unpack_from_int32(layer.w13_weight_packed.data.flatten(0, 1), 4)
-            .view(layer.w13_weight_packed.data.shape[0], layer.w13_weight_packed.data.shape[1], -1)
-            .transpose(1, 2)
-            .contiguous()
-            .int()
-        )
-        unpacked_w2_weight = (
-            self._unpack_from_int32(layer.w2_weight_packed.data.flatten(0, 1), 4)
-            .view(layer.w2_weight_packed.data.shape[0], layer.w2_weight_packed.data.shape[1], -1)
-            .transpose(1, 2)
-            .contiguous()
-            .int()
-        )
-
-        w13_weight_packed = self._pack_to_int32(unpacked_w13_weight)
-        w2_weight_packed = self._pack_to_int32(unpacked_w2_weight)
+        # Process w13 and w2 weights separately since they have different shapes
+        # w13: [num_experts, intermediate_size*2, hidden_size//8] -> [num_experts, hidden_size, intermediate_size*2//8]
+        # w2: [num_experts, hidden_size, intermediate_size*2//8] -> [num_experts, intermediate_size*2, hidden_size//8]
+        w13_weight_packed = self._transpose_and_repack_int4(layer.w13_weight_packed.data)
+        w2_weight_packed = self._transpose_and_repack_int4(layer.w2_weight_packed.data)
 
         layer.w13_weight_packed = torch.nn.Parameter(w13_weight_packed, requires_grad=False)
         layer.w2_weight_packed = torch.nn.Parameter(w2_weight_packed, requires_grad=False)

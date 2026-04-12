@@ -6,7 +6,7 @@ from sgl_kernel_npu.norm.l1_norm import l1_norm
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
-from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput, select_experts
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -24,7 +24,7 @@ def fused_topk_npu(
     """NPU fused TopK implementation using Ascend optimized kernels."""
 
     scoring_func = topk_config.scoring_func
-    use_softmax_kernel = scoring_func == "softmax" and topk_config.correction_bias is None
+    use_softmax_kernel = scoring_func == "softmax" and topk_config.correction_bias is None and not topk_config.use_grouped_topk
 
     if use_softmax_kernel:
         # Optimized path: softmax without bias
@@ -39,15 +39,14 @@ def fused_topk_npu(
                 else topk_weights[:, :-1]
             )
             topk_weights = l1_norm(weights_to_norm)
-    else:
-        # Universal path: supports sigmoid/softmax with/without bias, grouped/non-grouped
+    elif topk_config.renormalize:
         x = router_logits.to(torch.float32)
         k = topk_config.top_k
 
         kernel_kwargs = {
             "renorm": 0,  # NPU kernel only supports renorm=0
             "norm_type": 1 if scoring_func == "sigmoid" else 0,
-            "routed_scaling_factor": 1.0,
+            "routed_scaling_factor": topk_config.routed_scaling_factor if topk_config.apply_routed_scaling_factor_on_output else 1.0,
             "eps": float(1e-20),
         }
 
@@ -63,10 +62,17 @@ def fused_topk_npu(
             x, k, **kernel_kwargs
         )
 
-        if topk_config.renormalize:
-            topk_weights = l1_norm(topk_weights)
-
-    topk_weights = topk_weights.to(torch.float32)
+        topk_weights = topk_weights.to(torch.float32)
+    else:
+        topk_config.torch_native = True
+        return select_experts(
+            hidden_states=hidden_states,
+            layer_id=layer_id,
+            router_logits=router_logits,
+            topk_config=topk_config,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
 
     if expert_location_dispatch_info is not None:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
