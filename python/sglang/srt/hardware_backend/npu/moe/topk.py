@@ -23,45 +23,62 @@ def fused_topk_npu(
 ) -> "TopKOutput":
     """NPU fused TopK implementation using Ascend optimized kernels."""
 
-    scoring_func = topk_config.scoring_func
-    use_softmax_kernel = scoring_func == "softmax" and topk_config.correction_bias is None and not topk_config.use_grouped_topk
+    use_grouped_topk = topk_config.use_grouped_topk
+    renormalize = topk_config.renormalize
+    correction_bias = topk_config.correction_bias
 
-    if use_softmax_kernel:
-        # Optimized path: softmax without bias
+    if topk_config.custom_routing_function is not None:
+        topk_config.torch_native = True
+        return select_experts(
+            hidden_states=hidden_states,
+            layer_id=layer_id,
+            router_logits=router_logits,
+            topk_config=topk_config,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
+
+    if not use_grouped_topk and correction_bias is None:
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
             router_logits,
             k=topk_config.top_k,
         )
-        if topk_config.renormalize:
+        if renormalize:
             weights_to_norm = (
                 topk_weights
                 if topk_config.num_fused_shared_experts == 0
                 else topk_weights[:, :-1]
             )
             topk_weights = l1_norm(weights_to_norm)
-    elif topk_config.renormalize:
-        x = router_logits.to(torch.float32)
-        k = topk_config.top_k
-
-        kernel_kwargs = {
-            "renorm": 0,  # NPU kernel only supports renorm=0
-            "norm_type": 1 if scoring_func == "sigmoid" else 0,
-            "routed_scaling_factor": topk_config.routed_scaling_factor if topk_config.apply_routed_scaling_factor_on_output else 1.0,
-            "eps": float(1e-20),
-        }
-
-        # Handle bias and grouping
-        if topk_config.correction_bias is not None:
-            kernel_kwargs["bias"] = topk_config.correction_bias.to(torch.float32)
-        if topk_config.use_grouped_topk:
-            kernel_kwargs["k_group"] = topk_config.topk_group
-            kernel_kwargs["group_count"] = topk_config.num_expert_group
-        kernel_kwargs["group_select_mode"] = 1
-
+        topk_weights = topk_weights.to(torch.float32)
+    elif use_grouped_topk and correction_bias is not None:
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
-            x, k, **kernel_kwargs
+            router_logits.to(torch.float32),
+            k=topk_config.top_k,
+            bias=correction_bias.to(torch.float32),
+            k_group=topk_config.topk_group,
+            group_count=topk_config.num_expert_group,
+            group_select_mode=1,
+            renorm=0,
+            norm_type=1,
+            routed_scaling_factor=(
+                1 if renormalize else topk_config.routed_scaling_factor
+            ),
+            eps=float(1e-20),
         )
-
+        topk_weights = topk_weights.to(torch.float32)
+    elif num_token_non_padded is not None and correction_bias is not None:
+        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
+            router_logits.to(torch.float32),
+            k=topk_config.top_k,
+            bias=correction_bias.to(torch.float32),
+            renorm=0,
+            norm_type=1,
+            routed_scaling_factor=(
+                1 if renormalize else topk_config.routed_scaling_factor
+            ),
+            eps=float(1e-20),
+        )
         topk_weights = topk_weights.to(torch.float32)
     else:
         topk_config.torch_native = True
