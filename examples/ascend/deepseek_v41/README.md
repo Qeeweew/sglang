@@ -67,6 +67,8 @@ docker compose -f examples/ascend/deepseek_v41/compose.yaml exec sglang \
 
 测试提交 `84b15ced`，checkpoint 为 1017。两组都开启 DSpark 5、Radix、CED、bounded SWA replay 和 decode Graph，整机请求上限 128，静态显存比例 0.84。
 
+![8×910B3 的 32K decode 并发曲线和 128K 单请求冷 prefill 吞吐](benchmark-910b.png)
+
 ### 32K 输入的稳态 decode
 
 两套拓扑逐档使用相同的 token ID。每条请求命中 28,672-token 前缀，输入包含 4,096-token 独立后缀。满批后运行 50 步预热和 60 步预运行，测连续 60 步。采样使用 temperature 0.3、top-p 0.95、top-k 1024 和 top-5 logprobs。吞吐是整机在窗口内实际提交的 token 数除以窗口墙钟。每步每请求提交一个 verifier token 加接受的草稿。[DeepInfer 稳态测量方法](https://github.com/deepseek-ai/DeepInfer/blob/a679bb86ce36e883a98a97733492b686e5b9a08e/examples/README.md#stage-decoupling-and-metrics)
