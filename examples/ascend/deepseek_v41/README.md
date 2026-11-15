@@ -67,7 +67,7 @@ docker compose -f examples/ascend/deepseek_v41/compose.yaml exec sglang \
 
 叠加 [`compose.router.yaml`](compose.router.yaml) 后，每个 attention DP rank 发布本地 Radix 缓存的写入和淘汰事件。`sgl-router` 对文本请求查找可复用的最长 token 前缀，将请求定向到对应 rank。前缀未命中或命中长度相同时，默认选路由器在途请求最少的候选 rank。DP8/TP1 和 DP4/TP2 共用此配置。[DP rank 路由说明](../../../sgl-router/REFERENCE.md#dp-rank-routing)
 
-从仓库根目录构建路由器镜像，再用两份 Compose 文件启动。沿用上面的 `DSV41_MODEL_DIR`，其中的 `tokenizer.json` 和 `config.json` 需可读。复用已有的 910B 引擎镜像时，用 `DSV41_IMAGE` 指定其标签。
+从仓库根目录构建路由器镜像，再用两份 Compose 文件启动。沿用上面的 `DSV41_MODEL_DIR`，其中的 `tokenizer.json` 和 `config.json` 需可读。部署时可用 `DSV41_IMAGE` 指定已有引擎镜像。引擎在发布 KV 事件时会编译哈希扩展，使用这个 Dockerfile 构建的镜像包含扩展所需的 `libssl-dev`。
 
 ```bash
 git archive HEAD docker/sgl-router.Dockerfile sgl-router rust | \

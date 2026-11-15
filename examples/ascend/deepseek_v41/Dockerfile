@@ -22,7 +22,7 @@ RUN --mount=type=bind,from=dsv41_deps,source=ubuntu-toolchain-r-test.asc,target=
         > /etc/apt/sources.list.d/ubuntu-toolchain-r-test.list; \
     apt-get -o Acquire::Retries=3 update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        build-essential ca-certificates cmake curl gcc-13 g++-13 libdw-dev \
+        build-essential ca-certificates cmake curl gcc-13 g++-13 libdw-dev libssl-dev \
         libgl1 libglib2.0-0 libnuma-dev libsndfile1 pkg-config unzip; \
     rm -rf /var/lib/apt/lists/*
 
