@@ -27,6 +27,12 @@ SGLang is an open-source inference framework for large language, vision-language
 >
 > Go deep on inference, training, and AI hardware through technical talks, live demos, and hands-on workshops. Bring your deployment challenges and meet the engineers and researchers building the stack.
 
+## DeepSeek V4.1 on Ascend 910B
+
+This branch runs the original DeepSeek V4.1 Flash checkpoint on eight Ascend 910B NPUs with **native MXFP4 routed expert weights**. The experts stay in packed MXFP4 on device. The Ascend C grouped GEMM decodes weight tiles as it computes. Both attention DP8/TP1 and DP4/TP2 use MoE EP8 and DSpark speculative decoding.
+
+See the [910B adaptation, Docker build, and benchmark guide](examples/ascend/deepseek_v41/README.md).
+
 ## Get Started
 
 Pull the Docker image, which includes SGLang and its dependencies:

@@ -2,6 +2,8 @@
 
 This backend serves DeepSeek V4.1 on Ascend 910B. Routed MXFP4 experts remain
 compressed on the NPUs, and Engram uses registered compressed host tables.
+See the [910B deployment guide](../../../../../../examples/ascend/deepseek_v41/README.md)
+for the Docker build, topology selection, and benchmarks.
 
 The current target is Ascend 910B3, CANN 9.1, and a Torch/Torch-NPU installation
 with matching ABIs. Native host compilation requires GCC 13+, CMake 3.22+,

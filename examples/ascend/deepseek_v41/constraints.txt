@@ -1,0 +1,17 @@
+# Match the PyTorch ABI used by the Ascend extension wheels.
+torch==2.10.0+cpu
+torchvision==0.25.0+cpu
+torchaudio==2.10.0+cpu
+torch-npu==2.10.0.post6
+triton==3.5.0
+triton-ascend==3.2.2
+# Resolve SGLang extras against the Triton Ascend wheel requirements.
+numpy==1.26.4
+pandas==2.2.3
+psutil==6.0.0
+scipy==1.13.1
+apache-tvm-ffi==0.1.15.post1
+blake3==1.0.11
+deepseek-recipe==0.2.0
+pillow==11.3.0
+safetensors==0.8.0

@@ -1,0 +1,57 @@
+name: dsv41-910b
+
+services:
+  sglang:
+    image: ${DSV41_IMAGE:-sglang-dsv41:910b}
+    init: true
+    network_mode: host
+    ipc: host
+    privileged: true
+    restart: unless-stopped
+    stop_grace_period: 60s
+    devices:
+      - /dev/davinci0:/dev/davinci0
+      - /dev/davinci1:/dev/davinci1
+      - /dev/davinci2:/dev/davinci2
+      - /dev/davinci3:/dev/davinci3
+      - /dev/davinci4:/dev/davinci4
+      - /dev/davinci5:/dev/davinci5
+      - /dev/davinci6:/dev/davinci6
+      - /dev/davinci7:/dev/davinci7
+      - /dev/davinci_manager:/dev/davinci_manager
+      - /dev/devmm_svm:/dev/devmm_svm
+      - /dev/hisi_hdc:/dev/hisi_hdc
+    volumes:
+      - /usr/local/dcmi:/usr/local/dcmi:ro
+      - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro
+      - /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64:ro
+      - /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info:ro
+      - /etc/ascend_install.info:/etc/ascend_install.info:ro
+      - ${DSV41_MODEL_DIR:?Set DSV41_MODEL_DIR to the checkpoint directory}:/models/deepseek-v4.1-flash:ro
+      - deepjit-cache:/var/cache/dsv41/deepjit
+    environment:
+      DSV41_MODEL_PATH: /models/deepseek-v4.1-flash
+      DSV41_ATTN_DP_SIZE: "${DSV41_ATTN_DP_SIZE:-8}"
+      DSV41_PORT: "${DSV41_PORT:-31088}"
+      DSV41_MAX_RUNNING_REQUESTS: "${DSV41_MAX_RUNNING_REQUESTS:-64}"
+      DSV41_MEM_FRACTION_STATIC: "${DSV41_MEM_FRACTION_STATIC:-0.84}"
+      SGLANG_DSPARK_DEBUG_DUMP: "${SGLANG_DSPARK_DEBUG_DUMP:-}"
+    command:
+      - bash
+      - examples/ascend/deepseek_v41/serve.sh
+      - --host
+      - ${DSV41_BIND_HOST:-127.0.0.1}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "http://127.0.0.1:${DSV41_PORT:-31088}/ready"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 30m
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+volumes:
+  deepjit-cache:
