@@ -70,7 +70,8 @@ def check_router_prefix(backend_url, router_url):
     prefix = random.choices(range(256, 8192), k=1024)
     rank = 1
     before = indexed_kv_blocks(router_url, rank)
-    first = generate(backend_url, prefix + [100], 1, routed_dp_rank=rank)
+    # Leave at least the 140-token CED replay tail outside the shared prefix.
+    first = generate(backend_url, prefix + [100] * 256, 1, routed_dp_rank=rank)
     seed = first["meta_info"]
     assert seed["dp_rank"] == rank and seed["cached_tokens"] == 0, seed
 
@@ -80,7 +81,7 @@ def check_router_prefix(backend_url, router_url):
             raise RuntimeError("Router did not receive the warmed KV pages")
         time.sleep(0.1)
 
-    second = generate(router_url, prefix + [101], 1)
+    second = generate(router_url, prefix + [101] * 256, 1)
     hit = second["meta_info"]
     assert hit["dp_rank"] == seed["dp_rank"] and hit["cached_tokens"] >= len(prefix), hit
     print(f"router prefix reuse: rank {hit['dp_rank']}, {hit['cached_tokens']} cached tokens")

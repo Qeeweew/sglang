@@ -80,7 +80,7 @@ docker compose -f examples/ascend/deepseek_v41/compose.yaml \
 
 将文本客户端的 OpenAI base URL 设为 `http://127.0.0.1:30000/v1`，模型名用 `deepseek-ai/DeepSeek-V4.1-Flash-1017`。图文请求可直接使用引擎 API `http://127.0.0.1:31088/v1`。路由器端口可用 `DSV41_ROUTER_PORT` 调整。KV 事件和回放端口只绑定回环地址，DP8 默认使用 `5557–5564` 和 `5567–5574`，各自的起始端口由 `DSV41_KV_EVENTS_PORT` 和 `DSV41_KV_REPLAY_PORT` 控制。
 
-下面的检查在引擎 rank 1 预热一段 1,024-token 前缀，等待路由器收到 KV 事件，再经路由器发一条后缀不同的请求。它核对实际执行 rank 和 `cached_tokens`。
+下面的检查在引擎 rank 1 预热一段 1,024-token 前缀，等待路由器收到 KV 事件，再经路由器发一条后缀不同的请求。两条请求各带 256 个后缀 token，为 bounded SWA replay 留出尾部计算空间。检查会核对实际执行 rank 和 `cached_tokens`。
 
 ```bash
 curl --fail http://127.0.0.1:30000/readyz
