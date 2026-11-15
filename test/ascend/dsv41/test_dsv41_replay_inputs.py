@@ -115,6 +115,8 @@ class ReplayInputs(unittest.TestCase):
             self.assertIs(view.replace_positions, batch.replace_positions)
 
     def test_image_spans_match_full_prepared_embeddings(self):
+        from sglang.srt.layers.engram import EngramHasher
+        from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
         from sglang.srt.managers.schedule_batch import (
             Modality,
             MultimodalDataItem,
@@ -122,7 +124,6 @@ class ReplayInputs(unittest.TestCase):
         )
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-        from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
 
         devices = ["cpu"]
         if os.environ.get("SGLANG_DSV41_TEST_NPU") == "1":
@@ -143,21 +144,21 @@ class ReplayInputs(unittest.TestCase):
                     ids = [i % 16 for i in range(length)]
                     items = []
                     for start, end in spans:
-                        pad = MM_PAD_SHIFT_VALUE + start + 1
-                        ids[start : end + 1] = [pad] * (end - start + 1)
                         values = (
                             torch.arange((end - start + 1) * 8)
                             .view(-1, 8)
                             .to(device=device, dtype=torch.bfloat16)
                         )
-                        items.append(
-                            MultimodalDataItem(
-                                modality=Modality.IMAGE,
-                                pad_value=pad,
-                                offsets=[(start, end)],
-                                precomputed_embeddings=values,
-                            )
+                        item = MultimodalDataItem(
+                            modality=Modality.IMAGE,
+                            offsets=[(start, end)],
+                            precomputed_embeddings=values,
                         )
+                        item.set_identity((length * 1000 + start).to_bytes(32, "big"))
+                        media_ids = item.padding_sequence(end - start + 1)
+                        self.assertGreater(min(media_ids), torch.iinfo(torch.int32).max)
+                        ids[start : end + 1] = media_ids
+                        items.append(item)
                     requests.append(make_request(ids, MultimodalInputs(mm_items=items)))
                 requests.append(make_request([i % 16 for i in range(134)]))
                 embedding = torch.nn.Embedding(
@@ -197,7 +198,18 @@ class ReplayInputs(unittest.TestCase):
                     requests, [256, 384, 128], [64, 64, 6], [True] * 3, device
                 )
                 source_ids = batch.input_ids.clone()
-                view = merged_prefill(batch, make_runner(device))
+                runner = make_runner(device)
+                hasher = SimpleNamespace(max_ngram_size=4)
+                hasher.history_row = MethodType(EngramHasher.history_row, hasher)
+                runner.model.model.engram_hasher = hasher
+                view = merged_prefill(batch, runner)
+                torch.testing.assert_close(
+                    view.engram_history.cpu(),
+                    torch.tensor(
+                        [[MM_PAD_SHIFT_VALUE] * 3, [MM_PAD_SHIFT_VALUE] * 3, [0] * 3],
+                        dtype=torch.int32,
+                    ),
+                )
                 actual_tokens, actual_embeds = prepare(
                     view.input_ids, view.prefix_lens, view.extend_lens
                 )
@@ -222,7 +234,7 @@ class ReplayInputs(unittest.TestCase):
                 )
                 torch.testing.assert_close(batch.input_ids, source_ids, rtol=0, atol=0)
                 self.assertIs(view.multimodal_inputs, batch.multimodal_inputs)
-                self.assertIs(merged_prefill(view, make_runner(device)), view)
+                self.assertIs(merged_prefill(view, runner), view)
 
 
 class TokenizerValidation(unittest.TestCase):

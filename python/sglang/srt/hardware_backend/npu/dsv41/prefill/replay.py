@@ -174,10 +174,10 @@ def merged_prefill(batch, runner):
         ids.append(batch.input_ids[offset : offset + count])
         offset += count
         if history_size:
-            h = list(
-                req.full_untruncated_fill_ids[max(0, start - history_size) : start]
-            )
-            history.append([0] * (history_size - len(h)) + h)
+            preceding = req.full_untruncated_fill_ids[
+                max(0, start - history_size) : start
+            ]
+            history.append(hasher.history_row(preceding))
     # Preserve the scheduler's resolved device suffix (including future IDs).
     # Only cached replay IDs need a new transfer on this forward stream.
     view.input_ids = torch.cat(ids) if replayed else batch.input_ids
