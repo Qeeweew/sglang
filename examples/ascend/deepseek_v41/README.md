@@ -63,6 +63,33 @@ docker compose -f examples/ascend/deepseek_v41/compose.yaml exec sglang \
   python3 examples/ascend/deepseek_v41/smoke.py --parallel-requests 4 --prefix-replay
 ```
 
+## 跨会话复用 KV 前缀
+
+叠加 [`compose.router.yaml`](compose.router.yaml) 后，每个 attention DP rank 发布本地 Radix 缓存的写入和淘汰事件。`sgl-router` 对文本请求查找可复用的最长 token 前缀，将请求定向到对应 rank。前缀未命中或命中长度相同时，默认选路由器在途请求最少的候选 rank。DP8/TP1 和 DP4/TP2 共用此配置。[DP rank 路由说明](../../../sgl-router/REFERENCE.md#dp-rank-routing)
+
+从仓库根目录构建路由器镜像，再用两份 Compose 文件启动。沿用上面的 `DSV41_MODEL_DIR`，其中的 `tokenizer.json` 和 `config.json` 需可读。复用已有的 910B 引擎镜像时，用 `DSV41_IMAGE` 指定其标签。
+
+```bash
+git archive HEAD docker/sgl-router.Dockerfile sgl-router rust | \
+  docker buildx build --load --platform linux/arm64 -t sgl-router:dsv41-910b \
+    -f docker/sgl-router.Dockerfile -
+
+docker compose -f examples/ascend/deepseek_v41/compose.yaml \
+  -f examples/ascend/deepseek_v41/compose.router.yaml up -d
+```
+
+将文本客户端的 OpenAI base URL 设为 `http://127.0.0.1:30000/v1`，模型名用 `deepseek-ai/DeepSeek-V4.1-Flash-1017`。图文请求可直接使用引擎 API `http://127.0.0.1:31088/v1`。路由器端口可用 `DSV41_ROUTER_PORT` 调整。KV 事件和回放端口只绑定回环地址，DP8 默认使用 `5557–5564` 和 `5567–5574`，各自的起始端口由 `DSV41_KV_EVENTS_PORT` 和 `DSV41_KV_REPLAY_PORT` 控制。
+
+下面的检查在引擎 rank 1 预热一段 1,024-token 前缀，等待路由器收到 KV 事件，再经路由器发一条后缀不同的请求。它核对实际执行 rank 和 `cached_tokens`。
+
+```bash
+curl --fail http://127.0.0.1:30000/readyz
+docker compose -f examples/ascend/deepseek_v41/compose.yaml \
+  -f examples/ascend/deepseek_v41/compose.router.yaml exec -T sglang \
+  python3 - --router-url http://127.0.0.1:30000 \
+  < examples/ascend/deepseek_v41/smoke.py
+```
+
 ## 8×910B3 实测
 
 测试提交 `84b15ced`，checkpoint 为 1017。两组都开启 DSpark 5、Radix、CED、bounded SWA replay 和 decode Graph，整机请求上限 128，静态显存比例 0.84。

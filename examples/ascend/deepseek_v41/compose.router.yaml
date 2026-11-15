@@ -1,0 +1,43 @@
+services:
+  sglang:
+    command:
+      - bash
+      - examples/ascend/deepseek_v41/serve.sh
+      - --host
+      - ${DSV41_BIND_HOST:-127.0.0.1}
+      - --served-model-name
+      - ${DSV41_SERVED_MODEL_NAME:-deepseek-ai/DeepSeek-V4.1-Flash-1017}
+      - --kv-events-config
+      - >-
+        {"publisher":"zmq","bind":true,
+        "endpoint":"tcp://127.0.0.1:${DSV41_KV_EVENTS_PORT:-5557}",
+        "replay_endpoint":"tcp://127.0.0.1:${DSV41_KV_REPLAY_PORT:-5567}"}
+
+  router:
+    image: ${DSV41_ROUTER_IMAGE:-sgl-router:dsv41-910b}
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 60s
+    depends_on:
+      sglang:
+        condition: service_healthy
+    volumes:
+      - ${DSV41_MODEL_DIR:?Set DSV41_MODEL_DIR to the checkpoint directory}:/models/deepseek-v4.1-flash:ro
+    command:
+      - --host
+      - ${DSV41_ROUTER_BIND_HOST:-127.0.0.1}
+      - --port
+      - "${DSV41_ROUTER_PORT:-30000}"
+      - --termination-grace-secs
+      - "60"
+      - --worker-urls
+      - http://127.0.0.1:${DSV41_PORT:-31088}
+      - --model-id
+      - ${DSV41_SERVED_MODEL_NAME:-deepseek-ai/DeepSeek-V4.1-Flash-1017}
+      - --tokenizer-path
+      - /models/deepseek-v4.1-flash/tokenizer.json
+      - --chat-routing
+      - reorg
+      - --policy
+      - cache_aware
+      - --dp-aware
