@@ -8,6 +8,9 @@ from available GPU memory using a unified coeff+bias model:
 
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41.prefill import cache as _dsv41_cache
+
+
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
@@ -1211,6 +1214,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     # replacing the (T+D)/T inflation.
     _draft_kv_priced_exactly = False
 
+    @_dsv41_cache.adapt_pool_plan
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         cfg = kvc.model_config

@@ -1,3 +1,5 @@
+from sglang.srt.hardware_backend.npu.dsv41.dspark import kv_inject as _dsv41_ced_chunk
+
 from typing import NamedTuple, Optional
 
 import torch
@@ -124,6 +126,7 @@ class TargetHiddenKvInjector:
             )
         return PrefillPlacement(cache_loc, positions, state_slot, final_pos, swa_loc)
 
+    @_dsv41_ced_chunk.adapt_inject
     def inject_prefill(
         self,
         placement: PrefillPlacement,
@@ -144,6 +147,7 @@ class TargetHiddenKvInjector:
             swa_loc=placement.swa_loc,
         )
 
+    @_dsv41_ced_chunk.adapt_inject
     def inject_target_hidden(
         self,
         *,

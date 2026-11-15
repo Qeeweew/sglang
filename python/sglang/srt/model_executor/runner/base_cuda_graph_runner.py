@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41 import graph as _dsv41_graph
+
+
 import bisect
 import gc
 import logging
@@ -68,6 +71,7 @@ def freeze_gc(enable_cudagraph_gc: bool):
             gc.collect()
 
 
+@_dsv41_graph.adapt_capture_sizes
 def get_batch_sizes_to_capture(
     model_runner: ModelRunner,
     captured_req_width: int = 1,

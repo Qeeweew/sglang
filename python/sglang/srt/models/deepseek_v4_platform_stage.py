@@ -5,6 +5,9 @@ The mixins own platform mHC state, fusion, and TBO operations.
 
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41 import parallel as _dsv41_dp_buffers
+
+
 from functools import cached_property
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
@@ -324,6 +327,7 @@ class NonCudaDecoderMixin:
         # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
         return hidden_states, residual, post, comb
 
+    @_dsv41_dp_buffers.adapt_run
     def _run_moe_ffn_dp_sync(
         self,
         hidden_states: torch.Tensor,

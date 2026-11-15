@@ -20,6 +20,9 @@
 
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41 import moe as _dsv41_npu_moe
+
+
 import logging
 from contextlib import contextmanager, nullcontext
 from functools import cached_property
@@ -1065,6 +1068,7 @@ class DeepseekV2MoE(nn.Module):
             and get_exec().moe.ep_dispatch_algorithm not in ("fake", "lp")
         )
 
+    @_dsv41_npu_moe.adapt_forward
     def forward(
         self,
         hidden_states: torch.Tensor,

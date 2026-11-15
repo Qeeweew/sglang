@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41.dspark import worker as _dsv41_dspark
+
+
 from typing import Optional
 
 import msgspec
@@ -36,6 +39,7 @@ class MarkovGreedyStep:
     """
 
     @classmethod
+    @_dsv41_dspark.adapt_greedy
     def execute(
         cls,
         *,

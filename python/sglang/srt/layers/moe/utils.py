@@ -818,6 +818,10 @@ def is_moe_input_scattered_across_dp_ranks() -> bool:
 
 
 def should_use_dp_reduce_scatterv():
+    from sglang.srt.hardware_backend.npu.dsv41.parallel import _in_moe
+
+    if _in_moe.get():
+        return False
     """
     Whether the parallel configuration allows reduce_scatterv for returning an
     FFN output over attention DP (DP attention with EP), replacing the default

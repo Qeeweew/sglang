@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41 import dense_weights as _dsv41_weights
+from sglang.srt.hardware_backend.npu.dsv41 import linear as _dsv41_w8a16
+from sglang.srt.hardware_backend.npu.dsv41.attention import projections as _dsv41_projection
+from sglang.srt.hardware_backend.npu.dsv41 import mhc as _dsv41_mhc
+from sglang.srt.hardware_backend.npu.dsv41.prefill import replay as _dsv41_prefill
+
+
 import concurrent.futures
 import functools
 import logging
@@ -58,7 +65,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
     Dsv4NpuRoPE,
-    prime_rope_cos_sin,
+    prime_rope_cos_sin as _default_prime_rope_cos_sin,
     rope_cos_sin,
 )
 from sglang.srt.hardware_backend.npu.utils import (
@@ -173,9 +180,9 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     is_cross_layer_mhc_fusion_enabled,
 )
 from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
-    enter_late_layer_dp,
-    exit_late_layer_dp,
-    late_layer_dp_counts,
+    enter_late_layer_dp as _default_enter_late_layer_dp,
+    exit_late_layer_dp as _default_exit_late_layer_dp,
+    late_layer_dp_counts as _default_late_layer_dp_counts,
 )
 from sglang.srt.models.deepseek_common.moe_transport import (
     OverlappedMoeTransport,
@@ -509,6 +516,7 @@ def _wo_a_bf16_bmm_token_major(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Ten
     return result
 
 
+@_dsv41_projection.adapt_wo_a
 def _apply_wo_a_bf16_matmul(
     o: torch.Tensor,
     wo_a: torch.Tensor,
@@ -1013,6 +1021,7 @@ class MqaAttentionBase(nn.Module):
     wo_a_fp8_block128: bool = False
     use_mega_attention: bool = False
 
+    @_dsv41_w8a16.adapt_init
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -1222,6 +1231,7 @@ class MqaAttentionBase(nn.Module):
             or getattr(self.wo_b, "block_fp8_mxfp8_ready", False)
         )
 
+    @_dsv41_projection.adapt_kernel_heads
     def _kernel_num_heads(self, num_tokens: int) -> int:
         if self.attn_tp_size == 1:
             return self.n_local_heads
@@ -1711,6 +1721,7 @@ class MQALayer(MqaAttentionBase):
             return deepgemm_mxfp8_linear_input(y, y_sf)
         return _fp8_wo_a_einsum(o_fp8, o_s, *self.mega_wo_a, recipe=(1, 1, 32), out=out)
 
+    @_dsv41_projection.adapt_rope_positions
     def _get_npu_rope_position_cache(
         self,
         forward_batch: ForwardBatch,
@@ -2050,6 +2061,7 @@ class MQALayer(MqaAttentionBase):
             current_stream.wait_stream(stream_sources)
         return q
 
+    @_dsv41_projection.adapt_multi_prepare
     def _forward_prepare_multi_stream_npu(
         self,
         x: torch.Tensor,
@@ -2269,6 +2281,7 @@ class MQALayer(MqaAttentionBase):
 
         return q
 
+    @_dsv41_projection.adapt_prepare
     def _forward_prepare(
         self,
         x: torch.Tensor,
@@ -3370,6 +3383,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             self._hc_ffn_bf16_parts,
         )
 
+    @_dsv41_mhc.adapt_refresh
     def refresh_mhc_norm_weight_cache(self):
         # Cache bf16 norm weights so the fused path does not allocate/cast per forward.
         self._input_layernorm_weight_bf16 = (
@@ -3652,6 +3666,7 @@ def _needs_cp_tail_scatter(
     return _is_cuda and tail is not None and is_cp_active(forward_batch)
 
 
+@_dsv41_prefill.adapt_scatter_tail
 def _scatter_tail_rows(
     tail: LateLayerTail, rows: torch.Tensor, num_tokens: int, zero: bool = False
 ) -> torch.Tensor:
@@ -4021,7 +4036,7 @@ class DeepseekV4Model(nn.Module):
                 "decoder SWA bounded replay needs kv_source_layer_ids"
             )
             last_source = max(config.kv_source_layer_ids)
-            self.tail_writes_source_kv = True
+            self.tail_writes_source_kv = not (_is_npu and _dsv41_prefill.enabled())
             self.late_layer_start = (
                 last_source if self.tail_writes_source_kv else last_source + 1
             )
@@ -4200,6 +4215,8 @@ class DeepseekV4Model(nn.Module):
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
+        if _is_npu and _dsv41_mhc.enabled():
+            del hidden_states
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
@@ -4320,6 +4337,21 @@ class DeepseekV4Model(nn.Module):
                     dspark_aux_hidden_states.extend(aux)
                 residual_batch.clear(forward_batch)
                 return residual, pre, None
+            if i == self.late_layer_start and getattr(
+                forward_batch, "_dsv41_ced_skip_all", False
+            ):
+                backend = get_attn_backend()
+                backend._dsv41_skip_prefill_injection = True
+                backend._ced_pending = None
+                if capture_dspark:
+                    from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
+
+                    for _ in self.dspark_layers_to_capture:
+                        mhc_stream_mean(
+                            state.residual,
+                            out=dspark_aux_hidden_states.slot(state.residual[:, 0]),
+                        )
+                break
             if late_dp_counts is not None and i == self.late_layer_start:
                 saved_dp = enter_late_layer_dp(forward_batch, late_dp_counts)
                 if get_moe_a2a_backend().is_none():
@@ -4341,6 +4373,8 @@ class DeepseekV4Model(nn.Module):
                     cp_all_tokens=cp_extend,
                 )
                 state = state.with_residual(hidden_states)
+                if _is_npu and _dsv41_mhc.enabled():
+                    del hidden_states
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
             if capture_dspark and i in self.dspark_layers_to_capture:
@@ -4737,14 +4771,23 @@ class DeepseekV4Model(nn.Module):
             from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
             # The kernel widens each element to fp32 as it loads it.
-            hidden_states = mhc_combine(
-                pre_hc_head, last_pre, self.hc_mult, hidden_states.dtype
-            )
+            if _dsv41_mhc.enabled() and _is_npu:
+                hidden_states = _dsv41_mhc._head_combine(
+                    self, pre_hc_head, last_pre, self.hc_mult, hidden_states.dtype
+                )
+            else:
+                hidden_states = mhc_combine(
+                    pre_hc_head, last_pre, self.hc_mult, hidden_states.dtype
+                )
         else:
             hidden_states = self.hc_head(
                 hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
             )
-        hidden_states = self.norm(hidden_states)
+        hidden_states = (
+            _dsv41_mhc._head_norm(self, hidden_states)
+            if _dsv41_mhc.enabled() and _is_npu
+            else self.norm(hidden_states)
+        )
 
         # DSpark's model-boundary hook gathers compact tail rows. Other CP
         # outputs are gathered with this rank's full shard layout.
@@ -5088,6 +5131,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         return input_ids, input_embeds
 
+    @_dsv41_prefill.adapt_forward
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -5261,6 +5305,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.data = raw_scale.contiguous()
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
+    @_dsv41_projection.adapt_post_load
+    @_dsv41_w8a16.adapt_post_load
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
@@ -5964,6 +6010,7 @@ def _dequant_fp8_wo_a(
     yield from weights_dict.items()
 
 
+@_dsv41_weights.adapt_prepare
 def _prepare_deepseek_v4_weights(
     weights: Iterable[Tuple[str, torch.Tensor]],
     quant_config: Optional[QuantizationConfig],
@@ -6004,3 +6051,37 @@ def _fuse_deepseek_v4_wqkv_a_pair(
             )
         return q
     return torch.cat([q, kv], dim=0)
+
+
+def prime_rope_cos_sin(*args, **kwargs):
+    if _is_npu and _dsv41_projection.enabled():
+        return _dsv41_projection.prime_rope(*args, **kwargs)
+    return _default_prime_rope_cos_sin(*args, **kwargs)
+
+
+def late_layer_dp_counts(*args, **kwargs):
+    if _is_npu and _dsv41_prefill.enabled():
+        from sglang.srt.hardware_backend.npu.dsv41.prefill.parallel import (
+            late_layer_dp_counts as native,
+        )
+
+        return native(*args, **kwargs)
+    return _default_late_layer_dp_counts(*args, **kwargs)
+
+
+def enter_late_layer_dp(*args, **kwargs):
+    if _is_npu and _dsv41_prefill.enabled():
+        from sglang.srt.hardware_backend.npu.dsv41.prefill.parallel import (
+            enter_dp,
+        )
+
+        return enter_dp(*args, **kwargs)
+    return _default_enter_late_layer_dp(*args, **kwargs)
+
+
+def exit_late_layer_dp(*args, **kwargs):
+    if _is_npu and _dsv41_prefill.enabled():
+        from sglang.srt.hardware_backend.npu.dsv41.prefill.parallel import exit_dp
+
+        return exit_dp(*args, **kwargs)
+    return _default_exit_late_layer_dp(*args, **kwargs)

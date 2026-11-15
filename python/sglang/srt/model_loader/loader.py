@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41 import dense_weights as _dsv41_weights
+from sglang.srt.hardware_backend.npu.dsv41 import checkpoint as _dsv41_checkpoint
+
+
 # ruff: noqa: SIM117
 import collections
 import concurrent.futures
@@ -187,6 +191,7 @@ def loaded_checkpoint_files(
     return _checkpoint_files.get((model_or_path, revision))
 
 
+@_dsv41_weights.adapt_get_config
 def _get_quantization_config(
     model_config: ModelConfig,
     load_config: LoadConfig,
@@ -639,6 +644,7 @@ class DefaultModelLoader(BaseModelLoader):
 
         return hf_folder, hf_weights_files, use_safetensors
 
+    @_dsv41_checkpoint.adapt_iterator
     def _get_weights_iterator(
         self,
         source: Source,

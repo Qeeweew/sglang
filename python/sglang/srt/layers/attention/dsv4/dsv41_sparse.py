@@ -6,6 +6,9 @@ share that storage.
 
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41.attention import projections as _dsv41_projection
+
+
 from typing import Optional, Tuple
 
 import torch
@@ -159,6 +162,7 @@ class DeepseekV41Compressor(nn.Module):
                     hidden_size, head_dim, bias=False, dtype=torch.bfloat16
                 )
 
+    @_dsv41_projection.adapt_project
     def project(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.compress_ratio == 1:
             return self.wkv(x), None

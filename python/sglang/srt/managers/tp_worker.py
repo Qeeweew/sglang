@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41.prefill import replay as _dsv41_prefill
+
+
 import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -621,6 +624,7 @@ class TpModelWorker(BaseTpWorker):
         if self.model_runner._elastic_cuda_graph_enabled():
             self.model_runner.maybe_join_ep_ranks()
 
+    @_dsv41_prefill.adapt_worker_forward
     def forward_batch_generation(
         self,
         batch: Optional[ScheduleBatch],

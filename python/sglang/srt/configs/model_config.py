@@ -1,3 +1,6 @@
+from sglang.srt.hardware_backend.npu.dsv41.dspark import draft as _dsv41_draft
+
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1140,6 +1143,7 @@ class ModelConfig:
             is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
         )
 
+    @_dsv41_draft.adapt_draft_config
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
 

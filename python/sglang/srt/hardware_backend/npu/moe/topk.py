@@ -1,7 +1,6 @@
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from sgl_kernel_npu.operators.moe import moe_gating_top_k
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
@@ -15,6 +14,12 @@ from sglang.srt.layers.moe.topk import (
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
     from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
+
+
+def _gating_top_k(**kwargs):
+    from sgl_kernel_npu.operators.moe import moe_gating_top_k
+
+    return moe_gating_top_k(**kwargs)
 
 
 def fused_topk_npu(
@@ -37,7 +42,7 @@ def fused_topk_npu(
             if topk_config.apply_routed_scaling_factor_on_output
             else 1.0
         )
-        topk_weights, topk_ids, _ = moe_gating_top_k(
+        topk_weights, topk_ids, _ = _gating_top_k(
             x=router_logits.to(torch.float32),
             k=topk_config.top_k,
             bias=(
@@ -73,7 +78,7 @@ def fused_topk_npu(
         or topk_config.scoring_func == "sigmoid"
         or num_token_non_padded is not None
     ):
-        topk_weights, topk_ids, _ = moe_gating_top_k(
+        topk_weights, topk_ids, _ = _gating_top_k(
             x=router_logits.to(torch.float32),
             k=topk_config.top_k,
             bias=(

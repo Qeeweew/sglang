@@ -1,3 +1,5 @@
+from sglang.srt.hardware_backend.npu.dsv41.prefill import replay as _dsv41_prefill
+
 from copy import copy
 from typing import Any, Optional
 
@@ -98,6 +100,7 @@ def _tail_rows_on_original(
     return torch.cat(keep)
 
 
+@_dsv41_prefill.adapt_replay
 def run_encoder_swa_replay(worker, batch):
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.forward_mode import CaptureHiddenMode

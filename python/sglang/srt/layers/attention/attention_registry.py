@@ -208,6 +208,24 @@ def _create_nsa_compat(runner):
 
 @register_attention_backend("dsv4")
 def create_dsv4_backend(runner):
+    from sglang.srt.hardware_backend.npu.dsv41.policy import enabled
+
+    if (
+        enabled()
+        and runner.device.startswith("npu")
+        and runner.model_config.hf_config.model_type == "deepseek_v41"
+    ):
+        if runner.is_draft_worker and runner.spec_algorithm.is_dspark():
+            from sglang.srt.hardware_backend.npu.dsv41.dspark.draft import (
+                DSV41DraftBackend,
+            )
+
+            return DSV41DraftBackend(runner)
+        from sglang.srt.hardware_backend.npu.dsv41.attention.backend import (
+            DSV41AttentionBackend,
+        )
+
+        return DSV41AttentionBackend(runner)
     if (_is_hip or _is_npu) and get_exec().kernel.dsv4_prefill_backend == "cutedsl_h16":
         platform = "HIP" if _is_hip else "NPU"
         raise ValueError(

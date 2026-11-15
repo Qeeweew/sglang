@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41.prefill import cache as _dsv41_cache
+
+
 import atexit
 import json
 import logging
@@ -225,6 +228,7 @@ class UnifiedRadixCache(BasePrefixCache):
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
 
+    @_dsv41_cache.adapt_radix_init
     def __init__(
         self,
         params: CacheInitParams,
@@ -682,6 +686,7 @@ class UnifiedRadixCache(BasePrefixCache):
             "sorted(result.window_host_hit_lengths.items())",
         ],
     )
+    @_dsv41_cache.adapt_match
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:
@@ -728,6 +733,7 @@ class UnifiedRadixCache(BasePrefixCache):
         ).page_aligned(self.page_size)
         return self.linker.skip_offload_prefix(len(skip_key))
 
+    @_dsv41_cache.adapt_fast
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 
@@ -1569,6 +1575,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
 
+    @_dsv41_cache.adapt_checkpoint
     def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
         move its tree lock onto the node the insert ended on."""

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41.dspark import draft as _dsv41_draft
+
+
 import copy
 import logging
 from contextlib import nullcontext
@@ -100,6 +103,7 @@ def apply_rotary_emb(
 
 
 class DSparkAttention(MqaAttentionBase):
+    @_dsv41_draft.adapt_attention_init
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -242,6 +246,7 @@ class DSparkAttention(MqaAttentionBase):
             return q_out
         return q
 
+    @_dsv41_draft.adapt_forward
     def forward(
         self,
         positions: torch.Tensor,
@@ -673,7 +678,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     # ModelSlim NPU checkpoints carry QuaRot-aligned, MTP-local
     # embedding/head weights. The native CUDA path keeps the original DSpark
     # behavior and shares the target model's vocabulary modules.
-    uses_own_vocab_modules = _is_npu and not is_npu_arch35()
+    uses_own_vocab_modules = (
+        _is_npu and not is_npu_arch35() and not _dsv41_draft.enabled()
+    )
     precompile_kernels_after_loading = (
         DeepseekV4ForCausalLM.precompile_kernels_after_loading
     )
@@ -835,6 +842,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         projected, _ = stage0.main_proj(main_hidden)
         return stage0.main_norm(projected)
 
+    @_dsv41_draft.adapt_inject
     def write_target_hidden_kv(
         self,
         *,
@@ -1003,6 +1011,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             markov_head=self.markov_head,
         )
 
+    @_dsv41_draft.adapt_load
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         loaded_params = set()

@@ -27,6 +27,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 )
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.device_pool_info import MLABufferInfo, MLASplitBuffers
+from sglang.srt.mem_cache.pool_host._kvcacheio import npu_kv_cache_ops
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
     MLA_KVCACHEIO_OPS,
     require_kvcacheio_ops,
@@ -70,13 +71,7 @@ elif _is_xpu:
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
     )
-if _is_npu:
-    from sgl_kernel_npu.operators.mem_cache import (
-        transfer_kv_all_layer_kv_split,
-        transfer_kv_all_layer_kv_split_lf_pf,
-        transfer_kv_per_layer_kv_split,
-        transfer_kv_per_layer_kv_split_pf_lf,
-    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -660,9 +655,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_kv_split":
-                transfer = transfer_kv_per_layer_kv_split_pf_lf
+                transfer = npu_kv_cache_ops().transfer_kv_per_layer_kv_split_pf_lf
             elif self.layout == "layer_first_kv_split":
-                transfer = transfer_kv_per_layer_kv_split
+                transfer = npu_kv_cache_ops().transfer_kv_per_layer_kv_split
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
             binding = self._npu_layer_bindings[layer_id]
@@ -999,9 +994,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_kv_split":
-                transfer = transfer_kv_all_layer_kv_split_lf_pf
+                transfer = npu_kv_cache_ops().transfer_kv_all_layer_kv_split_lf_pf
             elif self.layout == "layer_first_kv_split":
-                transfer = transfer_kv_all_layer_kv_split
+                transfer = npu_kv_cache_ops().transfer_kv_all_layer_kv_split
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
             for native, host_k, host_v, is_target in self._npu_pool_bindings:

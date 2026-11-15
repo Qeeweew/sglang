@@ -147,6 +147,12 @@ def uses_draft_swa_ring() -> bool:
     """Whether the DSpark draft keeps its SWA KV in a per-request ring, so no SWA
     state is tree-owned under encoder replay. The HIP backend still addresses the
     draft SWA through the target's paged full-to-SWA mapping."""
+    from sglang.srt.hardware_backend.npu.dsv41.policy import enabled as native_910b
+
+    # The 910B draft backend and its fused page metadata address SWA through
+    # the target's FULL-to-SWA mapping. Keep paged draft storage on this path.
+    if native_910b() and get_platform().is_npu:
+        return False
     return get_exec().features.enable_encoder_swa_bounded_replay and not _is_hip
 
 
@@ -1239,7 +1245,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 ),
                 kv_layout=self.kv_layout,
             )
-            self.request_window_memory = RequestWindowMemory(
+            window_memory_cls = RequestWindowMemory
+            if getattr(self, "_dsv41_910b", False):
+                from sglang.srt.hardware_backend.npu.dsv41.attention.request_window import (
+                    BF16RequestWindowMemory,
+                )
+
+                window_memory_cls = BF16RequestWindowMemory
+            self.request_window_memory = window_memory_cls(
                 window_spec,
                 dtype=dtype,
                 device=device,

@@ -1,0 +1,17 @@
+# One component inventory shared with the Python host builder.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/native/components.json" component_registry)
+string(JSON component_count LENGTH "${component_registry}" components)
+math(EXPR component_last "${component_count} - 1")
+set(DSV41_ALL_COMPONENTS)
+foreach(index RANGE ${component_last})
+  string(JSON name GET "${component_registry}" components ${index} name)
+  list(APPEND DSV41_ALL_COMPONENTS "${name}")
+endforeach()
+
+function(dsv41_add_component name)
+  if(NOT name IN_LIST DSV41_ALL_COMPONENTS)
+    message(FATAL_ERROR "Unknown native component: ${name}")
+  endif()
+  set(directory "${CMAKE_CURRENT_SOURCE_DIR}/native/${name}")
+  target_sources(dsv41_kernels PRIVATE "${directory}/binding.cpp" "${directory}/launch.cpp")
+endfunction()

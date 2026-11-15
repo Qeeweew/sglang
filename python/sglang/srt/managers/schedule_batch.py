@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41.prefill import replay as _dsv41_prefill
+
+
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -1211,6 +1214,7 @@ class Req(ReqDllmMixin):
                 )
             )
 
+    @_dsv41_prefill.adapt_cap
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
@@ -2340,6 +2344,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 continue
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
+    @_dsv41_prefill.adapt_prepare
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 

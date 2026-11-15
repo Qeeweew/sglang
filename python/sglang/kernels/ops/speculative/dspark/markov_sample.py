@@ -1,6 +1,9 @@
 """One Markov draft step: add the step bias and pick one token per row, the
 argmax at temperature 0 and a Gumbel-max sample otherwise."""
 
+from sglang.srt.hardware_backend.npu.dsv41.dspark import worker as _dsv41_dspark
+
+
 import functools
 from typing import Callable, Optional
 
@@ -245,6 +248,7 @@ class MarkovSampleStep:
     ``has_sampled_rows=False`` argmaxes every row."""
 
     @classmethod
+    @_dsv41_dspark.adapt_markov
     def execute(cls, **kwargs) -> torch.Tensor:
         if inputs_on_cuda(**kwargs):
             if _is_npu:

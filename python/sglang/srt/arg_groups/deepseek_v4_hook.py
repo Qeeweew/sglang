@@ -117,6 +117,17 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
         if legacy:
             logger.warning("--engram-config is set; ignoring %s.", ", ".join(legacy))
         config = EngramConfig.from_dict(raw)
+    from sglang.srt.hardware_backend.npu.dsv41.policy import enabled as native_910b
+
+    if cfg.device == "npu" and native_910b():
+        required = EngramConfig(
+            placement=EngramPlacement.CPU, replication=EngramReplication.PER_NODE
+        )
+        if raw is not None and config != required:
+            raise ValueError(
+                "910B Engram requires shared compressed host tables with lookup=auto"
+            )
+        config = required
     if config.lookup == EngramLookup.PEER_READ and not get_platform().is_cuda:
         raise ValueError("--engram-config: lookup 'peer_read' needs CUDA.")
     if config.lookup in (EngramLookup.REDUCE_SCATTER, EngramLookup.ALL_TO_ALL) and (
@@ -371,7 +382,19 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             "DeepSeek-V4.1 TRT-LLM requires --cuda-graph-backend-prefill "
             "disabled or breakable"
         )
-    if cfg.enable_encoder_swa_bounded_replay:
+    from sglang.srt.hardware_backend.npu.dsv41.policy import enabled as dsv41_910b
+
+    native_910b = cfg.device == "npu" and dsv41_910b()
+    if native_910b:
+        from sglang.srt.hardware_backend.npu.dsv41.prefill.replay import (
+            validate_options,
+            validate_ced_config,
+        )
+
+        validate_options(cfg)
+        if cfg.enable_decoder_swa_bounded_replay:
+            validate_ced_config(model_config_of(server_args).hf_config)
+    if cfg.enable_encoder_swa_bounded_replay and not native_910b:
         incompatible = (
             (
                 "hardware other than CUDA or gfx950",
@@ -464,6 +487,18 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "both servers use the same block size and target/draft KV layout."
             )
 
+    if native_910b:
+        # The 910B profile opts into the qualified eager CED path explicitly.
+        # Retain that choice instead of applying the CUDA/ROCm auto-default.
+        declare_resolution(
+            server_args,
+            "validate_deepseek_v41_features",
+            enable_decoder_swa_bounded_replay=bool(
+                cfg.enable_decoder_swa_bounded_replay
+            ),
+        )
+        return
+
     incompatible = (
         (
             "prefill CP with the prefill CUDA graph",
@@ -491,7 +526,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             ),
         ),
     )
-    if cfg.enable_decoder_swa_bounded_replay:
+    if cfg.enable_decoder_swa_bounded_replay and not native_910b:
         for feature, unsupported in incompatible:
             if unsupported:
                 raise ValueError(

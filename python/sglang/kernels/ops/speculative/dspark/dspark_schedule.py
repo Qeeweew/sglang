@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41.dspark import worker as _dsv41_dspark
+
+
 from typing import TYPE_CHECKING
 
 import torch
@@ -21,6 +24,7 @@ if TYPE_CHECKING:
 
 class ScheduleVerifyLensTopk:
     @classmethod
+    @_dsv41_dspark.adapt_schedule
     def execute(cls, *args, **kwargs) -> torch.Tensor:
         # All NPU archs route to the bit-exact torch reference: the triton
         # kernel body (2D broadcast compare + axis-1 reduce, loop-carried

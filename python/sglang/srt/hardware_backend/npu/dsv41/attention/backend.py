@@ -1,0 +1,831 @@
+"""V4.1 attention adapter over the independently built 910B ops.
+
+Prefill uses scheduler metadata; decode/verify build device metadata in Graph.
+Buffers retain their addresses across replay; forward never reads the host.
+"""
+
+from __future__ import annotations
+
+import logging
+from types import SimpleNamespace
+
+import torch
+from sglang.srt.hardware_backend.npu.dsv41.dspark import verify as _dsv41_verify
+from sglang.srt.hardware_backend.npu.dsv41.attention.projections import (
+    cached_rope,
+    gather_rope,
+)
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+
+logger = logging.getLogger(__name__)
+
+
+class DSV41AttentionBackend(AttentionBackend):
+    # Scheduler CPU lengths remain available for prefill. Decode and verify use
+    # device positions, so FutureMap must not pull a per-round CPU mirror.
+    needs_cpu_seq_lens = False
+
+    def commit_after_verify(self, lengths):
+        from sglang.srt.hardware_backend.npu.dsv41.dspark.verify import _commit
+
+        return _commit(self, lengths)
+
+    def __init__(self, runner):
+        from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import PositionQuant
+
+        self.config = runner.model_config.hf_config
+        self.pool = runner.token_to_kv_pool
+        self.req_pool = runner.req_to_token_pool
+        self.token_to_kv_pool = self.pool
+        self.req_to_token_pool = self.req_pool
+        self.device = torch.device(runner.device)
+        if self.device.index is None:
+            self.device = torch.device("npu", torch.npu.current_device())
+        self.data_type = self.kv_cache_dtype = torch.bfloat16
+        self.position = PositionQuant(device=self.device)
+        self.context_len = runner.model_config.context_len
+        # The request pool includes speculative/overlap lanes after the user
+        # context limit. QLI must also see their final page: a six-row verify
+        # can cross the limit even when the accepted output is within it.
+        token_table = getattr(self.req_pool, "req_to_token", None)
+        table_capacity = (
+            self.context_len if token_table is None else token_table.shape[1]
+        )
+        self.max_seq = ((table_capacity + 127) // 128) * 128
+        self.page_columns = torch.arange(0, self.max_seq, 128, device=self.device)
+        args = runner.server_args
+        if getattr(args, "attn_cp_size", 1) != 1:
+            raise ValueError("V4.1/910B attention CP is not qualified")
+        attn_tp = args.tp_size // args.attn_dp_size
+        if args.tp_size % args.attn_dp_size or attn_tp not in (1, 2, 4):
+            raise ValueError(
+                "V4.1/910B supports attention TP1/2/4 with complete DP groups"
+            )
+        self.local_heads = self.config.num_attention_heads // attn_tp
+        self.batch_capacity = args.max_running_requests
+        chunk = args.chunked_prefill_size
+        if (
+            self.batch_capacity is None
+            or chunk is None
+            or min(self.batch_capacity, chunk) <= 0
+        ):
+            raise ValueError(
+                "V4.1 attention requires explicit positive max_running_requests and chunked_prefill_size"
+            )
+        self.buckets = {}
+        self.operators = {}
+        self.sources = {}
+        self.request_prefixes = {}
+        self.pool.register_request_state_owner(self)
+        self.request_window = self.pool.request_window
+        self.forward_metadata = None
+        self.low_ratio_prefill_graph = False
+        self.tail_forward_metadata = None
+        from sglang.srt.hardware_backend.npu.dsv41.prefill.replay import ced_enabled
+
+        self.ced_enabled = ced_enabled()
+        self.ced = None
+        self._tail_saved = None
+        self._ced_pending = None
+        self.invalid_requests = set()
+        if self.ced_enabled:
+            from sglang.srt.hardware_backend.npu.dsv41.prefill.replay import (
+                ced_tail_window,
+                validate_ced_config,
+            )
+            from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import CED
+
+            self.ced_cut = validate_ced_config(self.config)
+            self.ced_window = ced_tail_window(self.config)
+            self.ced = CED(device=self.device)
+
+    def clear_request_state(self, request):
+        self.request_prefixes.pop(request, None)
+        if self.request_window is not None:
+            self.request_window.valid_starts.pop(request, None)
+        self.invalid_requests.discard(request)
+        for source in self.sources.values():
+            source.state.committed_lengths[request].zero_()
+            source.state.pending[request].zero_()
+
+    def init_cuda_graph_state(self, max_bs, max_num_tokens):
+        pass
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1
+
+    @torch.inference_mode(False)
+    def _bucket(self, batch, rows, decode):
+        # Scheduler metadata can outlive the inference-mode scope that first
+        # requested it (e.g. Graph capture followed by eager preparation).
+        from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import (
+            QLIPlan,
+            SparseAttention,
+            WindowAttention,
+        )
+
+        key = (batch, rows, decode)
+        if key in self.buckets:
+            return self.buckets[key]
+        if min(batch, rows) <= 0 or max(batch, rows) >= 2**31:
+            raise ValueError("attention requires positive INT32 request/token counts")
+        eager = decode is False or decode == "tail"
+        if eager:
+            # Keep one eager metadata generation. Decode/verify metadata owns
+            # captured addresses and stays pinned; kernels are shared below.
+            for old_key in tuple(self.buckets):
+                if old_key[2] == decode:
+                    old = self.buckets.pop(old_key)
+                    if self.forward_metadata is old:
+                        self.forward_metadata = None
+                    del old
+        window_reuse = batch == 1
+        if window_reuse not in self.operators:
+            self.operators[window_reuse] = SimpleNamespace(
+                swa=WindowAttention(heads=self.local_heads),
+                sparse={
+                    r: SparseAttention(
+                        ratio=r,
+                        window_reuse=window_reuse,
+                        heads=self.local_heads,
+                    )
+                    for r in (1, 2)
+                },
+            )
+        operators = self.operators[window_reuse]
+
+        def empty(shape, dtype):
+            return torch.zeros(shape, dtype=dtype, device=self.device)
+
+        meta = SimpleNamespace(
+            batch=batch,
+            rows=rows,
+            cu=empty((batch + 1,), torch.int32),
+            lengths=empty((batch,), torch.int32),
+            requests=empty((batch,), torch.int32),
+            accepted=empty((batch,), torch.int32),
+            table=empty((batch, self.max_seq // 128), torch.int32),
+            compressed_table=empty((batch, self.max_seq // 128), torch.int32),
+            cmp_lengths={r: empty((batch,), torch.int32) for r in (1, 2)},
+            residual={r: empty((batch,), torch.int32) for r in (1, 2)},
+            indices={
+                r: torch.full((rows, 1, 512), -1, dtype=torch.int32, device=self.device)
+                for r in (1, 2)
+            },
+            window=empty((rows, 1), torch.int32),
+            swa_slots=empty((rows,), torch.int64),
+            full_slots=empty((rows,), torch.int64),
+            starts=empty((batch,), torch.int64),
+            swa=operators.swa,
+            sparse=operators.sparse,
+            plans={},
+            qli_plans={},
+            candidates=None,
+            late_layer_tail=None,
+        )
+        # QLI and attention use the same exact request and query extents.
+        cu = torch.tensor([0] * batch + [rows], dtype=torch.int32, device="cpu")
+        lengths = torch.full((batch,), rows, dtype=torch.int32, device="cpu")
+        pages = torch.zeros(
+            (batch, self.max_seq // 128), dtype=torch.int32, device="cpu"
+        )
+        for layer in self.config.index_source_layer_ids:
+            if self.ced_enabled and decode is False and layer >= self.ced_cut:
+                # These Indexer sources run only with the bounded tail metadata.
+                continue
+            r = self.config.compress_ratios[layer]
+            mode = (
+                "source"
+                if layer == self.config.candidate_source_layer_id
+                else "consumer"
+                if layer > self.config.candidate_source_layer_id >= 0
+                else "off"
+            )
+            # Indexer layers execute serially and already share meta.indices.
+            # Their sequence metadata, schedule and scratch depend on ratio
+            # and candidate mode, not the layer's weights or K cache.
+            if (r, mode) not in meta.qli_plans:
+                meta.qli_plans[r, mode] = QLIPlan(
+                    cu,
+                    lengths // r,
+                    pages,
+                    ratio=r,
+                    residual=lengths % r,
+                    page_size=128 // r,
+                    candidate_mode=mode,
+                    device=self.device,
+                )
+                plan = meta.qli_plans[r, mode]
+                key_storage = self.pool.index_pools[r].index_k_buffer[0]
+                plan.bind_metadata(
+                    meta.cu[: batch + 1],
+                    meta.cmp_lengths[r][:batch],
+                    meta.compressed_table[:batch],
+                    residual=meta.residual[r][:batch],
+                    page_count=key_storage.numel() // ((128 // r) * 128),
+                    max_key_length=self.max_seq // r,
+                )
+            plan = meta.qli_plans[r, mode]
+            meta.plans[layer] = plan
+            if mode == "source":
+                meta.candidates = plan.candidate_out
+        self.buckets[key] = meta
+        return meta
+
+    @_dsv41_verify.adapt_metadata
+    def init_forward_metadata_out_graph(self, fb, in_capture=False):
+        self._dsv41_skip_prefill_injection = False
+        if fb.forward_mode.is_idle():
+            return
+        self.tail_forward_metadata = None
+        self._ced_pending = None
+        if fb.forward_mode.is_decode():
+            return self._stage_decode_metadata(fb)
+        if not fb.forward_mode.is_extend_without_speculative():
+            raise ValueError(
+                "V4.1 910B integration currently accepts ordinary prefill/decode"
+            )
+        batch, rows = fb.batch_size, fb.input_ids.numel()
+        counts = list(fb.extend_seq_lens_cpu)
+        if len(counts) != batch or any(n < 0 for n in counts):
+            raise ValueError(
+                "V4.1 prefill requires one nonnegative query count per request"
+            )
+        lengths = fb.seq_lens_cpu[:batch].to(device="cpu", dtype=torch.int32)
+        if bool(((lengths < 0) | (lengths > self.context_len)).any()):
+            raise ValueError("V4.1 request exceeds deployment context capacity")
+        requests = fb.req_pool_indices[:batch].to(device="cpu", dtype=torch.int64)
+        if self.invalid_requests.intersection(requests.tolist()):
+            raise RuntimeError(
+                "V4.1 request state is invalid after a failed CED forward; release the request slot"
+            )
+        padding = rows - sum(counts)
+        if padding < 0 or (padding and getattr(fb, "dp_padding_mode", None) is None):
+            raise ValueError(
+                "V4.1 attention query rows disagree with scheduler metadata"
+            )
+        token_table = self.req_pool.req_to_token
+        page_indices = (
+            fb.req_pool_indices[:batch].long()[:, None] * token_table.shape[1]
+            + self.page_columns[None, :]
+        )
+        full_pages = (
+            token_table.view(-1).index_select(0, page_indices.flatten()).view(batch, -1)
+        )
+        pages = (full_pages // 128).int()
+        # FULL and compressed pools share page IDs. SWA pages have a separate
+        # allocator, so translate the first token of every FULL page.
+        swa_pages = None
+        if self.request_window is None:
+            swa_pages = (
+                self.pool.translate_loc_from_full_to_swa(full_pages.long()) // 128
+            ).int()
+
+        if padding:
+            # MLP sync aligns token rows to attention TP (or the MAX_LEN DP
+            # stride), without adding a request to scheduler metadata. Keep Cu
+            # a complete partition: a private dummy request owns the suffix,
+            # sees no KV, writes no cache and commits no compressor state.
+            counts.append(padding)
+            lengths = torch.cat((lengths, lengths.new_zeros(1)))
+            requests = torch.cat((requests, requests.new_zeros(1)))
+            pages = torch.cat((pages, torch.zeros_like(pages[:1])))
+            if swa_pages is not None:
+                swa_pages = torch.cat((swa_pages, torch.zeros_like(swa_pages[:1])))
+            batch += 1
+        meta = self._bucket(batch, rows, False)
+        cu = torch.tensor([0] + counts, dtype=torch.int32, device="cpu").cumsum(0).int()
+        meta.cu.copy_(cu)
+        meta.lengths.copy_(lengths)
+        # NPU req pool reserves row zero for Graph padding. Give every padded
+        # request a private state slot, and never commit its fabricated query.
+        dummy = requests == 0
+        for request, length, count in zip(requests.tolist(), lengths.tolist(), counts):
+            if request == 0:
+                continue
+            start = length - count
+            if start % 2 and self.request_prefixes.get(request) != start:
+                # Speculative commits are device-only. An eager continuation
+                # can inspect the existing source state at this rare boundary.
+                pair_sources = [s for s in self.sources.values() if s.ratio == 2]
+                if not pair_sources or any(
+                    int(s.state.committed_lengths[request].item()) != start
+                    for s in pair_sources
+                ):
+                    raise ValueError(
+                        "an odd V4.1 continuation requires its committed C2 pending pair"
+                    )
+            self.request_prefixes[request] = length
+        state_ids = torch.where(
+            dummy, self.pool.num_req_slots + torch.arange(batch, device="cpu"), requests
+        )
+        meta.requests.copy_(state_ids.int())
+        meta.accepted.copy_(
+            torch.where(dummy, 0, torch.tensor(counts, dtype=torch.int32, device="cpu"))
+        )
+        meta.starts.copy_(
+            torch.where(
+                dummy,
+                0,
+                lengths.long() - torch.tensor(counts, dtype=torch.int64, device="cpu"),
+            )
+        )
+        if swa_pages is not None:
+            meta.table.copy_(swa_pages)
+        meta.compressed_table.copy_(pages)
+        # Replay views use captured query buffers but retain the runtime's
+        # unpadded cache locations. An idle DP rank therefore has no locations.
+        # Keep dummy queries in the collective without letting them write KV.
+        slots = fb.out_cache_loc.long()
+        slot_rows = slots.numel()
+        if slot_rows > rows:
+            raise ValueError("V4.1 cache locations exceed captured query rows")
+        meta.full_slots.fill_(-1)
+        meta.swa_slots.fill_(-1)
+        if slot_rows:
+            live = torch.repeat_interleave(
+                ~dummy, torch.tensor(counts, dtype=torch.int64, device="cpu")
+            )[:slot_rows].to(self.device)
+            meta.full_slots[:slot_rows].copy_(torch.where(live, slots, -1))
+            if self.request_window is None:
+                translated = self.pool.translate_loc_from_full_to_swa(slots)
+                meta.swa_slots[:slot_rows].copy_(torch.where(live, translated, -1))
+        for r in (1, 2):
+            meta.cmp_lengths[r].copy_(lengths // r)
+            meta.residual[r].copy_(lengths % r)
+        self.forward_metadata = meta
+        meta.window.zero_()
+        meta.source_rows = None
+        if self.request_window is not None:
+            # SGLang can append a private TP/DP padding request. It owns no
+            # main KV, replay history or source-compressor rows.
+            floors_cpu = list(
+                getattr(fb, "_dsv41_swa_floor", None) or [0] * fb.batch_size
+            )
+            main_prefix = list(
+                getattr(fb, "_dsv41_main_prefix", None)
+                or (
+                    lengths[: fb.batch_size].long()
+                    - torch.tensor(counts[: fb.batch_size])
+                ).tolist()
+            )
+            floors_cpu.extend([0] * (batch - len(floors_cpu)))
+            main_prefix.extend([0] * (batch - len(main_prefix)))
+            floors = torch.tensor(floors_cpu, dtype=torch.int64, device=self.device)
+            self.request_window.prepare(meta, counts=counts, floors=floors)
+            source_counts = [
+                int(length) - prefix for length, prefix in zip(lengths, main_prefix)
+            ]
+            source_rows = torch.cat(
+                [
+                    torch.arange(int(cu[i + 1]) - count, int(cu[i + 1]), device="cpu")
+                    for i, count in enumerate(source_counts)
+                ]
+            )
+            # A cold, unpadded chunk projects every row. Keep that ordinary
+            # view instead of copying the full activation at each KV owner.
+            meta.source_rows = (
+                None if source_counts == counts else source_rows.to(self.device)
+            )
+            meta.source_cu = (
+                torch.tensor([0] + source_counts, dtype=torch.int32)
+                .cumsum(0)
+                .int()
+                .to(self.device)
+            )
+            meta.source_starts = torch.tensor(
+                main_prefix, dtype=torch.int64, device=self.device
+            )
+            meta.source_counts = torch.tensor(
+                source_counts, dtype=torch.int32, device=self.device
+            )
+            meta.source_slots = (
+                meta.full_slots
+                if meta.source_rows is None
+                else meta.full_slots.index_select(0, meta.source_rows)
+            )
+            meta.window[:, 0].copy_(
+                (
+                    fb.positions
+                    - floors.repeat_interleave(
+                        torch.tensor(counts, device=self.device), output_size=rows
+                    )
+                    + 1
+                )
+                .clamp(1, 128)
+                .int()
+            )
+        if self.ced_enabled:
+            # CPU coverage bookkeeping happens outside decode/verify capture.
+            coverage = self.pool._dsv41_ced_coverage
+            if coverage is not None:
+                full_cpu = meta.full_slots.cpu()
+                coverage.invalidate(full_cpu)
+            self._init_tail_metadata(fb, meta, cu, counts, lengths)
+
+    def _stage_decode_metadata(self, fb):
+        """Stage only device inputs; positions carry the actual decode prefix.
+
+        The replay view uses captured rows even on an idle attention DP rank.
+        Its request zero must neither write KV nor advance a real compressor.
+        Cache locations can contain fewer rows than the captured batch.
+        """
+        batch = fb.batch_size
+        if fb.input_ids.numel() != batch or fb.positions.numel() != batch:
+            raise ValueError("ordinary decode requires one input row per request")
+        meta = self._bucket(batch, batch, True)
+        if not hasattr(meta, "decode_requests"):
+            meta.decode_requests = torch.empty(
+                batch, dtype=torch.int64, device=self.device
+            )
+        if self.invalid_requests:
+            requests = fb.req_pool_indices[:batch].cpu().tolist()
+            if self.invalid_requests.intersection(requests):
+                raise RuntimeError(
+                    "release V4.1 request slots invalidated by a failed CED forward"
+                )
+        slots = fb.out_cache_loc
+        if slots.numel() > batch:
+            raise ValueError("decode cache locations exceed captured query rows")
+        meta.full_slots.fill_(-1)
+        meta.full_slots[: slots.numel()].copy_(slots)
+        meta.decode_requests.copy_(fb.req_pool_indices[:batch])
+        meta.starts.copy_(fb.positions)
+        self.forward_metadata = meta
+        # Allocator free/remap invalidates CED coverage for the new suffix.
+        # As with verify, no CPU coverage readback is needed here.
+
+    @_dsv41_verify.adapt_metadata_in_graph
+    def init_forward_metadata_in_graph(self, fb):
+        if not fb.forward_mode.is_decode():
+            return
+        meta = self.forward_metadata
+        batch, requests = meta.batch, meta.decode_requests
+        live = requests != 0
+        prefix = torch.where(live, meta.starts, 0)
+        total = (prefix + 1).int()
+        meta.cu.copy_(torch.arange(batch + 1, dtype=torch.int32, device=self.device))
+        meta.lengths.copy_(total)
+        meta.requests.copy_(
+            torch.where(
+                live,
+                requests,
+                self.pool.num_req_slots + torch.arange(batch, device=self.device),
+            ).int()
+        )
+        meta.accepted.copy_(live.int())
+        meta.starts.copy_(prefix)
+        token_table = self.req_pool.req_to_token
+        indices = requests[:, None] * token_table.shape[1] + self.page_columns[None, :]
+        full_pages = (
+            token_table.view(-1).index_select(0, indices.flatten()).view(batch, -1)
+        )
+        meta.compressed_table.copy_((full_pages // 128).int())
+        if self.request_window is None:
+            meta.table.copy_(
+                (
+                    self.pool.translate_loc_from_full_to_swa(full_pages.long()) // 128
+                ).int()
+            )
+        meta.full_slots.masked_fill_(~live, -1)
+        if self.request_window is None:
+            translated = self.pool.translate_loc_from_full_to_swa(meta.full_slots)
+            meta.swa_slots.copy_(torch.where(live, translated, -1))
+        for ratio in (1, 2):
+            meta.cmp_lengths[ratio].copy_(total // ratio)
+            meta.residual[ratio].copy_(total % ratio)
+        if self.request_window is not None:
+            self.request_window.prepare(meta, width=1)
+
+    def _init_tail_metadata(self, fb, full, cu, counts, lengths):
+        from sglang.srt.hardware_backend.npu.dsv41.prefill.replay import TailRows
+
+        prompt_lengths = getattr(fb, "_dsv41_prompt_lengths", None)
+        if prompt_lengths is not None:
+            prompt_lengths = list(prompt_lengths) + [0] * (
+                full.batch - len(prompt_lengths)
+            )
+        cutoffs = [
+            max(0, p - self.ced_window)
+            for p in (
+                prompt_lengths if prompt_lengths is not None else lengths.tolist()
+            )
+        ]
+        tail_counts = [
+            max(1, min(n, int(length) - cutoff)) if n and length > 0 else 0
+            for n, length, cutoff in zip(counts, lengths, cutoffs)
+        ]
+        fb._dsv41_ced_empty_chunk = prompt_lengths is not None and not any(
+            n > 0 and length > cutoff
+            for n, length, cutoff in zip(counts, lengths, cutoffs)
+        )
+        row_map = torch.cat(
+            [
+                torch.arange(int(cu[i + 1]) - n, int(cu[i + 1]), dtype=torch.int32)
+                for i, n in enumerate(tail_counts)
+            ]
+        ).to(self.device)
+        rows = sum(tail_counts)
+        tail = self._bucket(full.batch, rows, "tail")
+        tail_cu = (
+            torch.tensor([0] + tail_counts, dtype=torch.int32, device="cpu")
+            .cumsum(0)
+            .int()
+        )
+        tail.cu.copy_(tail_cu)
+        for name in ("lengths", "table", "compressed_table"):
+            target = getattr(tail, name)
+            target.copy_(getattr(full, name))
+        tail.requests.copy_(full.requests)
+        tail.accepted.copy_(torch.tensor(tail_counts, dtype=torch.int32, device="cpu"))
+        tail.accepted.masked_fill_(full.accepted == 0, 0)
+        tail.starts.copy_(lengths.long() - torch.tensor(tail_counts, device="cpu"))
+        tail.starts.masked_fill_(full.accepted == 0, 0)
+        self.ced.gather(full.full_slots, row_map, out=tail.full_slots)
+        self.ced.gather(full.swa_slots, row_map, out=tail.swa_slots)
+        for r in (1, 2):
+            tail.cmp_lengths[r].copy_(full.cmp_lengths[r])
+            tail.residual[r].copy_(full.residual[r])
+        tail.window.zero_()
+        floor_lengths = torch.cat(
+            [
+                # A whole extend retains the preceding chunk's valid SWA KV.
+                # A truncated extend must mask its uncomputed local prefix.
+                torch.zeros(n, dtype=torch.int32, device="cpu")
+                if n == count
+                else torch.arange(1, n + 1, dtype=torch.int32, device="cpu")
+                for n, count in zip(tail_counts, counts)
+            ]
+        )
+        tail.window[:rows, 0].copy_(floor_lengths)
+        tail.late_layer_tail = TailRows(
+            token_indices=row_map.long(),
+            positions=self.ced.gather(fb.positions.long().contiguous(), row_map),
+            extend_seq_lens=torch.tensor(
+                tail_counts[: fb.batch_size], dtype=torch.int32, device=self.device
+            ),
+            extend_seq_lens_cpu=tail_counts[: fb.batch_size],
+            swa_out_cache_loc=tail.swa_slots,
+            row_map=row_map,
+            movement=self.ced,
+        )
+        tail.fb_scalars = {
+            name: value.new_tensor(rows)
+            for name in ("num_token_non_padded", "global_num_token_non_padded")
+            if (value := getattr(fb, name, None)) is not None
+        }
+        self.tail_forward_metadata = tail
+        if self.request_window is not None:
+            floors = list(getattr(fb, "_dsv41_swa_floor", None) or [0] * fb.batch_size)
+            floors.extend([0] * (full.batch - len(floors)))
+            floor = torch.maximum(
+                torch.tensor(floors, device=self.device),
+                torch.tensor(cutoffs, device=self.device),
+            )
+            plan = self.request_window.prepare(tail, counts=tail_counts, floors=floor)
+            row_floor = floor.repeat_interleave(
+                torch.tensor(tail_counts, device=self.device), output_size=rows
+            )
+            valid = plan.positions >= row_floor
+            tail.swa_slots.masked_fill_(~valid, -1)
+            plan.commit_dst.masked_fill_(~valid, -1)
+            tail.window[:, 0].copy_(
+                (plan.positions - row_floor + 1).clamp(1, 128).int()
+            )
+            self.request_window.activate(full.ring_plan)
+            return
+        # No device readback in the layer loop or the completion hooks.
+        keep = torch.cat(
+            [
+                # All retained rows were computed. The extra rollback rows
+                # can complete the window at a preceding page boundary.
+                torch.arange(int(cu[i + 1]) - n, int(cu[i + 1]), device="cpu")
+                for i, n in enumerate(tail_counts)
+            ]
+        )
+        self._ced_pending = (full.full_slots.cpu()[keep], full.swa_slots.cpu()[keep])
+
+    def enter_late_layer_tail(self, fb):
+        if self._tail_saved is not None or self.tail_forward_metadata is None:
+            raise RuntimeError("invalid CED full/tail metadata transition")
+        full, tail = self.forward_metadata, self.tail_forward_metadata
+        rows = tail.late_layer_tail
+        for r in (1, 2):
+            tail.indices[r].fill_(-1)
+            self.ced.gather(
+                full.indices[r], rows.row_map, out=tail.indices[r][: tail.rows]
+            )
+        if full.candidates is not None:
+            self.ced.gather(full.candidates, rows.row_map, out=tail.candidates)
+        # Preserve the exact original objects, including optional scalar tensors.
+        updates = {
+            "input_ids": rows.rows(fb.input_ids),
+            "positions": rows.positions,
+            "out_cache_loc": tail.full_slots,
+            "extend_seq_lens": rows.extend_seq_lens,
+            "extend_seq_lens_cpu": rows.extend_seq_lens_cpu,
+            "extend_start_loc": tail.cu[: tail.batch],
+            "extend_num_tokens": tail.rows,
+            "global_num_token_non_padded_cpu": tail.rows,
+        }
+        for name in ("num_token_non_padded", "global_num_token_non_padded"):
+            value = getattr(fb, name, None)
+            if value is not None:
+                updates[name] = tail.fb_scalars[name]
+        memo = getattr(fb, "_dsv41_rope_memo", None)
+        if memo:
+            from sglang.srt.hardware_backend.npu.dsv41.attention.projections import (
+                expanded_rope,
+            )
+            from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.position_quant import (
+                RopeTables,
+            )
+
+            narrowed = {}
+            for key, (_, trig, _) in memo.items():
+                selected = RopeTables(
+                    self.ced.gather(trig.cos, rows.row_map),
+                    self.ced.gather(trig.sin, rows.row_map),
+                    self.ced.gather(trig.valid, rows.row_map),
+                    None,
+                )
+                narrowed[key] = (rows.positions, selected, expanded_rope(selected))
+            updates["_dsv41_rope_memo"] = narrowed
+        saved = (full, {name: getattr(fb, name) for name in updates})
+        self._tail_saved = saved
+        for name, value in updates.items():
+            setattr(fb, name, value)
+        self.forward_metadata = tail
+        if self.request_window is not None:
+            self.request_window.activate(tail.ring_plan)
+        return saved
+
+    def exit_late_layer_tail(self, saved, fb):
+        if self._tail_saved is not saved:
+            raise RuntimeError("CED exit does not match its full metadata")
+        self.restore_late_layer_tail(fb)
+
+    def restore_late_layer_tail(self, fb):
+        if self._tail_saved is not None:
+            self.forward_metadata, fields = self._tail_saved
+            for name, value in fields.items():
+                setattr(fb, name, value)
+            self._tail_saved = None
+            if self.request_window is not None:
+                self.request_window.activate(self.forward_metadata.ring_plan)
+
+    def publish_ced_prefill(self):
+        if self._ced_pending is not None:
+            self.pool._dsv41_ced_coverage.publish(*self._ced_pending)
+            self._ced_pending = None
+
+    def invalidate_ced_requests(self):
+        self._ced_pending = None
+        if self.forward_metadata is not None:
+            requests = self.forward_metadata.requests.cpu().tolist()
+            self.invalid_requests.update(r for r in requests if r > 0)
+
+    def get_swa_out_cache_loc(self, forward_batch):
+        return self.forward_metadata.swa_slots
+
+    def store_cache(self, *, layer_id, swa_k, forward_batch):
+        self.position.scatter_bf16(
+            swa_k.contiguous(),
+            self.forward_metadata.swa_slots,
+            self.pool.get_swa_buffer(layer_id).squeeze(2),
+        )
+        if self.request_window is not None:
+            if forward_batch.forward_mode.is_target_verify():
+                self.forward_metadata.ring_plan.pending[layer_id].copy_(
+                    swa_k.view(-1, 512)
+                )
+            else:
+                self.request_window.commit(layer_id, swa_k)
+
+    def _source(self, layer):
+        from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import (
+            CompressorState,
+            ProjectedCompressor,
+        )
+
+        if layer.layer_id not in self.sources:
+            state = CompressorState.allocate(
+                self.pool.num_req_slots + self.batch_capacity + 1,
+                device=self.device,
+            )
+            gamma = layer.compressor.norm.weight.float().contiguous()
+            self.sources[layer.layer_id] = ProjectedCompressor(
+                layer.compress_ratio, gamma, state
+            )
+        return self.sources[layer.layer_id]
+
+    @_dsv41_verify.adapt_sources
+    def forward_low_ratio_sources(self, *, layer, x, q_lora, positions, forward_batch):
+        meta, r = self.forward_metadata, layer.compress_ratio
+        if meta.late_layer_tail is not None and layer.compressor is not None:
+            raise RuntimeError(
+                "CED late queries cannot advance source compressor state"
+            )
+        if layer.compressor is not None:
+            source = self._source(layer)
+            # The scheduler owns the committed prefix; warmup/capture do not
+            # advance it. A Radix hit restores an even, 128-aligned prefix;
+            # its complete C1/C2 rows are already retained with FULL pages and
+            # no pending-pair payload is needed. Subsequent odd chunk/decode
+            # boundaries use this request's committed pending pair.
+            selected = getattr(meta, "source_rows", None)
+            source_x = x if selected is None else x.index_select(0, selected)
+            starts = meta.starts if selected is None else meta.source_starts
+            cu = meta.cu if selected is None else meta.source_cu
+            accepted = meta.accepted if selected is None else meta.source_counts
+            full_slots = meta.full_slots if selected is None else meta.source_slots
+            source.state.committed_lengths[meta.requests.long()] = starts
+            kv, scores = layer.compressor.project(source_x)
+            prepared = source.prepare(
+                kv.contiguous(),
+                None if scores is None else scores.contiguous(),
+                cu[: meta.batch + 1],
+                meta.requests,
+            )
+            completion, rope_positions, _status = source.commit(prepared, accepted)
+            slots = torch.where(completion >= 0, full_slots // r, -1).long()
+            trig = gather_rope(layer.freqs_cis, rope_positions)
+            if layer.indexer is not None and layer.indexer.owns_k:
+                index = layer.indexer
+                key = index.k_norm(index.wk(prepared.latent))
+                codes, scale = self.position.quantize_key(
+                    key.contiguous(), cos=trig.cos, sin=trig.sin
+                )
+                pool = self.pool.index_pools[r]
+                local = self.pool.layer_mapping[layer.layer_id].compress_layer_id
+                self.position.scatter_index(
+                    codes,
+                    scale,
+                    slots,
+                    pool.index_k_buffer[local].view(-1, 128),
+                    pool.index_scale_buffer[local].view(-1),
+                )
+            values = self.position.rope(prepared.latent, trig.cos, trig.sin)
+            self.position.scatter_bf16(
+                values, slots, self.pool.get_key_buffer(layer.layer_id).squeeze(2)
+            )
+        if layer.indexer is not None:
+            index = layer.indexer
+            q, _ = index.wq_b(q_lora)
+            q = q.view(-1, 32, 128).contiguous()
+            trig = cached_rope(layer.freqs_cis, positions.long(), forward_batch)
+            codes, qscale = self.position.quantize_query(q, cos=trig.cos, sin=trig.sin)
+            weight, _ = index.weights_proj(x)
+            weight = (weight.float() * index.head_weight_scale).half().contiguous()
+            pool = self.pool.index_pools[r]
+            local = self.pool.layer_mapping[layer.layer_id].compress_layer_id
+            plan = meta.plans[layer.layer_id]
+            indices, _ = plan.run(
+                codes,
+                pool.index_k_buffer[local].view(-1, 128 // r, 128),
+                weight,
+                qscale,
+                pool.index_scale_buffer[local].view(-1, 128 // r),
+                candidates=meta.candidates if plan.mode == 2 else None,
+            )
+            meta.indices[r].fill_(-1)
+            meta.indices[r][: meta.rows, 0].copy_(indices)
+
+    def forward(
+        self, q, k, v, layer, forward_batch, *, compress_ratio, attn_sink, **kwargs
+    ):
+        m = self.forward_metadata
+        if q.shape[0] != m.rows:
+            raise ValueError("attention Q rows must match the runtime metadata")
+        if q.shape[1:] != (self.local_heads, 512):
+            raise ValueError("attention Q must contain exactly the local TP heads")
+        query = q
+        cache = self.pool.get_swa_buffer(layer.layer_id)
+        sinks = attn_sink.contiguous()
+        if compress_ratio == 0:
+            out = m.swa(
+                query,
+                cache,
+                m.table,
+                m.cu,
+                m.lengths,
+                sinks,
+                m.window,
+            )
+        else:
+            r = compress_ratio
+            out = m.sparse[r](
+                query,
+                cache,
+                self.pool.get_key_buffer(layer.layer_id),
+                m.indices[r],
+                m.table,
+                m.compressed_table,
+                m.cu,
+                m.lengths,
+                m.cmp_lengths[r],
+                m.residual[r],
+                m.window,
+                sinks,
+            )
+        return out

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41.dspark import worker as _dsv41_dspark
+
+
 import logging
 from typing import Optional
 
@@ -176,6 +179,7 @@ class TargetVerifyExecutor:
         )
         self._simulated_bonus_seed: Optional[int] = None
 
+    @_dsv41_dspark.adapt_accept
     def accept_and_finalize(
         self,
         *,

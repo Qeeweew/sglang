@@ -550,6 +550,10 @@ def can_use_custom_all_reduce_v2(
     group: ProcessGroup,
     device: torch.device,
 ) -> bool:
+    # CUDA and HIP both use torch's CUDA device type. Other devices fall
+    # back to their process-group collectives.
+    if device.type != "cuda":
+        return False
     if _is_hip:
         from sglang.srt.utils.hip_vmm_utils import (
             MIN_HIP_VERSION,

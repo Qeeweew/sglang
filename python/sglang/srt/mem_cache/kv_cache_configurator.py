@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41.prefill import cache as _dsv41_cache
+
+
 import gc
 import logging
 import math
@@ -1768,6 +1771,15 @@ class KVCacheConfigurator:
             )
 
             req_to_token_pool_cls = DSV4NPUReqToTokenPool
+            if (
+                _dsv41_cache.enabled()
+                and self.model_config.hf_config.model_type == "deepseek_v41"
+            ):
+                from sglang.srt.hardware_backend.npu.dsv41.attention.kv_pool import (
+                    DSV41NPUReqToTokenPool,
+                )
+
+                req_to_token_pool_cls = DSV41NPUReqToTokenPool
 
         req_to_token_pool = req_to_token_pool_cls(
             size=max_num_reqs,
@@ -2082,6 +2094,7 @@ class KVCacheConfigurator:
             v_head_dim=self.model_config.v_head_dim,
         )
 
+    @_dsv41_cache.adapt_build
     def _build_dsv4_kv_pool(
         self,
         *,
@@ -2123,6 +2136,15 @@ class KVCacheConfigurator:
             )
 
             pool_cls = DSV4NPUTokenToKVPool
+            if (
+                _dsv41_cache.enabled()
+                and self.model_config.hf_config.model_type == "deepseek_v41"
+            ):
+                from sglang.srt.hardware_backend.npu.dsv41.attention.kv_pool import (
+                    DSV41NPUTokenToKVPool,
+                )
+
+                pool_cls = DSV41NPUTokenToKVPool
             kv_layout_kwargs = {}
         else:
             pool_cls = DeepSeekV4TokenToKVPool
@@ -2951,6 +2973,12 @@ class KVCacheConfigurator:
                         )
 
                         swa_allocator_cls = DSV4NPUTokenToKVPoolAllocator
+                        if getattr(token_to_kv_pool, "_dsv41_910b", False):
+                            from sglang.srt.hardware_backend.npu.dsv41.attention.kv_pool import (
+                                DSV41NPUTokenToKVPoolAllocator,
+                            )
+
+                            swa_allocator_cls = DSV41NPUTokenToKVPoolAllocator
                     else:
                         swa_allocator_cls = SWATokenToKVPoolAllocator
                     token_to_kv_pool_allocator = swa_allocator_cls(

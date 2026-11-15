@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41 import dense_weights as _dsv41_weights
+
+
 import logging
 import math
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
@@ -395,6 +398,7 @@ class Fp8Config(QuantizationConfig):
             scale_fmt=scale_fmt,
         )
 
+    @_dsv41_weights.adapt_get_method
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:

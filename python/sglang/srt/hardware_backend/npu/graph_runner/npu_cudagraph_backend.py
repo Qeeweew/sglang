@@ -206,6 +206,23 @@ class NPUCudaGraphBackend(BaseGraphBackend):
 
     def prepare_replay(self, forward_batch):
         runner = self._decode_runner
+        from sglang.srt.hardware_backend.npu.dsv41 import graph as dsv41_graph
+
+        if runner is not None and dsv41_graph.enabled():
+            dsv41_graph.refresh_counts(forward_batch, runner.model_runner)
+            if (
+                runner.model_runner.model_config.hf_config.model_type == "deepseek_v41"
+                and runner.model_runner.spec_algorithm.is_dspark()
+            ):
+                # The common loader copies requests, lengths and cache locations.
+                # Keep metadata_ready unchanged for callers after load_batch.
+                ready = forward_batch.forward_metadata_ready
+                forward_batch.forward_metadata_ready = False
+                try:
+                    runner.load_batch(forward_batch)
+                finally:
+                    forward_batch.forward_metadata_ready = ready
+                return True
         if runner is None or forward_batch.needs_forward_metadata_init():
             return False
         if not runner.model_runner.spec_algorithm.is_dflash():

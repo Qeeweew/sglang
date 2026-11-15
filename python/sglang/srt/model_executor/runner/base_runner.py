@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41.prefill import replay as _dsv41_prefill
+
+
 import inspect
 import logging
 from abc import ABC, abstractmethod
@@ -484,6 +487,7 @@ class BaseRunner(ABC):
             allocate_logits_buffer=allocate_logits_buffer,
         )
 
+    @_dsv41_prefill.adapt_dummy
     def _dummy_run(
         self,
         batch_size: int,

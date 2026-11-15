@@ -368,6 +368,14 @@ def set_dp_buffer_len(
 
 
 def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
+    from sglang.srt.hardware_backend.npu.dsv41 import parallel as native
+
+    if native._in_moe.get():
+        return native.collective_buffer(
+            "gather",
+            _DpGatheredBufferWrapper.get_global_dp_buffer_len(),
+            _DpGatheredBufferWrapper.get_dp_hidden_size(),
+        )
     return _DpGatheredBufferWrapper.get_global_dp_buffer(group=group)
 
 
@@ -376,6 +384,14 @@ def get_local_dp_buffer(
 ) -> torch.Tensor:
     """A buffer for this rank's local DP rows, ``hidden_size`` wide (the model's
     hidden size by default)."""
+    from sglang.srt.hardware_backend.npu.dsv41 import parallel as native
+
+    if native._in_moe.get():
+        return native.collective_buffer(
+            "scatter",
+            _DpGatheredBufferWrapper.get_local_dp_buffer_len(),
+            hidden_size or _DpGatheredBufferWrapper.get_dp_hidden_size(),
+        )
     return _DpGatheredBufferWrapper.get_local_dp_buffer(
         group=group, hidden_size=hidden_size
     )

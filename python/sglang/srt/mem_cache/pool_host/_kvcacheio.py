@@ -1,4 +1,4 @@
-"""`sgl_kernel.kvcacheio` KV-transfer ops for XPU, from the sgl-kernel-xpu wheel.
+"""KV-transfer operators for the XPU and NPU host pools.
 
 CUDA/ROCm keep importing `sgl_kernel.kvcacheio` directly in each pool module;
 only XPU imports the ops from here. The XPU wheel can lag the CUDA op set, so
@@ -13,11 +13,21 @@ so on XPU a wheel without that op or without the module fails at import.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import cache
 from types import MappingProxyType
 
 from sglang.srt.utils import is_xpu
 
 _is_xpu = is_xpu()
+
+
+@cache
+def npu_kv_cache_ops():
+    # The module is provided by newer wheels. The standalone 910B path uses
+    # a device KV pool and also imports this module's host-pool classes.
+    from sgl_kernel_npu.operators import mem_cache
+
+    return mem_cache
 
 
 def unavailable_stub(name: str, reason: str):

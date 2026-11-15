@@ -299,6 +299,12 @@ class EngramHasher(nn.Module):
 
     def init_history(self, num_req_slots: int, device) -> None:
         """Allocate oldest-first history with a spare row for graph padding."""
+        from sglang.srt.hardware_backend.npu.dsv41.policy import enabled
+
+        if enabled() and torch.device(device).type == "npu":
+            from sglang.srt.hardware_backend.npu.dsv41 import engram as dsv41_engram
+
+            return dsv41_engram._init_history(self, num_req_slots, device)
         self.history = torch.zeros(
             num_req_slots + 1,
             self.max_ngram_size - 1,
@@ -347,6 +353,12 @@ class EngramHasher(nn.Module):
     def forward(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        from sglang.srt.hardware_backend.npu.dsv41.policy import enabled
+
+        if enabled() and input_ids.device.type == "npu":
+            from sglang.srt.hardware_backend.npu.dsv41 import engram as dsv41_engram
+
+            return dsv41_engram._hasher_forward(self, input_ids, forward_batch)
         assert self.history is not None, "EngramHasher.init_history was not called"
         n = self.max_ngram_size
         num_tokens = input_ids.shape[0]
@@ -574,6 +586,14 @@ class EngramHasher(nn.Module):
         commit_lens: torch.Tensor,
     ) -> None:
         """Commit anchor + accepted drafts; the bonus is the next block's anchor."""
+        from sglang.srt.hardware_backend.npu.dsv41.policy import enabled
+
+        if enabled() and verify_ids_2d.device.type == "npu":
+            from sglang.srt.hardware_backend.npu.dsv41 import engram as dsv41_engram
+
+            return dsv41_engram._commit_after_verify(
+                self, verify_ids_2d, req_pool_indices, commit_lens
+            )
         assert self.history is not None, "EngramHasher.init_history was not called"
         if _cuda_kernels(self.history):
             engram_commit_history(
@@ -1481,6 +1501,14 @@ def engram_gate(
     whose ``input_ids`` entry is ``image_token_id``, which keep ``x``."""
     # ``kv`` is the wkv projection of the same tokens, so a shape mismatch is a
     # caller bug that ``fused_engram_gate`` asserts on, not a reason to fall back.
+    from sglang.srt.hardware_backend.npu.dsv41.policy import enabled
+
+    if enabled() and x.device.type == "npu":
+        from sglang.srt.hardware_backend.npu.dsv41 import engram as dsv41_engram
+
+        return dsv41_engram.gate(
+            x, kv, q_weight, k_weight, eps, clamp_value, input_ids, image_token_id
+        )
     if (
         _cuda_kernels(x)
         and x.ndim == 3
@@ -1528,7 +1556,15 @@ class Engram(nn.Module):
         self.eps = config.rms_norm_eps
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
-        self.embed = EngramEmbedding(
+        from sglang.srt.hardware_backend.npu.dsv41.policy import enabled
+        from sglang.srt.utils.device import is_npu
+
+        embedding_cls = EngramEmbedding
+        if enabled() and is_npu():
+            from sglang.srt.hardware_backend.npu.dsv41.engram import (
+                EngramEmbedding as embedding_cls,
+            )
+        self.embed = embedding_cls(
             layout.num_embeddings[self.layer_hash_index],
             layout.head_dim,
             layer_id,

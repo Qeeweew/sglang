@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41.prefill import cache as _dsv41_cache
+
+
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -309,6 +312,7 @@ class SWAComponent(TreeComponent):
             case _:
                 raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
+    @_dsv41_cache.adapt_validator
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:

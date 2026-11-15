@@ -19,7 +19,6 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch_npu
-from sgl_kernel_npu.operators.mem_cache import get_npu_kv_quant_path, kv_compress_epilog
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -65,6 +64,8 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
 
     @property
     def arch35_packed_kv_dim(self) -> int:
+        from sgl_kernel_npu.operators.mem_cache import get_npu_kv_quant_path
+
         nope_dim = self.qk_nope_head_dim
         rope_dim = self.qk_rope_head_dim
         return get_npu_kv_quant_path().packed_dim(nope_dim, rope_dim)
@@ -582,6 +583,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         if cache_2d.shape[0] == 0:
             return
+        from sgl_kernel_npu.operators.mem_cache import kv_compress_epilog
+
         kv_compress_epilog(
             buf,
             cache_2d,

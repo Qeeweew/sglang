@@ -15,7 +15,6 @@ from typing import (
 )
 
 import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
@@ -270,7 +269,8 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         if "MEM" in activities:
-            torch.cuda.memory._record_memory_history(
+            memory = torch.npu.memory if _is_npu else torch.cuda.memory
+            memory._record_memory_history(
                 max_entries=envs.SGLANG_MEM_PROFILE_MAX_ENTRIES.get()
             )
             self.profile_in_progress = True
@@ -385,8 +385,11 @@ class SchedulerProfilerManager:
                 + stage_suffix
                 + ".pickle",
             )
-            torch.cuda.memory._dump_snapshot(memory_profile_path)
-            torch.cuda.memory._record_memory_history(enabled=None)
+            memory = torch.npu.memory if _is_npu else torch.cuda.memory
+            # The CUDA helper passes CUDA-only snapshot kwargs. NPU exposes its
+            # own dump API; transfer_to_npu does not adapt that helper's ABI.
+            memory._dump_snapshot(memory_profile_path)
+            memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
             if get_device().gpu_id == get_device().base_gpu_id:

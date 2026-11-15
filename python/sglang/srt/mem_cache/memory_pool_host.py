@@ -13,6 +13,7 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
 from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
+from sglang.srt.mem_cache.pool_host._kvcacheio import npu_kv_cache_ops
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
     MLA_KVCACHEIO_OPS,
     require_kvcacheio_ops,
@@ -62,13 +63,7 @@ elif _is_xpu:
         transfer_kv_per_layer_mla_pf_lf,
     )
 
-if _is_npu:
-    from sgl_kernel_npu.operators.mem_cache import (
-        transfer_kv_all_layer_kv_split,
-        transfer_kv_all_layer_kv_split_lf_pf,
-        transfer_kv_per_layer_kv_split,
-        transfer_kv_per_layer_kv_split_pf_lf,
-    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -599,7 +594,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 # dev_view: [1, dev_pages, native_page_size, 1, kv_dim]
                 host_view = self._host_page_view(l)
                 if self.layout == "layer_first":
-                    transfer_kv_all_layer_kv_split(
+                    npu_kv_cache_ops().transfer_kv_all_layer_kv_split(
                         device_indices=native_device_indices,
                         host_indices=native_host_indices,
                         device_k=dev_view,
@@ -610,7 +605,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                         impl="auto",
                     )
                 else:
-                    transfer_kv_all_layer_kv_split_lf_pf(
+                    npu_kv_cache_ops().transfer_kv_all_layer_kv_split_lf_pf(
                         device_indices=native_device_indices,
                         host_indices=native_host_indices,
                         device_k=dev_view,
@@ -705,7 +700,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             # dev_view: [1, dev_pages, native_page_size, 1, kv_dim]
             host_view = self._host_page_view(layer_id)
             if self.layout == "layer_first":
-                transfer_kv_per_layer_kv_split(
+                npu_kv_cache_ops().transfer_kv_per_layer_kv_split(
                     device_indices=native_device_indices,
                     host_indices=native_host_indices,
                     device_k=dev_view,
@@ -718,7 +713,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                     impl="auto",
                 )
             else:
-                transfer_kv_per_layer_kv_split_pf_lf(
+                npu_kv_cache_ops().transfer_kv_per_layer_kv_split_pf_lf(
                     device_indices=native_device_indices,
                     host_indices=native_host_indices,
                     device_k=dev_view,
@@ -1115,7 +1110,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                     .unsqueeze(0)
                 )
                 if self.layout == "layer_first":
-                    transfer_kv_all_layer_kv_split(
+                    npu_kv_cache_ops().transfer_kv_all_layer_kv_split(
                         device_indices=dev_op_indices,
                         host_indices=host_op_indices,
                         device_k=dev_view,
@@ -1126,7 +1121,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                         impl="auto",
                     )
                 else:
-                    transfer_kv_all_layer_kv_split_lf_pf(
+                    npu_kv_cache_ops().transfer_kv_all_layer_kv_split_lf_pf(
                         device_indices=dev_op_indices,
                         host_indices=host_op_indices,
                         device_k=dev_view,
@@ -1209,7 +1204,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 .unsqueeze(0)
             )
             if self.layout == "layer_first":
-                transfer_kv_per_layer_kv_split(
+                npu_kv_cache_ops().transfer_kv_per_layer_kv_split(
                     device_indices=dev_op_indices,
                     host_indices=host_op_indices,
                     device_k=dev_view,
@@ -1222,7 +1217,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                     impl="auto",
                 )
             else:
-                transfer_kv_per_layer_kv_split_pf_lf(
+                npu_kv_cache_ops().transfer_kv_per_layer_kv_split_pf_lf(
                     device_indices=dev_op_indices,
                     host_indices=host_op_indices,
                     device_k=dev_view,

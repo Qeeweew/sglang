@@ -27,6 +27,10 @@ ScheduleBatch -> ForwardBatch
 
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41 import graph as _dsv41_graph
+from sglang.srt.hardware_backend.npu.dsv41.prefill import replay as _dsv41_prefill
+
+
 import hashlib
 import warnings
 from dataclasses import dataclass
@@ -894,7 +898,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
         self.can_run_dp_draft_cuda_graph = batch.can_run_dp_draft_cuda_graph
 
+    _dsv41_main_prefix: list[int] | None = None
+    _dsv41_swa_floor: list[int] | None = None
+    _dsv41_prompt_lengths: list[int] | None = None
+
     @classmethod
+    @_dsv41_prefill.adapt_init_batch
     def init_new(
         cls,
         batch: ScheduleBatch,
@@ -1731,6 +1740,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return original
         return self.forward_mode
 
+    @_dsv41_graph.adapt_sync_batch
+    @_dsv41_prefill.adapt_prepare_sync
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 

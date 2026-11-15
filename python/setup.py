@@ -36,6 +36,7 @@ from pathlib import Path
 
 from setuptools import setup
 from setuptools.command.sdist import sdist
+from setuptools.command.build_py import build_py
 
 try:
     from setuptools_rust import Binding, RustExtension, build_rust
@@ -216,11 +217,34 @@ def _declared_rust_extensions():
     return _pyproject_rust_extensions(_discovered_rust_extensions())
 
 
+_DEEPJIT_PACKAGE = Path(
+    "sglang/srt/hardware_backend/npu/dsv41/kernels/third_party/deepjit"
+)
+
+
+def _copy_deepjit(destination):
+    # An sdist already contains the package-local copy. A source checkout owns
+    # exactly one editable vendor tree at the repository's 3rdparty boundary.
+    source = _PYTHON_DIR.parent / "3rdparty/deepjit"
+    if not source.is_dir():
+        source = _PYTHON_DIR / _DEEPJIT_PACKAGE
+    if not (source / "SOURCE.json").is_file():
+        raise RuntimeError("Missing vendored DeepJIT source and license")
+    shutil.copytree(source, destination / _DEEPJIT_PACKAGE, dirs_exist_ok=True)
+
+
+class BuildPy(build_py):
+    def run(self):
+        super().run()
+        _copy_deepjit(Path(self.build_lib))
+
+
 class Sdist(sdist):
     """Materialize shared GGUF headers in the standalone source distribution."""
 
     def make_release_tree(self, base_dir, files):
         super().make_release_tree(base_dir, files)
+        _copy_deepjit(Path(base_dir))
         relative = Path("sglang/kernels/jit/include/sgl_kernel/quantization/gguf")
         canonical = (
             _PYTHON_DIR / "sglang/kernels/aot/include/sgl_kernel/quantization/gguf"
@@ -266,8 +290,8 @@ if build_rust is not None:
             super().run()
 
     setup(
-        cmdclass={"build_rust": BuildRust, "sdist": Sdist},
+        cmdclass={"build_rust": BuildRust, "sdist": Sdist, "build_py": BuildPy},
         rust_extensions=_declared_rust_extensions(),
     )
 else:
-    setup(cmdclass={"sdist": Sdist})
+    setup(cmdclass={"sdist": Sdist, "build_py": BuildPy})

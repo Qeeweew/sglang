@@ -8,6 +8,9 @@ mscale: cos/sin stored in freqs_cis must already be pre-multiplied by the YARN
 mscale at precompute time (see precompute_freqs_cis). We just read what's stored.
 """
 
+from sglang.srt.hardware_backend.npu.dsv41.attention import projections as _dsv41_projection
+
+
 from typing import Optional
 
 import torch
@@ -149,6 +152,7 @@ class Dsv4NpuRoPE:
         return cos, sin
 
     @staticmethod
+    @_dsv41_projection.adapt_rotary
     def apply_rotary_mul_inplace(
         q_rope: torch.Tensor,
         kv_rope: Optional[torch.Tensor],

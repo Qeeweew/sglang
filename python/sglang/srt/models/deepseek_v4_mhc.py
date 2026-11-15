@@ -22,6 +22,9 @@ TODO: move dsv4 MHC into the same abstraction
 
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41 import mhc as _dsv41_mhc
+
+
 from functools import partial
 from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
 
@@ -296,6 +299,7 @@ def mega_moe_input_of(
     return partial(mega_moe_input_target, mlp, forward_batch=forward_batch)
 
 
+@_dsv41_mhc.adapt_boundary
 def make_boundary(
     norm: RMSNorm,
     *,
@@ -358,6 +362,7 @@ def mix_stats(
     return coefficients
 
 
+@_dsv41_mhc.adapt_stats
 def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     from sglang.kernels.ops.layernorm.mhc import (
         hc_mix_stats,
@@ -521,6 +526,7 @@ def combine(
     return _combine(hc, state, quantized)
 
 
+@_dsv41_mhc.adapt_combine
 def _combine(
     hc: HcSubLayer,
     state: HcState,
@@ -579,6 +585,7 @@ def _combine(
 # ---------------------------------------------------------------------------
 
 
+@_dsv41_mhc.adapt_post
 def post(
     cfg: HcConfig,
     x: torch.Tensor,
@@ -722,6 +729,7 @@ def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
     )
 
 
+@_dsv41_mhc.adapt_post_fusion
 def _post_fusion(
     hc: HcSubLayer,
     y: torch.Tensor,
@@ -831,6 +839,7 @@ def _post_fusion(
     return HcState(post(cfg, y, residual, post_mix, comb), pre)
 
 
+@_dsv41_mhc.adapt_post_runner
 def run_attn_post(
     hc: HcSubLayer,
     out: Union[torch.Tensor, AttnOutput],
@@ -866,6 +875,7 @@ def run_attn_post(
     return _post_fusion(hc, out, residual, coefficients, next)
 
 
+@_dsv41_mhc.adapt_post_runner
 def run_moe_post(
     hc: HcSubLayer,
     out: Union[torch.Tensor, MoEOutput],

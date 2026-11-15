@@ -1,0 +1,77 @@
+{
+  "schema": 1,
+  "components": [
+    {
+      "name": "engram",
+      "backend": "jit"
+    },
+    {
+      "name": "qli",
+      "backend": "jit"
+    },
+    {
+      "name": "engram_ops",
+      "backend": "jit"
+    },
+    {
+      "name": "position_quant",
+      "backend": "jit"
+    },
+    {
+      "name": "compressor",
+      "backend": "jit"
+    },
+    {
+      "name": "router",
+      "backend": "jit"
+    },
+    {
+      "name": "ced",
+      "backend": "jit"
+    },
+    {
+      "name": "fp8_weight",
+      "backend": "jit"
+    },
+    {
+      "name": "dspark_schedule",
+      "backend": "jit"
+    },
+    {
+      "name": "moe_routes",
+      "backend": "jit"
+    },
+    {
+      "name": "mxfp4_weight",
+      "backend": "jit"
+    },
+    {
+      "name": "quant_grouped_gemm",
+      "backend": "jit"
+    },
+    {
+      "name": "page_metadata",
+      "backend": "jit"
+    },
+    {
+      "name": "elementwise",
+      "backend": "jit"
+    },
+    {
+      "name": "mhc",
+      "backend": "jit"
+    },
+    {
+      "name": "w8a16",
+      "backend": "jit"
+    },
+    {
+      "name": "projection",
+      "backend": "jit"
+    },
+    {
+      "name": "attention",
+      "backend": "jit"
+    }
+  ]
+}

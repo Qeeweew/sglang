@@ -1,3 +1,8 @@
+from sglang.srt.hardware_backend.npu.dsv41.dspark import worker as _dsv41_dspark
+
+
+from sglang.srt.hardware_backend.npu.dsv41.prefill import replay as _dsv41_prefill
+
 import logging
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
@@ -176,6 +181,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def weight_update_runners(self) -> list[tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)] if self._hosts_draft else []
 
+    @_dsv41_dspark.adapt_worker_init
     def __init__(
         self,
         server_args: ServerArgs,
@@ -799,6 +805,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._observers.note_prefill_step()
         return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
+    @_dsv41_prefill.adapt_prefill
     def _forward_prefill(
         self,
         batch: ScheduleBatch,

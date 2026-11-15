@@ -160,6 +160,16 @@ def filter_noisy_warnings():
     # (category, message regex, emitting packages, or None for any)
     noisy_warnings = [
         (
+            ImportWarning,
+            r"\s*\*+\s+The torch\.Tensor\.cuda[\s\S]*",
+            "torch_npu",
+        ),
+        (
+            RuntimeWarning,
+            r"torch\.jit\.script and torch\.jit\.script_method will be disabled by transfer_to_npu",
+            "torch_npu",
+        ),
+        (
             DeprecationWarning,
             re.escape("Using `struct.scalar` as pointer is deprecated."),
             None,

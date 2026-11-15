@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+from sglang.srt.hardware_backend.npu.dsv41.prefill import inputs as _dsv41_replay_inputs
+
+
 import asyncio
 import copy
 import dataclasses
@@ -1377,6 +1380,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             normalized.append(provided or embedded)
         obj.mm_content_hashes = normalized
 
+    @_dsv41_replay_inputs.adapt_validate
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:

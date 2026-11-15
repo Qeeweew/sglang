@@ -229,7 +229,14 @@ def create_moe_dispatcher(
         # weighted unpermute) runs in the MoE runner's permute hooks, see
         # moe_runner/ascend.py.
         if _is_npu and a2a_backend.is_none():
-            _validate_ascend_no_a2a_layout(moe_runner_config)
+            from sglang.srt.hardware_backend.npu.dsv41.moe import (
+                ResidentMXFP4Method,
+            )
+
+            # Resident MXFP4 owns global routing and EP partials in the model;
+            # the common dispatcher is never invoked for this method.
+            if not isinstance(quant_method, ResidentMXFP4Method):
+                _validate_ascend_no_a2a_layout(moe_runner_config)
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()

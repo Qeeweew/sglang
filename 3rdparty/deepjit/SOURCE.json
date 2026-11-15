@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/deepseek-ai/DeepJIT",
+  "commit": "6e4bba88ee9e73a0986714f7f6bb45590ebeb04d",
+  "patches": [
+    "Do not query unused ACL_DEV_ATTR_UBUF_PER_VECTOR_CORE on arch2201.",
+    "Cache actor-specific SDK PCH and discover Bisheng cc1 plans from a header-free probe; preserve per-key process locks and exact compiler commands.",
+    "Make Precompiler.finish idempotent and drain every task before rethrowing a compilation error."
+  ]
+}

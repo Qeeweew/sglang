@@ -13,6 +13,9 @@
 # ==============================================================================
 """Logits processing."""
 
+from sglang.srt.hardware_backend.npu.dsv41.dspark import aux as _dsv41_aux
+
+
 import dataclasses
 import logging
 from contextlib import contextmanager
@@ -826,6 +829,7 @@ class LogitsProcessor(nn.Module):
             return None
         return flat[:numel].view(shape)
 
+    @_dsv41_aux.adapt_prune
     def _get_pruned_states(
         self,
         hidden_states: torch.Tensor,

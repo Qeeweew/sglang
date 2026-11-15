@@ -113,6 +113,12 @@ def argmax(logits: torch.Tensor) -> torch.Tensor:
     """
     import torch
 
+    if logits.device.type == "npu":
+        from sglang.srt.hardware_backend.npu.dsv41.policy import enabled
+
+        if enabled():
+            return torch.argmax(logits, dim=-1)
+
     if logits.is_cuda and PlatformInfo.detect().device_type == "npu":
         if (
             logits.dim() == 2

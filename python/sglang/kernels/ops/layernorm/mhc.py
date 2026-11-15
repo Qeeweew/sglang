@@ -1,3 +1,6 @@
+from sglang.srt.hardware_backend.npu.dsv41 import mhc as _dsv41_mhc
+
+
 import functools
 import importlib
 import logging
@@ -1893,6 +1896,7 @@ def _hc_broadcast_kernel(
         tl.store(y_row + k * H + offs, x, mask=mask)
 
 
+@_dsv41_mhc.adapt_broadcast
 def hc_broadcast(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
     """[T, H] -> [T, hc_mult, H], every copy equal to x: the initial mHC residual."""
     if not x.is_cuda or x.stride(-1) != 1:
@@ -2788,6 +2792,7 @@ def hc_mix_stats_sinkhorn_deepgemm(
     return pre, post, comb
 
 
+@_dsv41_mhc.adapt_head_collapse
 def mhc_combine(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
@@ -2815,6 +2820,20 @@ def mhc_combine(
 def mhc_stream_mean(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """y[m, h] = x[m, :, h].mean(), bitwise equal to ``x.mean(dim=1)``, written
     into ``out`` when given."""
+    if _dsv41_mhc.enabled() and x.device.type == "npu":
+        if out is None:
+            out = x.new_empty((x.shape[0], x.shape[2]))
+        if out.stride(1) != 1 or out.stride(0) % x.shape[2]:
+            raise ValueError("mHC capture output must be a packed hidden-width segment")
+        width = out.stride(0)
+        storage = out.as_strided(
+            (out.shape[0], width),
+            (width, 1),
+            storage_offset=out.storage_offset() // width * width,
+        )
+        column = (out.storage_offset() % width) // x.shape[2]
+        _dsv41_mhc.operator().mean_packed(x.contiguous(), storage, column)
+        return out
     m, hc, h = x.shape
     # Bitwise equality with torch's CUDA mean holds for 4 streams (the mHC width)
     # over whole 1024-element blocks; torch orders some other widths differently.
