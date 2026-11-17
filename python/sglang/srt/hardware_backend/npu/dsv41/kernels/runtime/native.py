@@ -8,6 +8,7 @@ from threading import Lock
 
 import torch
 import torch_npu
+
 from sglang.srt.hardware_backend.npu.dsv41.kernels.paths import native_library_path
 from sglang.srt.hardware_backend.npu.dsv41.kernels.runtime.toolchain import (
     validate_jit_toolchain,
@@ -87,9 +88,9 @@ def load_library(path=None):
             validate_jit_toolchain(publication)
             torch.ops.load_library(str(path))
             abi = torch.ops.dsv41.abi()
-            if abi != 22:
+            if abi != 23:
                 raise RuntimeError(
-                    f"incompatible Torch-NPU extension ABI {abi} (expected 22): {path}; rebuild"
+                    f"incompatible Torch-NPU extension ABI {abi} (expected 23): {path}; rebuild"
                 )
             torch.ops.dsv41.configure_jit(
                 publication["kernel_source_root"],

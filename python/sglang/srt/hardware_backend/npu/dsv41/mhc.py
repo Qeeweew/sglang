@@ -8,6 +8,7 @@ from contextvars import ContextVar
 from functools import cache, wraps
 
 import torch
+
 from sglang.srt.hardware_backend.npu.dsv41.dense_weights import enabled
 from sglang.srt.hardware_backend.npu.dsv41.kernels.config import V41
 
@@ -286,6 +287,32 @@ def adapt_post_runner(original):
     @wraps(original)
     def run(hc, out, residual, *, stats_stream, next, world_size, precomputed=None):
         from sglang.srt.models import deepseek_v4_mhc as mhc
+
+        from .peer_collectives import DeferredAttention, DeferredMoE
+        from .peer_collectives import post as peer_post
+
+        if isinstance(out, (DeferredAttention, DeferredMoE)):
+            _validate_config(hc.cfg)
+            pre, post_mix, comb = mhc._compute_triplet(
+                hc, residual, stats_stream, precomputed
+            )
+            norm_weight = None
+            if (
+                next is not None
+                and next.hc is not None
+                and next.hc.cfg.pre_from_prev
+                and next.norm_fusable
+            ):
+                _validate_config(next.hc.cfg)
+                norm_weight = _norm_weight(next.norm)
+            updated, normalized = peer_post(
+                out, residual, pre, post_mix, comb, norm_weight
+            )
+            return mhc.HcState(
+                updated,
+                pre,
+                mhc.HcNormed(normalized) if normalized is not None else None,
+            )
 
         if (
             _supported(hc.cfg, residual)

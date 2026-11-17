@@ -100,7 +100,7 @@ snapshots under immutable version directories. Keep the whole publication,
 not just the shared library. `DSV41_NATIVE_DIR` chooses a publication;
 `DSV41_JIT_CACHE_DIR` chooses a cache shared by the ranks on the node.
 
-Native ABI 22 requires rebuilding the host publication. CMake builds the host
+Native ABI 23 requires rebuilding the host publication. CMake builds the host
 extension. The router produces grouped GEMM metadata on the device.
 AICore kernels compile through DeepJIT for the model geometries actually bound.
 Prepare and warm them before Graph capture; hot calls and replay do not compile.

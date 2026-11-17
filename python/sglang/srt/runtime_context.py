@@ -713,6 +713,11 @@ class ForwardFlags:
         "mlp_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,
         "defer_moe_finalize": False,
+        # 910B communication/post boundary: hand off live tensors, not a
+        # partial result that another stream or layer could overwrite.
+        "npu_defer_attn_reduce": False,
+        "npu_defer_route_combine": False,
+        "npu_defer_moe_post": False,
         # Attention runs on a DP-local token batch. The MLP runs after the DP
         # gather and therefore uses the TP-global token batch.
         "lora_batch_layout": LoRABatchLayout.DP_LOCAL,

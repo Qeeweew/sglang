@@ -1279,6 +1279,16 @@ def attn_cp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
 
 
 def attn_tp_all_reduce(input: torch.Tensor):
+    if input.device.type == "npu" and envs.SGLANG_OPT_DSV41_NPU_PEER_COMM.get():
+        from sglang.srt.hardware_backend.npu.dsv41.peer_collectives import (
+            try_all_reduce,
+        )
+        from sglang.srt.hardware_backend.npu.dsv41.policy import enabled
+
+        if enabled():
+            output = try_all_reduce(input, get_parallel().attn_tp_group)
+            if output is not None:
+                return output
     return get_parallel().attn_tp_group.all_reduce(input)
 
 

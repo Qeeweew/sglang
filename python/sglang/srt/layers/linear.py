@@ -28,6 +28,7 @@ from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce,
     is_allocation_symmetric,
 )
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
@@ -1819,7 +1820,7 @@ class RowParallelLinear(LinearBase):
             and not should_skip_mlp_all_reduce()
         ):
             if self.use_dp_attention_reduce:
-                output = get_parallel().attn_tp_group.all_reduce(output_parallel)
+                output = attn_tp_all_reduce(output_parallel)
             else:
                 quantize_communications = (
                     (

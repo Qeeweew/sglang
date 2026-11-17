@@ -2,6 +2,10 @@
   "schema": 1,
   "components": [
     {
+      "name": "peer_all_reduce",
+      "backend": "jit"
+    },
+    {
       "name": "engram",
       "backend": "jit"
     },

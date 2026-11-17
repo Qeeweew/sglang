@@ -1,0 +1,80 @@
+#pragma once
+#include <kernel_operator.h>
+#include <c_api/asc_simd.h>
+#include <peer_all_reduce/layout.h>
+
+namespace peer_protocol {
+namespace p = peer_all_reduce;
+__aicore__ inline __gm__ uint64_t *signal(GM_ADDR base, uint32_t kind, uint32_t channel) {
+    return reinterpret_cast<__gm__ uint64_t *>(base +
+                                               (kind * p::kWorkers + channel) * p::kSignalBytes);
+}
+__aicore__ inline __gm__ uint64_t *global_signal(GM_ADDR base, uint32_t kind) {
+    return reinterpret_cast<__gm__ uint64_t *>(base + (5 * p::kWorkers + kind) * p::kSignalBytes);
+}
+__aicore__ inline void publish(__gm__ uint64_t *address, uint64_t epoch) {
+    *reinterpret_cast<volatile __gm__ uint64_t *>(address) = epoch;
+    __asc_aicore::asc_dcci_single(address);
+}
+__aicore__ inline uint64_t observe(__gm__ uint64_t *address) {
+    __asc_aicore::asc_dcci_single(address);
+    return *reinterpret_cast<volatile __gm__ uint64_t *>(address);
+}
+__aicore__ inline void await(__gm__ uint64_t *address, uint64_t epoch) {
+    const int64_t start = AscendC::GetSystemCycle();
+    while (observe(address) < epoch) {
+        if (AscendC::GetSystemCycle() - start > 500000000LL)
+            AscendC::Trap();
+        const int64_t retry = AscendC::GetSystemCycle() + 8;
+        while (AscendC::GetSystemCycle() < retry) {
+        }
+    }
+}
+__aicore__ inline void aggregate(GM_ADDR local, uint32_t kind, uint64_t epoch) {
+    if (AscendC::GetBlockIdx() == 0) {
+        for (uint32_t c = 0; c < p::kWorkers; ++c)
+            await(signal(local, kind, c), epoch);
+        publish(global_signal(local, kind == 2 ? 0 : kind == 3 ? 2 : 1), epoch);
+    }
+}
+__aicore__ inline uint64_t begin(GM_ADDR local, GM_ADDR table, uint32_t world) {
+    const uint64_t epoch = observe(signal(local, 0, AscendC::GetBlockIdx())) + 1;
+    auto peers = reinterpret_cast<__gm__ uint64_t *>(table);
+    // Only the leader polls remote free credits. Letting every AIV spin on
+    // the same remote cache line floods HCCS and can starve a slower peer's
+    // payload DMA. The remaining workers poll one local start credit.
+    if (AscendC::GetBlockIdx() == 0) {
+        for (uint32_t rank = 0; rank < world; ++rank)
+            await(global_signal(reinterpret_cast<GM_ADDR>(peers[rank]), 0), epoch - 1);
+        for (uint32_t c = 0; c < p::kWorkers; ++c)
+            publish(signal(local, 4, c), epoch);
+    }
+    await(signal(local, 4, AscendC::GetBlockIdx()), epoch);
+    set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+    return epoch;
+}
+__aicore__ inline void finish(GM_ADDR local, uint64_t epoch) {
+    set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+    set_flag(PIPE_V, PIPE_S, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
+    publish(signal(local, 0, AscendC::GetBlockIdx()), epoch);
+    publish(signal(local, 2, AscendC::GetBlockIdx()), epoch);
+    aggregate(local, 2, epoch);
+}
+__aicore__ inline void loaded() {
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+}
+__aicore__ inline void stored() {
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+}
+__aicore__ inline void vector_store() {
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+}
+} // namespace peer_protocol

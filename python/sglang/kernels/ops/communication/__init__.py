@@ -17,6 +17,26 @@ __all__ = []
 
 register_kernel(
     KernelSpec(
+        op="communication.npu_peer_all_reduce",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.communication.npu_peer_collectives:npu_peer_all_reduce",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+
+for _fn in ("npu_peer_moe_gather", "npu_peer_moe_return", "npu_peer_post"):
+    register_kernel(
+        KernelSpec(
+            op=f"communication.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.communication.npu_peer_collectives:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.NPU}),
+        )
+    )
+del _fn
+
+register_kernel(
+    KernelSpec(
         op="communication.moe_finalize_shared_gate_all_reduce",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.communication.all_reduce_fusion:moe_finalize_shared_gate_all_reduce",

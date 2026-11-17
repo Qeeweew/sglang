@@ -2118,6 +2118,12 @@ class GroupCoordinator:
         # Also before destroy_process_group(): the symmetric workspace is released
         # collectively on cpu_group, after the custom all-reduce drops its views.
         self.ca_comm = None
+        if _is_npu and self.cpu_group is not None:
+            from sglang.srt.hardware_backend.npu.dsv41.peer_collectives import (
+                close_group_peer_all_reduce,
+            )
+
+            close_group_peer_all_reduce(self.cpu_group)
         if self.cpu_group is not None:
             from sglang.srt.distributed.device_communicators.symm_workspace import (
                 close_group_symm_workspaces,

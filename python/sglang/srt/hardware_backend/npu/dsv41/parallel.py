@@ -77,7 +77,9 @@ def adapt_run(original):
                     )
                 )
             ):
-                return _run_sequence_parallel(layer, hidden_states, forward_batch, **kwargs)
+                return _run_sequence_parallel(
+                    layer, hidden_states, forward_batch, **kwargs
+                )
             return original(layer, hidden_states, forward_batch, **kwargs)
         finally:
             _in_moe.reset(token)
@@ -112,8 +114,7 @@ def collective_buffer(role, rows, width):
 def moe_sequence_parallel_enabled(parallel):
     return (
         parallel.tp_size == 8
-        and parallel.attn_dp_size == 4
-        and parallel.attn_tp_size == 2
+        and (parallel.attn_dp_size, parallel.attn_tp_size) in ((4, 2), (8, 1))
         and parallel.attn_cp_size == 1
         and parallel.moe_ep_size == 8
         and parallel.moe_tp_size == 1
@@ -122,8 +123,12 @@ def moe_sequence_parallel_enabled(parallel):
 
 
 def _use_moe_sequence_parallel(parallel, batch):
+    from .peer_collectives import enabled as peer_enabled
+
     return (
         moe_sequence_parallel_enabled(parallel)
+        # Preserve the existing DP8 MoeRowTransport baseline when opted out.
+        and (parallel.attn_tp_size == 2 or peer_enabled())
         and batch.dp_padding_mode is not None
         and batch.dp_padding_mode.is_max_len()
     )
@@ -157,6 +162,10 @@ def _run_sequence_parallel(
     if rows == 0:
         return torch.empty_like(local)
 
+    from .peer_collectives import moe_communicator
+
+    peer = moe_communicator(local, parallel.tp_group)
+
     tp = parallel.attn_tp_size
     shard_rows = (rows + tp - 1) // tp
     padded_rows = shard_rows * tp
@@ -164,7 +173,7 @@ def _run_sequence_parallel(
     owned_rows = max(0, min(shard_rows, rows - start))
     shard = local.narrow(0, min(start, rows), owned_rows)
     shard_input = shard
-    if owned_rows != shard_rows:
+    if owned_rows != shard_rows and peer is None:
         shard_input = _workspace("moe_sp_padded_input", local, shard_rows)
         if owned_rows:
             shard_input[:owned_rows].copy_(shard)
@@ -176,7 +185,9 @@ def _run_sequence_parallel(
     # Rank order is DP0/TP0, DP0/TP1, DP1/TP0, ...; concatenating
     # these halves preserves the original global DP token order.
     gathered = _workspace("gather", local, global_rows)
-    if padded_rows == rows:
+    if peer is not None:
+        peer.gather(local, gathered)
+    elif padded_rows == rows:
         parallel.tp_group.all_gather_into_tensor(gathered, shard_input)
     else:
         # HCCL requires equal payloads. Compact the communication-only holes
@@ -188,7 +199,9 @@ def _run_sequence_parallel(
         gathered.view(parallel.attn_dp_size, rows, -1).copy_(
             padded_gather.view(parallel.attn_dp_size, padded_rows, -1)[:, :rows]
         )
-    with get_forward().scoped(mlp_reduce_scatter=True):
+    with get_forward().scoped(
+        mlp_reduce_scatter=True, npu_defer_route_combine=peer is not None
+    ):
         partial = layer.mlp(
             gathered,
             batch,
@@ -197,6 +210,8 @@ def _run_sequence_parallel(
             skip_shared_experts=True,
             return_moe_output=False,
         )
+    if peer is not None:
+        return peer.finish(partial, shared, rows)
     if padded_rows != rows:
         padded_partial = _workspace(
             "moe_sp_padded_partial", local, padded_rows * parallel.attn_dp_size
@@ -213,5 +228,8 @@ def _run_sequence_parallel(
     output = torch.empty(
         (padded_rows, local.shape[1]), dtype=local.dtype, device=local.device
     )
-    parallel.attn_tp_group.all_gather_into_tensor(output, shard_output)
+    if tp == 1:
+        output.copy_(shard_output)
+    else:
+        parallel.attn_tp_group.all_gather_into_tensor(output, shard_output)
     return output[:rows]

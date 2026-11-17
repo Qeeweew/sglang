@@ -10,6 +10,7 @@ import logging
 from functools import cache, wraps
 
 import torch
+
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
 from .policy import enabled
@@ -76,7 +77,9 @@ class ExpertScratch:
         if not 0 <= rows <= slots:
             raise ValueError("expert rows must fit the original route slot capacity")
         capturing = torch.npu.is_current_stream_capturing()
-        shrink = not capturing and not self.captured and 0 < slots * 4 <= self.slot_capacity
+        shrink = (
+            not capturing and not self.captured and 0 < slots * 4 <= self.slot_capacity
+        )
         if (
             self.buffers is None
             or rows > self.capacity
@@ -98,7 +101,9 @@ class ExpertScratch:
             capacity = rows
             h, i = capacity * self.hidden, capacity * self.width
             start = max(h, i)
-            storage = torch.empty((start + 2 * i,), dtype=torch.float16, device=self.device)
+            storage = torch.empty(
+                (start + 2 * i,), dtype=torch.float16, device=self.device
+            )
             sorted_x = storage[:h].view(capacity, self.hidden)
             gate_up = storage[start : start + 2 * i].view(capacity, 2 * self.width)
             activated = storage[:i].view(capacity, self.width)
@@ -291,7 +296,9 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
 
         if self.pending or not all(all(parts) for parts in self.loaded):
             raise RuntimeError("incomplete resident MXFP4 expert weights")
-        up, down = _expert_projections(self.e, self.h, self.i, torch.npu.current_device())
+        up, down = _expert_projections(
+            self.e, self.h, self.i, torch.npu.current_device()
+        )
         self.local_experts = MXFP4LocalExperts(
             up,
             down,
@@ -377,6 +384,12 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
         if torch.npu.is_current_stream_capturing():
             arena.graph_bindings[self.local_experts, key] = invoke
         invoke()
+        from sglang.srt.runtime_context import get_forward
+
+        if get_forward().npu_defer_route_combine:
+            from .peer_collectives import RoutedOutput
+
+            return RoutedOutput(values, inverse, routing.ids, routing.weights)
         return self.routes.combine(values, inverse, routing)
 
 
@@ -465,6 +478,14 @@ def adapt_forward(original):
         routed = method.routed(
             hidden_states, routing, compact=compact_prefill(forward_batch)
         )
+        from .peer_collectives import RoutedOutput
+
+        if isinstance(routed, RoutedOutput):
+            if not skip_shared_experts or return_moe_output or leave_output_sum:
+                raise ValueError(
+                    "deferred native route combine requires the SP return boundary"
+                )
+            return routed
         shared = (
             self._forward_shared_experts(hidden_states, gemm_output_zero_allocator)
             if not skip_shared_experts

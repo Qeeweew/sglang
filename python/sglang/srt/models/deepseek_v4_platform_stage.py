@@ -5,14 +5,12 @@ The mixins own platform mHC state, fusion, and TBO operations.
 
 from __future__ import annotations
 
-from sglang.srt.hardware_backend.npu.dsv41 import parallel as _dsv41_dp_buffers
-
-
 from functools import cached_property
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.hardware_backend.npu.dsv41 import parallel as _dsv41_dp_buffers
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     can_fuse_all_reduce,
@@ -41,7 +39,7 @@ from sglang.srt.models.deepseek_common.moe_transport import (
 )
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE, AttnOutput
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
@@ -160,7 +158,10 @@ class NonCudaDecoderMixin:
             fuse_all_reduce_mhc = self._can_fuse_attn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
-            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            with (
+                self.self_attn.maybe_use_decode_attn_tp(forward_batch),
+                get_forward().scoped(npu_defer_attn_reduce=x.device.type == "npu"),
+            ):
                 y = self.self_attn(
                     x=x,
                     positions=positions,
@@ -190,13 +191,14 @@ class NonCudaDecoderMixin:
             fuse_all_reduce_mhc = self._can_fuse_ffn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
-            y = self._run_moe_ffn_dp_sync(
-                x,
-                forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
-                return_moe_output=fuse_all_reduce_mhc,
-            )
+            with get_forward().scoped(npu_defer_moe_post=x.device.type == "npu"):
+                y = self._run_moe_ffn_dp_sync(
+                    x,
+                    forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    return_moe_output=fuse_all_reduce_mhc,
+                )
             del x
             return mhc.run_moe_post(
                 self.ffn_hc,
@@ -564,6 +566,16 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
         forward_batch: ForwardBatch,
         prev_pre: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if hidden_states.device.type == "npu":
+            from sglang.srt.hardware_backend.npu.dsv41.peer_collectives import (
+                try_draft_stage,
+            )
+
+            fused = try_draft_stage(
+                self, positions, hidden_states, forward_batch, prev_pre
+            )
+            if fused is not None:
+                return fused
         # The draft stages run the plain four steps: no fused post, no seams, so
         # they need nothing from `bind_next` and never hand anything forward.
         assert self.attn_hc is not None and self.ffn_hc is not None
