@@ -98,7 +98,7 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     For example, if there are 3 images and 1 audio, there will be 4 MultimodalDataItems.
 
     Each item has a full identity for embedding caching and batch deduplication.
-    KV caching additionally scopes the request by its ordered media identities.
+    KV caching uses the same full identities at the media positions or in the request namespace.
 
     We put the common fields first and the model-specific fields in model_specific_data.
     """
@@ -170,7 +170,7 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
         """Adopt a full 32-byte digest and derive four 62-bit pad sentinels.
 
         ``hash`` keeps a compatibility scalar, never the embedding-cache key.
-        The radix key also binds the full identity in the request namespace.
+        The radix key also binds the full identity.
         """
         if len(identity) != _MM_IDENTITY_BYTES:
             raise ValueError(

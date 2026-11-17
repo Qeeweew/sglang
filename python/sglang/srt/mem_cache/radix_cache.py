@@ -26,7 +26,9 @@ import logging
 import sys
 import time
 from array import array
+from bisect import bisect_left
 from collections import defaultdict
+from itertools import zip_longest
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
@@ -56,11 +58,20 @@ from sglang.srt.utils.common import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
+MediaCacheSpan = tuple[int, int, bytes]  # raw-token start, length, full identity
+
 
 class RadixKey:
     """is_bigram=True: token_ids holds raw tokens (N+1 for N bigrams); slices share one boundary token."""
 
-    __slots__ = ("token_ids", "extra_key", "cache_salt", "is_bigram", "limit")
+    __slots__ = (
+        "token_ids",
+        "extra_key",
+        "cache_salt",
+        "is_bigram",
+        "limit",
+        "media_spans",
+    )
 
     def __init__(
         self,
@@ -69,6 +80,7 @@ class RadixKey:
         is_bigram: bool = False,
         limit: Optional[int] = None,
         cache_salt: Optional[str] = None,
+        media_spans: tuple[MediaCacheSpan, ...] = (),
     ):
         # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
@@ -81,6 +93,41 @@ class RadixKey:
         # Optional cap on raw tokens: behave as if token_ids were sliced to
         # token_ids[:limit], without the O(n) copy. None = use all tokens.
         self.limit = limit
+        # Sorted by raw-token start. Only the page containing the start needs
+        # the identity; the remaining pages already depend on that prefix.
+        self.media_spans = media_spans
+
+    @classmethod
+    def from_req(
+        cls,
+        req: Req,
+        token_ids: array[int],
+        *,
+        is_bigram: bool = False,
+        limit: Optional[int] = None,
+    ) -> RadixKey:
+        return cls(
+            token_ids,
+            req.extra_key,
+            is_bigram=is_bigram,
+            limit=limit,
+            cache_salt=req.cache_salt,
+            media_spans=getattr(req, "media_cache_spans", ()),
+        )
+
+    def media_spans_at(self, start: int, stop: int) -> tuple[MediaCacheSpan, ...]:
+        """Media starts in [start, stop), rebased to the raw-token slice."""
+        spans = self.media_spans
+        if not spans or start >= stop:
+            return ()
+        lo = bisect_left(spans, (start,))
+        hi = bisect_left(spans, (stop,), lo)
+        selected = spans[lo:hi]
+        if start == 0:
+            return selected
+        return tuple(
+            (pos - start, length, identity) for pos, length, identity in selected
+        )
 
     def _raw_len(self) -> int:
         n = len(self.token_ids)
@@ -125,20 +172,14 @@ class RadixKey:
         if step != 1:
             raise ValueError("RadixKey slice step must be 1")
 
-        if self.is_bigram:
-            # bigrams [start, stop) span raw tokens [start, stop + 1);
-            # empty slice -> empty raw tokens (not a dangling boundary token).
-            raw = self.token_ids[start : stop + 1] if stop > start else array("q")
-            return RadixKey(
-                raw,
-                self.extra_key,
-                is_bigram=True,
-                cache_salt=self.cache_salt,
-            )
+        # An overlapping bigram includes one more raw token in a nonempty slice.
+        raw_stop = stop + int(self.is_bigram and stop > start)
         return RadixKey(
-            self.token_ids[start:stop],
+            self.token_ids[start:raw_stop],
             self.extra_key,
+            is_bigram=self.is_bigram,
             cache_salt=self.cache_salt,
+            media_spans=self.media_spans_at(start, raw_stop),
         )
 
     def __repr__(self) -> str:
@@ -211,6 +252,14 @@ class RadixKey:
             lo = hi
             step *= 2
 
+        if self.media_spans or other.media_spans:
+            left = self.media_spans_at(0, matched_tokens)
+            right = other.media_spans_at(offset, offset + matched_tokens)
+            for a, b in zip_longest(left, right):
+                if a != b:
+                    matched_tokens = min(span[0] for span in (a, b) if span is not None)
+                    break
+
         if self.is_bigram:
             matched = max(0, min(matched_tokens - 1, len(self), len(other) - offset))
             return (matched // page_size) * page_size if page_size > 1 else matched
@@ -243,6 +292,12 @@ class RadixKey:
             plain = (
                 t[offset] if page_size == 1 else tuple(t[offset : offset + page_size])
             )
+        if self.media_spans:
+            spans = self.media_spans_at(
+                offset, offset + page_size + int(self.is_bigram)
+            )
+            if spans:
+                plain = ("media", plain, spans)
         if self.cache_salt is not None:
             return ((self.extra_key, self.cache_salt), plain)
         return plain if self.extra_key is None else (self.extra_key, plain)

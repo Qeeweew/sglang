@@ -166,6 +166,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
     )
+    from sglang.srt.mem_cache.radix_cache import MediaCacheSpan
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
     from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import UocrReqState
     from sglang.srt.sampling.custom_logit_processor import PageGuardState
@@ -573,6 +574,7 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
         self._user_cache_salt = self.cache_salt
+        self.media_cache_spans: tuple[MediaCacheSpan, ...] = ()
         self.lora_id = lora_id
         self.routing_key = routing_key
 
@@ -996,7 +998,9 @@ class Req(ReqDllmMixin):
             )
         self.spec_cap_lens_histogram[cap_len] += 1
 
-    def extend_image_inputs(self, image_inputs):
+    def extend_image_inputs(
+        self, image_inputs, *, cache_media_by_position: bool = False
+    ):
         if self.mm_token_counts_ready:
             image_tokens, audio_tokens, video_tokens = (
                 image_inputs.compute_mm_token_counts()
@@ -1010,24 +1014,54 @@ class Req(ReqDllmMixin):
             self.multimodal_inputs = image_inputs
         else:
             self.multimodal_inputs.merge(image_inputs)
-        self.bind_multimodal_cache_namespace()
+        self.bind_multimodal_cache_namespace(
+            cache_media_by_position=cache_media_by_position
+        )
 
-    def bind_multimodal_cache_namespace(self) -> None:
-        """Protect KV lookup with full identities, not partial pad-token matches.
+    def bind_multimodal_cache_namespace(
+        self, *, cache_media_by_position: bool = False
+    ) -> None:
+        """Bind full media identities after padding has established their offsets."""
+        self.media_cache_spans = ()
+        if self.multimodal_inputs is None or not self.multimodal_inputs.mm_items:
+            return
+        items = self.multimodal_inputs.mm_items
+        identities = tuple(item.cache_key for item in items)
+        if cache_media_by_position and self.session is None:
+            spans = self._positioned_media_spans(items, identities)
+            if spans:
+                self.cache_salt = self._user_cache_salt
+                self.media_cache_spans = spans
+                return
 
-        A media span can contain only one token, so even wide pad sentinels
-        cannot carry its entire digest. Scope both the radix tree and storage
-        to the ordered media identities. This deliberately gives up text-prefix
-        sharing across different media while preserving same-media reuse.
-        """
-        if self.multimodal_inputs is not None and self.multimodal_inputs.mm_items:
-            identities = tuple(
-                item.cache_key for item in self.multimodal_inputs.mm_items
-            )
-            self.cache_salt = (
-                "sglang-mm-v1:"
-                + structured_digest((self._user_cache_salt, identities)).hex()
-            )
+        # Keep the request-wide namespace for cache paths that only carry token
+        # IDs and for processors that cannot identify every media span.
+        self.cache_salt = (
+            "sglang-mm-v1:"
+            + structured_digest((self._user_cache_salt, identities)).hex()
+        )
+
+    def _positioned_media_spans(
+        self, items: list[MultimodalDataItem], identities: tuple[bytes, ...]
+    ) -> tuple[MediaCacheSpan, ...]:
+        token_ids = self.origin_input_ids
+        spans = []
+        for item, identity in zip(items, identities):
+            if not item.offsets:
+                return ()
+            for start, end in item.offsets:
+                if not 0 <= start <= end < len(token_ids):
+                    return ()
+                if token_ids[start] != item.pad_value:
+                    return ()
+                spans.append((start, end - start + 1, identity))
+        spans.sort()
+        if any(
+            start + length > following[0]
+            for (start, length, _), following in zip(spans, spans[1:])
+        ):
+            return ()
+        return tuple(spans)
 
     def _extend_session_image_inputs(self, image_inputs):
         """Append media while preserving the saved session and its position history."""

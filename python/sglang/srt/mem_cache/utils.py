@@ -91,12 +91,53 @@ def maybe_init_custom_mem_pool(
 
 
 def get_hash_str(
-    token_ids: List[int],
+    token_ids: Any,
     prior_hash: Optional[str] = None,
     page_size: Optional[int] = None,
 ) -> str | List[str]:
     prior_digest = bytes.fromhex(prior_hash) if prior_hash else None
+    if getattr(token_ids, "media_spans", ()) and len(token_ids):
+        return _get_media_hash_str(token_ids, prior_digest, page_size)
     return get_native_hash(token_ids, prior_digest, page_size)
+
+
+def _get_media_hash_str(key, prior_digest, page_size):
+    # Hash ordinary runs in one native call. On media pages, fold the full
+    # identities into the parent digest before hashing the raw token IDs.
+    width = len(key) if page_size is None else page_size
+    raw_len = len(key) + int(key.is_bigram)
+    tagged_pages = set()
+    for start, _, _ in key.media_spans:
+        if start >= raw_len:
+            break
+        tagged_pages.add(min(start, len(key) - 1) // width * width)
+        if key.is_bigram and start:
+            tagged_pages.add((start - 1) // width * width)
+
+    if not tagged_pages:
+        return get_native_hash(key, prior_digest, page_size)
+
+    hashes = []
+    cursor = 0
+    for start in sorted(tagged_pages):
+        if cursor < start:
+            hashes.extend(get_native_hash(key[cursor:start], prior_digest, width))
+            prior_digest = bytes.fromhex(hashes[-1])
+
+        page = key[start : start + width]
+        digest = hashlib.sha256(b"sglang-mm-page-v1\0")
+        digest.update(prior_digest or b"")
+        for offset, length, identity in page.media_spans:
+            digest.update(offset.to_bytes(8, "little"))
+            digest.update(length.to_bytes(8, "little"))
+            digest.update(identity)
+        hashes.append(get_native_hash(page, digest.digest()))
+        prior_digest = bytes.fromhex(hashes[-1])
+        cursor = start + width
+
+    if cursor < len(key):
+        hashes.extend(get_native_hash(key[cursor:], prior_digest, width))
+    return hashes[0] if page_size is None else hashes
 
 
 def storage_namespace_seed(

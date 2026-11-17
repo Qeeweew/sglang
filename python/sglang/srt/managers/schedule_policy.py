@@ -377,7 +377,6 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
-            cache_salt = r.cache_salt
             match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
 
             # NOTE(sang): This logic is for in-batch prefix caching;
@@ -388,14 +387,9 @@ class SchedulePolicy:
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+                waiting_key = RadixKey.from_req(r, prefix_ids)
                 match_result = self.waiting_queue_radix_tree.match_prefix(
-                    MatchPrefixParams(
-                        key=RadixKey(
-                            token_ids=prefix_ids,
-                            extra_key=extra_key,
-                            cache_salt=cache_salt,
-                        )
-                    )
+                    MatchPrefixParams(key=waiting_key)
                 )
                 if envs.SGLANG_RADIX_FORCE_MISS.get():
                     match_result = zero_match_result(
@@ -410,11 +404,7 @@ class SchedulePolicy:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
                         InsertParams(
-                            key=RadixKey(
-                                token_ids=prefix_ids,
-                                extra_key=extra_key,
-                                cache_salt=cache_salt,
-                            ),
+                            key=waiting_key,
                             value=torch.empty(len(prefix_ids), dtype=torch.bool),
                         )
                     )

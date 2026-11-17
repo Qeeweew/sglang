@@ -747,6 +747,14 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_prefix_sharing(self) -> bool:
         return not self.disable
 
+    def supports_positioned_media_keys(self) -> bool:
+        return (
+            self._tree_core_backend == "python"
+            and not self.disable
+            and self.cache_controller is None
+            and self.linker is None
+        )
+
     @rank_consensus(
         same_params=["len(params.key)"],
         same_results=["result.prefix_len"],
@@ -1616,11 +1624,10 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self._components_tuple:
             effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
-        radix_key = RadixKey(
+        radix_key = RadixKey.from_req(
+            req,
             token_ids[:effective_cache_len],
-            req.extra_key,
             is_bigram=self.tree_core.is_eagle,
-            cache_salt=req.cache_salt,
         )
 
         if (
@@ -1686,11 +1693,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # Split the leaf at the prompt boundary so eviction can drop the output
         # KV without the prompt. prev_prefix_len keeps the overlapping indices
         # from being freed as duplicates.
-        prompt_key = RadixKey(
+        prompt_key = RadixKey.from_req(
+            req,
             req.origin_input_ids,
-            req.extra_key,
             is_bigram=self.tree_core.is_eagle,
-            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         if (
             len(self._components_tuple) == 1

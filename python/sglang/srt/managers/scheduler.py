@@ -126,6 +126,7 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.hardware_backend.npu.dsv41 import policy as dsv41_policy
 from sglang.srt.hf_transformers import (
     get_processor,
     get_tokenizer,
@@ -3581,7 +3582,14 @@ class Scheduler(
                 req.origin_input_ids = duplicate_pad_mm_input_ids(
                     req.origin_input_ids, image_inputs, self.pad_input_ids_func
                 )
-            req.extend_image_inputs(image_inputs)
+            req.extend_image_inputs(
+                image_inputs,
+                cache_media_by_position=(
+                    dsv41_policy.enabled()
+                    and self.disaggregation_mode == DisaggregationMode.NULL
+                    and self.tree_cache.supports_positioned_media_keys()
+                ),
+            )
             # the request now owns cleanup, including rejection after padding
             mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
