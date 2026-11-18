@@ -4,6 +4,39 @@
 #include "jit.h"
 namespace native_host {
 namespace {
+std::tuple<at::Tensor, at::Tensor> split_rms_norm(const at::Tensor &input, const at::Tensor &first,
+                                                  const at::Tensor &second, double first_eps,
+                                                  double second_eps) {
+    const auto device = input.device();
+    TORCH_CHECK_VALUE(device.type() == c10::DeviceType::PrivateUse1 && input.dim() == 2 &&
+                      input.scalar_type() == at::kBFloat16 && input.stride(1) == 1 &&
+                      input.stride(0) >= input.size(1), "expected row-strided BF16 NPU matrix");
+    const auto format = at_npu::native::get_npu_format(input);
+    TORCH_CHECK_VALUE(format == ACL_FORMAT_ND || format == ACL_FORMAT_NCHW, "expected ND input");
+    for (const auto &weight : {first, second}) {
+        check(weight, at::kBFloat16, device);
+        TORCH_CHECK_VALUE(weight.dim() == 1 && weight.numel() > 0 &&
+                          weight.numel() <= elementwise::kReductionPanelElements &&
+                          weight.numel() % elementwise::kFp32VectorElements == 0,
+                          "expected RMSNorm weight covering complete vector repeats");
+    }
+    TORCH_CHECK_VALUE(first.numel() + second.numel() == input.size(1) &&
+                      std::isfinite(first_eps) && first_eps > 0 &&
+                      std::isfinite(second_eps) && second_eps > 0, "invalid split/epsilons");
+    c10_npu::NPUGuard guard(device);
+    const auto rows = input.size(0);
+    auto first_out = at::empty({rows, first.numel()}, input.options());
+    auto second_out = at::empty({rows, second.numel()}, input.options());
+    if (rows) {
+        auto stream = c10_npu::getCurrentNPUStream(input.get_device());
+        for (const auto &tensor : {input, first, second, first_out, second_out}) record(tensor, stream);
+        split_rms_norm_launch(stream.stream(), u32(core_count(input.get_device())), ptr(input),
+                              ptr(first), ptr(second), ptr(first_out), ptr(second_out),
+                              u32(first.numel()), u32(second.numel()), f32(first_eps),
+                              f32(second_eps), rows, input.stride(0));
+    }
+    return {first_out, second_out};
+}
 void rms_norm(const at::Tensor &x, const at::Tensor &weight, const at::Tensor &out, double eps) {
     auto device = x.device();
     check(x, at::kBFloat16, device);
@@ -63,6 +96,8 @@ void swiglu(const at::Tensor &gate, const at::Tensor &up, const std::optional<at
 }
 } // namespace
 TORCH_LIBRARY_FRAGMENT(dsv41, m) {
+    m.def("split_rms_norm(Tensor input, Tensor first_weight, Tensor second_weight, float first_eps, "
+          "float second_eps) -> (Tensor, Tensor)", &split_rms_norm);
     m.def("rms_norm(Tensor x, Tensor weight, Tensor(a!) out, float epsilon) -> ()", &rms_norm);
     m.def("swiglu(Tensor gate, Tensor up, Tensor? count, Tensor(a!) out, float limit, bool packed) "
           "-> ()",

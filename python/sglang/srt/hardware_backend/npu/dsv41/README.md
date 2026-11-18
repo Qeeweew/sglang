@@ -122,6 +122,17 @@ operator. Use the ordinary eager draft warmup or explicitly prepare with
 `torch.ops.dsv41.precompile_dspark_markov()` on the initialized current NPU
 before standalone Graph capture.
 
+Target attention uses `elementwise.split_rms_norm` (dispatcher:
+`torch.ops.dsv41.split_rms_norm`) for packed WQKV-A. In one launch, paired
+vector workers normalize the two row segments using their own weights and
+epsilons. Outputs are contiguous BF16 matrices; WQ-B, the indexer and the
+KV path consume them unchanged. Both target prepare entry points share this
+path. The adapter keeps the vendor norms for separate projections, older
+publications, unsupported layouts/widths, and above the measured 2,048-row
+range. An eager warmup prepares the JIT; for direct graph capture, use
+`precompile_elementwise("split_rms_norm", rows, q_width, vector_cores,
+second_width=kv_width)` before capture.
+
 Wheel/sdist build hooks copy DeepJIT into package data, including its license
 and source identity. Editable checkouts use the single root `3rdparty` tree.
 Native source and CMake files are package data; host binaries are built for the

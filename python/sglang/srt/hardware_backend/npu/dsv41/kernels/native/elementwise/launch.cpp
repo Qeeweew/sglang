@@ -34,7 +34,31 @@ native_jit::Kernel &entry(Operation operation, uint64_t rows, uint32_t width, ui
                                                     std::move(flags), workers);
     });
 }
+native_jit::Kernel &split_entry(int64_t rows, uint32_t first_width, uint32_t second_width,
+                                uint32_t budget) {
+    const uint32_t workers = budget / 2 * 2;
+    TORCH_CHECK_VALUE(workers >= 2, "split RMSNorm requires two vector workers");
+    const bool single_wave = rows <= workers / 2;
+    static thread_local native_jit::ActualEntries<4> entries;
+    return entries.get({first_width, second_width, workers, single_wave}, [&] {
+        std::vector<std::string> flags{"--cce-auto-sync=off", "-DELEMENTWISE_RMS=1",
+            "-DELEMENTWISE_WIDTH=" + std::to_string(first_width),
+            "-DELEMENTWISE_SECOND_WIDTH=" + std::to_string(second_width),
+            "-DELEMENTWISE_WORKERS=" + std::to_string(workers)};
+        if (single_wave) flags.emplace_back("-DELEMENTWISE_SINGLE_TILE=1");
+        return std::make_unique<native_jit::Kernel>("split_rms_norm", "elementwise/elementwise.asc",
+                                                    std::move(flags), workers);
+    });
+}
 } // namespace
+void split_rms_norm_launch(void *stream, uint32_t budget, uint8_t *input, uint8_t *first_weight,
+                           uint8_t *second_weight, uint8_t *first_out, uint8_t *second_out,
+                           uint32_t first_width, uint32_t second_width, float first_eps,
+                           float second_eps, int64_t rows, int64_t stride) {
+    split_entry(rows, first_width, second_width, budget)
+        .launch_persistent(stream, uint64_t(rows) * 2, input, first_weight, second_weight,
+                           first_out, second_out, first_eps, second_eps, rows, stride);
+}
 extern "C" void dsv41_rms_norm_launch(void *stream, uint32_t blocks, uint8_t *input,
                                       uint8_t *weight, uint8_t *output, int64_t rows,
                                       uint32_t width, float epsilon) {
@@ -52,13 +76,22 @@ extern "C" void dsv41_swiglu_launch(void *stream, uint32_t blocks, uint8_t *gate
 TORCH_LIBRARY_FRAGMENT(dsv41, m) {
     m.def("precompile_elementwise(str operation, int rows, int width, int workers, bool "
           "packed=False, "
-          "bool fp16=False, bool prefix=False) -> ()",
+          "bool fp16=False, bool prefix=False, int second_width=0) -> ()",
           [](const std::string &operation, int64_t rows, int64_t width, int64_t workers,
-             bool packed, bool fp16, bool prefix) {
+             bool packed, bool fp16, bool prefix, int64_t second_width) {
               using namespace elementwise;
               TORCH_CHECK_VALUE(rows > 0 && width > 0 && width <= UINT32_MAX && workers > 0 &&
                                     workers <= native_host::core_count(c10_npu::current_device()),
                                 "actual elementwise geometry/worker budget required");
+              if (operation == "split_rms_norm") {
+                  TORCH_CHECK_VALUE(!packed && !fp16 && !prefix && width <= kReductionPanelElements &&
+                                    width % kFp32VectorElements == 0 && second_width > 0 &&
+                                    second_width <= kReductionPanelElements &&
+                                    second_width % kFp32VectorElements == 0, "invalid split RMSNorm widths");
+                  split_entry(rows, uint32_t(width), uint32_t(second_width), uint32_t(workers)).prepare();
+                  return;
+              }
+              TORCH_CHECK_VALUE(second_width == 0, "second_width is only for split RMSNorm");
               if (operation == "rms_norm") {
                   TORCH_CHECK_VALUE(!packed && !fp16 && !prefix &&
                                         width <= 2 * kReductionPanelElements &&

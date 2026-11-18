@@ -185,6 +185,48 @@ def adapt_wo_a(original_wo_a):
     return wo_a
 
 
+@cache
+def _split_rms_operator():
+    from ..kernels.runtime.native import load_library
+
+    return getattr(load_library(), "split_rms_norm", None)
+
+
+def _normalized_qkv(layer, x):
+    import torch_npu
+
+    if not layer.fuse_wqa_wkv:
+        return layer.q_norm(layer.wq_a(x)[0]), layer.kv_norm(layer.wkv(x)[0])
+
+    packed, _ = layer.wqkv_a(x)
+    first, second = layer.q_norm.weight, layer.kv_norm.weight
+    split_norm = _split_rms_operator()
+    if (
+        split_norm is not None
+        and packed.ndim == 2
+        and packed.size(0) <= 2048
+        and packed.stride(1) == 1
+        and packed.stride(0) >= packed.size(1)
+        and first.is_contiguous()
+        and second.is_contiguous()
+        and all(0 < w.numel() <= 4096 and w.numel() % 64 == 0 for w in (first, second))
+        and all(
+            t.dtype == torch.bfloat16 and torch_npu.get_npu_format(t) in (0, 2)
+            for t in (packed, first, second)
+        )
+    ):
+        return split_norm(
+            packed,
+            first,
+            second,
+            layer.q_norm.variance_epsilon,
+            layer.kv_norm.variance_epsilon,
+        )
+    return layer.q_norm(packed[..., : layer.q_lora_rank]), layer.kv_norm(
+        packed[..., layer.q_lora_rank :]
+    )
+
+
 def adapt_prepare(original_prepare):
     if not enabled():
         return original_prepare
@@ -226,19 +268,11 @@ def adapt_prepare(original_prepare):
             )
         if x.dtype != torch.bfloat16:
             raise ValueError("V4.1/910B attention input must be BF16")
-        if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x)
-            q_lora = qkv_a[..., : self.q_lora_rank]
-            kv = qkv_a[..., self.q_lora_rank :]
-        else:
-            q_lora, _ = self.wq_a(x)
-            kv, _ = self.wkv(x)
-        q_lora = self.q_norm(q_lora)
+        q_lora, kv = _normalized_qkv(self, x)
         q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if self.q_head_norm:
             q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
-        kv = self.kv_norm(kv)
         cos, sin = self._get_npu_rope_position_cache(
             forward_batch, positions, q.dtype, inverse=False
         )
@@ -290,94 +324,12 @@ def adapt_multi_prepare(original_multi_prepare):
     if not enabled():
         return original_multi_prepare
 
-    def prepare(
-        self,
-        x,
-        positions,
-        forward_batch,
-        attn_backend,
-        q_out=None,
-        x_quant=None,
-        q_rope_out=None,
-        k_nope_out=None,
-        k_rope_out=None,
-    ):
-        from inspect import unwrap
-
-        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
-        from sglang.srt.models.deepseek_v4 import (
-            MQALayer,
-        )
-
-        original_prepare = unwrap(MQALayer._forward_prepare)
-        import torch_npu
-
-        if not (enabled() and self.is_dsv41 and (x.device.type == "npu")):
-            return original_prepare(
-                self,
-                x,
-                positions,
-                forward_batch,
-                attn_backend,
-                q_out,
-                x_quant=x_quant,
-                q_rope_out=q_rope_out,
-                k_nope_out=k_nope_out,
-                k_rope_out=k_rope_out,
-            )
-        if x_quant is not None or any(
-            (t is not None for t in (q_rope_out, k_nope_out, k_rope_out))
-        ):
-            raise ValueError(
-                "V4.1/910B preparation uses BF16 projections and a BF16 KV cache"
-            )
-        if x.dtype != torch.bfloat16:
-            raise ValueError("V4.1/910B attention input must be BF16")
-        if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x)
-            q_lora = qkv_a[..., : self.q_lora_rank]
-            kv = qkv_a[..., self.q_lora_rank :]
-        else:
-            q_lora, _ = self.wq_a(x)
-            kv, _ = self.wkv(x)
-        q_lora = self.q_norm(q_lora)
-        q, _ = self.wq_b(q_lora)
-        q = q.view(-1, self.n_local_heads, self.head_dim)
-        if self.q_head_norm:
-            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
-        kv = self.kv_norm(kv)
-        cos, sin = self._get_npu_rope_position_cache(
-            forward_batch, positions, q.dtype, inverse=False
-        )
-        Dsv4NpuRoPE.apply_rotary_mul_inplace(
-            q, kv.unsqueeze(1), cos, sin, qk_nope_dim=self.qk_nope_head_dim
-        )
-        attn_backend.store_cache(
-            layer_id=self.layer_id, swa_k=kv, forward_batch=forward_batch
-        )
-        if q_out is not None:
-            if q_out.dtype != torch.bfloat16:
-                raise ValueError("V4.1/910B Q storage must be BF16")
-            q_out.copy_(q)
-        if self.compress_ratio in (1, 2) and (
-            self.compressor is not None or self.indexer is not None
-        ):
-            attn_backend.forward_low_ratio_sources(
-                layer=self,
-                x=x,
-                q_lora=q_lora,
-                positions=positions,
-                forward_batch=forward_batch,
-            )
-        return (q, None)
-
     @wraps(original_multi_prepare)
     def multi_prepare(
         self, x, positions, forward_batch, attn_backend, q_out=None, x_quant=None
     ):
         if enabled() and self.is_dsv41 and (x.device.type == "npu"):
-            return prepare(
-                self,
+            return self._forward_prepare(
                 x,
                 positions,
                 forward_batch,
