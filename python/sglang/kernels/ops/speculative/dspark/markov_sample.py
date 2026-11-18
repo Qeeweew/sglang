@@ -444,6 +444,10 @@ class MarkovSampleStep:
             [local_values.float(), local_indices.view(torch.float32)], dim=1
         )
         gathered = partial if gather is None else gather(partial)
+        return cls.finish_candidates(gathered, rows)
+
+    @staticmethod
+    def finish_candidates(gathered, rows):
         gathered = gathered.view(-1, rows, 2)
         values = gathered[..., 0].transpose(0, 1)
         indices = gathered[..., 1].contiguous().view(torch.int32) & _NO_INDEX.value

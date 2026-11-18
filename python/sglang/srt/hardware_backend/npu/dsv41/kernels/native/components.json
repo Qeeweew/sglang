@@ -42,6 +42,10 @@
       "backend": "jit"
     },
     {
+      "name": "dspark_markov",
+      "backend": "jit"
+    },
+    {
       "name": "moe_routes",
       "backend": "jit"
     },

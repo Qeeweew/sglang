@@ -109,6 +109,19 @@ performance; their first use may prepare additional JIT entries.
 A cold cache needs the CANN compiler. Rebuild when Torch ABI, bindings, SDK, or
 vendored headers change, and restart the processes after rebuilding.
 
+`AscendMarkovStep` uses the optional `dspark_markov` component on either side
+of the existing candidate all-gather. For greedy FP32 steps without saved
+logits the local kernel reads row-strided BF16/FP32 logits and bias, adds in
+FP32 and selects the first winning token in each vocabulary tile. Wide shards
+reduce tile winners on the same device before exchanging the usual single
+`(score, bitcast token ID)` per row. The final rank merge emits INT64 tokens.
+There is no TP-specific path. Sampled steps, saved logits and unsupported
+types use the original Torch local selection; strided gathered packets use
+the original Torch merge. Older ABI 23 publications fall back for each missing
+operator. Use the ordinary eager draft warmup or explicitly prepare with
+`torch.ops.dsv41.precompile_dspark_markov()` on the initialized current NPU
+before standalone Graph capture.
+
 Wheel/sdist build hooks copy DeepJIT into package data, including its license
 and source identity. Editable checkouts use the single root `3rdparty` tree.
 Native source and CMake files are package data; host binaries are built for the

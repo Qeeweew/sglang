@@ -126,7 +126,9 @@ def adapt_markov(original_markov):
     @wraps(original_markov)
     def markov(cls, **kwargs):
         if kwargs["base_logits"].device.type == "npu":
-            return cls.torch(**kwargs)
+            from .markov import AscendMarkovStep
+
+            return AscendMarkovStep.run(**kwargs)
         return original_markov(cls, **kwargs)
 
     return markov
