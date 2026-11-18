@@ -22,6 +22,7 @@ def graph_case(library_dir, mode):
     plan, inputs, candidate = make_case(
         [6], [4097], ratio=2, residual=[1], mode=mode, library_dir=library_dir, seed=37
     )
+    plan.workspace = None
     # Warm custom launch registration before capture.
     for _ in range(2):
         plan.run(*inputs, candidates=candidate)
@@ -127,6 +128,7 @@ def chained_graph(library_dir):
     source, inputs, _ = make_case(
         [6], [20003], mode="source", library_dir=library_dir, seed=95
     )
+    source.workspace = None
     consumer = QLIPlan(
         [0, 6],
         [20003],

@@ -4,6 +4,7 @@
 #include "bucket_layout.h"
 #include "grouped_metadata.h"
 #include "jit.h"
+#include "workspace.h"
 #include <limits>
 namespace native_host {
 namespace {
@@ -76,7 +77,7 @@ route(const at::Tensor &x, const std::optional<at::Tensor> &bias, double factor,
 }
 void bucket(const at::Tensor &ids, const at::Tensor &local_ids, const at::Tensor &counts,
             const at::Tensor &offsets, const at::Tensor &order, const at::Tensor &metadata,
-            const at::Tensor &histogram, int64_t first) {
+            const std::optional<at::Tensor> &histogram, int64_t first) {
     const auto device = ids.device();
     check(ids, at::kInt, device);
     check(counts, at::kInt, device);
@@ -90,30 +91,36 @@ void bucket(const at::Tensor &ids, const at::Tensor &local_ids, const at::Tensor
     check(offsets, at::kInt, device, {counts.numel() + 1});
     check(order, at::kInt, device, {ids.numel()});
     check(metadata, at::kInt, device, {route_metadata::kWords * (counts.numel() + 1)});
-    const uint32_t workers = std::min<int64_t>(core_count(ids.get_device()), counts.numel());
-    check(histogram, at::kInt, device, {workers, router_bucket::histogram_stride(counts.numel())});
-    disjoint({local_ids, counts, offsets, order, metadata, histogram}, {ids});
     c10_npu::NPUGuard guard(device);
+    const uint32_t workers = std::min<int64_t>(core_count(ids.get_device()), counts.numel());
+    const int64_t stride = router_bucket::histogram_stride(counts.numel());
+    if (histogram)
+        check(*histogram, at::kInt, device, {workers, stride});
+    disjoint({local_ids, counts, offsets, order, metadata, histogram}, {ids});
     auto stream = c10_npu::getCurrentNPUStream(ids.get_device());
-    for (const auto &tensor : {ids, local_ids, counts, offsets, order, metadata, histogram})
+    const auto acl_stream = stream.stream();
+    const LaunchWorkspace scratch(histogram, workers * stride * sizeof(int32_t), acl_stream);
+    for (const auto &tensor : {ids, local_ids, counts, offsets, order, metadata})
         record(tensor, stream);
-    dsv41_route_bucket(stream.stream(), workers, ids.data_ptr(), local_ids.data_ptr(),
+    track(histogram, stream);
+    dsv41_route_bucket(acl_stream, workers, ids.data_ptr(), local_ids.data_ptr(),
                        counts.data_ptr(), offsets.data_ptr(), order.data_ptr(), metadata.data_ptr(),
-                       histogram.data_ptr(), ids.numel(), int32_t(first), uint32_t(counts.numel()));
+                       scratch.data(), ids.numel(), int32_t(first), uint32_t(counts.numel()));
 }
 
 } // namespace
 TORCH_LIBRARY_FRAGMENT(dsv41, m) {
     m.def("prepare_route_bucket(Tensor ids, Tensor local_ids, Tensor counts, Tensor offsets, "
-          "Tensor order, Tensor metadata, Tensor histogram, int first) -> ()",
+          "Tensor order, Tensor metadata, Tensor? histogram, int first) -> ()",
           [](const at::Tensor &ids, const at::Tensor &local_ids, const at::Tensor &counts,
-             const at::Tensor &offsets, const at::Tensor &order, const at::Tensor &metadata, const at::Tensor &histogram,
+             const at::Tensor &offsets, const at::Tensor &order, const at::Tensor &metadata,
+             const std::optional<at::Tensor> &histogram,
              int64_t first) {
               native_jit::PrepareOnlyScope prepare;
               bucket(ids, local_ids, counts, offsets, order, metadata, histogram, first);
           });
     m.def("route_bucket(Tensor ids, Tensor(a!) local_ids, Tensor(b!) counts, Tensor(c!) offsets, "
-          "Tensor(d!) order, Tensor(e!) metadata, Tensor(f!) histogram, int first) -> ()", &bucket);
+          "Tensor(d!) order, Tensor(e!) metadata, Tensor(f!)? histogram, int first) -> ()", &bucket);
 
     m.def("router(Tensor logits, Tensor? bias, float factor, Tensor? valid_rows, Tensor? dp_counts, "
           "int dp_stride, Tensor? alternate_bias, Tensor? image_mask, Tensor(a!)? ids_out, "

@@ -1,6 +1,7 @@
 #include "launch.h"
 #include "torch.h"
 #include "jit.h"
+#include "workspace.h"
 namespace native_host {
 namespace {
 using namespace mhc;
@@ -61,26 +62,33 @@ void project(const at::Tensor &r, const at::Tensor &fn, const at::Tensor &projec
     check(fn, at::kFloat, device, {p.projection_columns, p.input_width});
     check(projection, at::kFloat, device, {p.splits, int64_t(p.padded_rows), p.projection_stride});
     check(squares, at::kFloat, device, {p.splits, int64_t(p.padded_rows)});
+    const std::array<int64_t, 4> input_shape{p.cube_groups, kSlots, p.tile_rows, p.panel_k};
+    const std::array<int64_t, 4> product_shape{p.cube_groups, kSlots, p.tile_rows,
+                                               p.projection_stride};
     if (!vector) {
         TORCH_CHECK_VALUE(p.input_width <= UINT16_MAX,
                           "mixed mHC Fn ND2NZ source stride exceeds uint16");
-        TORCH_CHECK_VALUE(inputs && products, "mixed mHC requires two stable GM rings");
-        check(*inputs, at::kFloat, device, {p.cube_groups, kSlots, p.tile_rows, p.panel_k});
-        check(*products, at::kFloat, device,
-              {p.cube_groups, kSlots, p.tile_rows, p.projection_stride});
+        if (inputs)
+            check(*inputs, at::kFloat, device, input_shape);
+        if (products)
+            check(*products, at::kFloat, device, product_shape);
     }
     disjoint({projection, squares, inputs, products}, {r, fn});
     if (!s.rows)
         return;
     c10_npu::NPUGuard guard(device);
     auto stream = c10_npu::getCurrentNPUStream(r.get_device());
+    const auto acl_stream = stream.stream();
+    const size_t slot_bytes = vector ? 0 : size_t(p.cube_groups) * kSlots * p.tile_rows * sizeof(float);
+    const LaunchWorkspace input_ring(inputs, slot_bytes * p.panel_k, acl_stream);
+    const LaunchWorkspace product_ring(products, slot_bytes * p.projection_stride, acl_stream);
     for (auto &t : {r, fn, projection, squares})
         track(t, stream);
     track(inputs, stream);
     track(products, stream);
-    dsv41_mhc_project_launch(stream.stream(), vector ? p.vector_groups : p.cube_groups, ptr(r),
-                             ptr(fn), ptr(projection), ptr(squares), ptr(inputs), ptr(products), p,
-                             vector);
+    dsv41_mhc_project_launch(acl_stream, vector ? p.vector_groups : p.cube_groups, ptr(r), ptr(fn),
+                             ptr(projection), ptr(squares), input_ring.data(), product_ring.data(),
+                             p, vector);
 }
 StatsParams stats_check(const at::Tensor &p, const at::Tensor &s, const at::Tensor &scale,
                         const at::Tensor &base, const at::Tensor &pre, const at::Tensor &post,

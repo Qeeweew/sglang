@@ -170,12 +170,15 @@ def graphs(op, scope, records, shapes=None):
             pointers = [t.data_ptr() for t in tensors]
             stream = torch.npu.Stream()
             stream.wait_stream(torch.npu.current_stream())
+            managed_output = torch.empty_like(output)
             with torch.npu.stream(stream):
+                managed = op.bind(confidence, budget, out=managed_output)
                 for _ in range(2):
                     op(confidence, budget, survival=scratch, out=output)
             stream.synchronize()
             graph = torch.npu.NPUGraph()
             with torch.npu.graph(graph, stream=stream):
+                managed()
                 op(confidence, budget, survival=scratch, out=output)
             for pattern in ("ones", "special", "zeros", "nextafter", "random"):
                 confidence.copy_(test_data(b, g, pattern))
@@ -193,6 +196,9 @@ def graphs(op, scope, records, shapes=None):
                     ((sg, 123.0), (og, -987654)),
                     f"native/graph/{b}x{g}/{pattern}",
                     records,
+                )
+                torch.testing.assert_close(
+                    managed_output.cpu(), output.cpu(), rtol=0, atol=0
                 )
                 assert pointers == [t.data_ptr() for t in tensors]
             del graph

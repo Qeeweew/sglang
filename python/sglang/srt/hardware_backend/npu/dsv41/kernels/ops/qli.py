@@ -1,6 +1,6 @@
 """910B INT8 query/key lightning indexer with explicit plan-time DeepJIT preparation.
 
-The plan owns scratch and fixed-address outputs. It can upload CPU sequence
+The plan owns fixed-address outputs, not launch scratch. It can upload CPU sequence
 metadata or borrow the serving backend's live device tensors. Query ranges
 are derived inside the kernel; there is no host scheduling table. Keep the
 plan and captured input tensors alive with the Graph.
@@ -135,7 +135,8 @@ class QLIPlan:
             if self.mode == 1
             else None
         )
-        self.workspace = self._library.qli_workspace(
+        self.workspace = None
+        self.workspace_bytes = self._library.qli_workspace_bytes(
             self.device.index,
             self.cores,
             self.heads,
@@ -144,7 +145,6 @@ class QLIPlan:
             self.mode,
             self._pages_shape[1] * self.page_size,
         )
-        self.workspace_bytes = self.workspace.numel()
         self._last_inputs = ()
         self.update(cu_q, lengths, residual=residual, pages=pages)
 

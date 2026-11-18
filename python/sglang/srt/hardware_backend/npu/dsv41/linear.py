@@ -19,7 +19,6 @@ from .policy import enabled
 logger = logging.getLogger(__name__)
 
 _WO_A = weakref.WeakValueDictionary()
-_WORKSPACES = {}
 
 
 def enabled_for(quant_config):
@@ -121,23 +120,16 @@ class W8A16LinearMethod(UnquantizedLinearMethod):
         self.finalized = True
 
     def _launch(self, layer, x, output):
-        stream = torch.npu.current_stream(x.device).npu_stream
-        geometry = (x.device, x.dtype, tuple(x.shape), stream)
+        geometry = (x.device, x.dtype, tuple(x.shape))
         prepared = self.plans.get(geometry)
         if prepared is None:
             if torch.npu.is_current_stream_capturing():
-                raise RuntimeError(
-                    "warm the actual W8A16 shape and stream before Graph capture"
-                )
+                raise RuntimeError("warm the actual W8A16 shape before Graph capture")
             call = self.op.bind(x, self.weight, layer.w8a16_scale, out=output)
-            key = (x.device, x.dtype, stream, call.plan[1], call.plan[2])
-            workspace = _WORKSPACES.setdefault(key, call.workspace)
-            # Retain no activation/output: eager output lifetimes and captured
-            # addresses belong to the caller, while geometry is address-free.
-            prepared = call.native, call.plan, workspace
+            prepared = call.native, call.plan
             self.plans[geometry] = prepared
-        native, plan, workspace = prepared
-        native.w8a16(x, self.weight, layer.w8a16_scale, output, workspace, *plan)
+        native, plan = prepared
+        native.w8a16(x, self.weight, layer.w8a16_scale, output, None, *plan)
         return output
 
     def apply(self, layer, x, bias=None):

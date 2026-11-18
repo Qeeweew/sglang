@@ -85,13 +85,6 @@ def run():
                 op.stats(*c["dev"], workspace=c["workspace"])
             graphs[m] = graph
         stream.synchronize()
-        ring_addresses = {
-            key: tuple(t.data_ptr() for t in buffers)
-            for key, buffers in op._rings.items()
-        }
-        assert {key[2] for key in ring_addresses} == {
-            c["bm"] for m, c in cases.items() if m > 8
-        }
         addresses = {
             m: [
                 t.data_ptr()
@@ -131,14 +124,10 @@ def run():
                         c["workspace"].square_sum,
                     )
                 ]
-                assert ring_addresses == {
-                    key: tuple(t.data_ptr() for t in buffers)
-                    for key, buffers in op._rings.items()
-                }
     stream.synchronize()
     print(
         "PASS mHC compact geometry: 8 eager shapes, caller workspaces, "
-        "2 mixed Graphs, changed inputs and stable rings"
+        "2 mixed Graphs and changed inputs"
     )
 
 

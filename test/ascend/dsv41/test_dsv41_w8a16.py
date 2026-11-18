@@ -138,7 +138,7 @@ def test_loaded_method_and_changed_input_graph(rows, batches, n, k, merged):
         check()
         torch.testing.assert_close(eager.cpu(), out.cpu(), rtol=0, atol=0)
         output_pointer = out.data_ptr()
-        workspaces = [entry[2].data_ptr() for entry in method.plans.values()]
+        plans = dict(method.plans)
         graph = torch.npu.NPUGraph()
         with patch.object(
             method.op, "bind", side_effect=AssertionError("Graph/hot path cannot bind")
@@ -153,9 +153,7 @@ def test_loaded_method_and_changed_input_graph(rows, batches, n, k, merged):
                 stream.synchronize()
                 check()
                 assert out.data_ptr() == output_pointer
-                assert workspaces == [
-                    entry[2].data_ptr() for entry in method.plans.values()
-                ]
+                assert method.plans == plans
         del graph
     if batches == 1:
         addend = torch.full_like(out, 0.25)
@@ -179,7 +177,7 @@ def test_loaded_method_and_changed_input_graph(rows, batches, n, k, merged):
                     raw_scales_and_repack="passed",
                     changed_input_graph_replays=3,
                     numerical_reference="independent CPU weight quantization and FP64 W8A16 dot",
-                    stable_weights_workspace_and_output=True,
+                    stable_weights_plan_and_output=True,
                 )
             )
             + "\n"

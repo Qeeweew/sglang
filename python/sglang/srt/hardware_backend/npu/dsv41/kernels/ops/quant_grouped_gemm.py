@@ -65,7 +65,7 @@ class NativeGroupedGemm:
         self.device = npu_device(device or f"npu:{torch.npu.current_device()}")
         self.k, self.n, self.experts = k, n, experts
         self.adaptive = block_m == 0
-        self.block_m, self._workspaces = block_m, {}
+        self.block_m = block_m
         self.params = geometry(k, n, block_m=block_m or 16)
         self.cores = library.quant_gmm_cores(self.device.index)
 
@@ -155,18 +155,6 @@ class NativeGroupedGemm:
         route_capacity = 4 * (self.experts + 1)
         if routing.ndim != 1 or routing.numel() < route_capacity:
             raise ValueError("compact metadata capacity must cover all experts")
-        stream = torch.npu.current_stream(self.device)
-        count = self.cores * 2 * params["BN"] * params["STEP_K"]
-        if workspace is None:
-            key = (stream.npu_stream, bm)
-            if key not in self._workspaces:
-                if torch.npu.is_current_stream_capturing():
-                    raise RuntimeError("warm native workspace on the capture stream")
-                self._workspaces[key] = x.new_empty(count)
-            workspace = self._workspaces[key]
-        check_tensor(workspace, torch.float16, None, self.device, "workspace")
-        if workspace.numel() < count:
-            raise ValueError(f"workspace needs {count} FP16 elements")
         require_disjoint((out, workspace), (x, packed, scales, routing))
         op = load_library().quant_gmm
         with torch.npu.device(self.device):

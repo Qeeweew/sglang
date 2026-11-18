@@ -16,8 +16,8 @@ from sglang.srt.hardware_backend.npu.dsv41.kernels.runtime.native import (
 class _NativeAttention:
     """Three DeepJIT dataflows specialized to the actual bound geometry.
 
-    Each bind prepares its entry and owns stable workspace per device, stream
-    and allocation geometry. Replay may update every device metadata tensor.
+    Each bind prepares the entry; launch borrows scratch from the NPU allocator.
+    Replay may update every device metadata tensor.
     """
 
     def __init__(
@@ -44,7 +44,6 @@ class _NativeAttention:
         self.heads, self.mode, self.ratio = heads, mode, ratio
         self.capacity, self.ring = capacity, bool(ring)
         self.window_rows, self.cores = window_rows, cores
-        self._workspaces = {}
 
     def empty(self, q, out):
         if q.ndim != 3 or q.shape[1] != self.heads or q.device.type != "npu":
@@ -138,44 +137,10 @@ class _NativeAttention:
         )
         require_disjoint((out,), inputs)
         native = load_library()
-        key = (
-            device,
-            int(torch.npu.current_stream(device).npu_stream),
-            width,
-            capacity,
-            page_rows,
-            selected_rows,
-            self.cores,
-        )
-        workspace = self._workspaces.get(key)
-        if workspace is None:
-            if torch.npu.is_current_stream_capturing():
-                raise RuntimeError(
-                    "warm attention on this NPU stream before Graph capture"
-                )
-            count = native.attention_workspace(
-                tokens,
-                self.heads,
-                batch,
-                table.shape[1],
-                columns,
-                capacity,
-                self.ratio,
-                self.mode,
-                device.index,
-                self.ring,
-                width,
-                page_rows,
-                self.window_rows,
-                selected_rows,
-                self.cores,
-            )
-            workspace = torch.empty(count, dtype=torch.uint8, device=device)
-            self._workspaces[key] = workspace
         args = (
             *inputs,
             out,
-            workspace,
+            None,
             capacity,
             self.ratio,
             self.mode,

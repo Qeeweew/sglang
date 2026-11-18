@@ -39,7 +39,7 @@ void end_prepare_batch();
 // Flags describe dataflow/encoding and bind-stable geometry. Compile only the
 // configurations actually used; live lengths and routing stay dynamic.
 // Persistent entries bind a queried maximum worker plan. Launch occupancy is
-// runtime-only; it does not change code generation or workspace capacity.
+// runtime-only; it does not change code generation.
 class Kernel {
     friend class PreparationBatch;
     struct DeviceSlot {

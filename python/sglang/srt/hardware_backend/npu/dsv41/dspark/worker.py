@@ -37,13 +37,8 @@ def _schedule(device, stream, rows, gamma, maximum):
     from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import DSparkSchedule
 
     operator = DSparkSchedule(device=device)
-    survival = torch.empty(
-        operator.workspace_shape(rows, gamma, maximum),
-        device=device,
-        dtype=torch.float32,
-    )
     output = torch.empty(rows, device=device, dtype=torch.int32)
-    return operator, survival, output
+    return operator, output
 
 
 def _target_state_commit(backend, lengths, *, folded=False):
@@ -157,7 +152,7 @@ def adapt_schedule(original_schedule):
             return original_schedule(cls, confidence=confidence, budget=budget, cfg=cfg)
         rows, gamma = confidence.shape
         maximum = cfg.resolved_max_verify_len()
-        op, survival, output = _schedule(
+        op, output = _schedule(
             str(confidence.device),
             int(torch.npu.current_stream(confidence.device).npu_stream),
             rows,
@@ -170,7 +165,6 @@ def adapt_schedule(original_schedule):
             min_verify_len=cfg.min_verify_len,
             max_verify_len=maximum,
             survival_eps=cfg.survival_eps,
-            survival=survival,
             out=output,
         )
 

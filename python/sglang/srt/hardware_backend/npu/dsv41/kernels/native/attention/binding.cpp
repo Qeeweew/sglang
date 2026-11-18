@@ -1,6 +1,7 @@
 #include "torch.h"
 #include "launch.h"
 #include "jit.h"
+#include "workspace.h"
 #include <cmath>
 
 namespace native_host {
@@ -86,7 +87,7 @@ void run(const at::Tensor &q, const at::Tensor &kv, const std::optional<at::Tens
          const std::optional<at::Tensor> &compressed_table, const at::Tensor &cu,
          const at::Tensor &lengths, const std::optional<at::Tensor> &compressed_lengths,
          const std::optional<at::Tensor> &residual, const std::optional<at::Tensor> &window,
-         const at::Tensor &sinks, const at::Tensor &out, const at::Tensor &scratch,
+         const at::Tensor &sinks, const at::Tensor &out, const std::optional<at::Tensor> &workspace,
          int64_t capacity, int64_t ratio, int64_t mode, bool ring, int64_t window_rows,
          int64_t cores) {
     const auto device = q.device();
@@ -124,16 +125,21 @@ void run(const at::Tensor &q, const at::Tensor &kv, const std::optional<at::Tens
             c.coordinate_shift > 0 && compressed->size(0) <= INT32_MAX / c.compressed_page_rows;
         c.coordinate_elements32 = compressed->numel() <= INT32_MAX;
     }
-    check(scratch, at::kByte, device);
-    TORCH_CHECK_VALUE(scratch.numel() >= attention::workspace_bytes(c),
-                      "attention workspace too small");
-    disjoint({out, scratch}, {q, kv, compressed, indices, table, compressed_table, cu, lengths,
+    const auto bytes = attention::workspace_bytes(c);
+    if (workspace) {
+        check(*workspace, at::kByte, device);
+        TORCH_CHECK_VALUE(workspace->numel() >= bytes, "attention workspace too small");
+    }
+    disjoint({out, workspace}, {q, kv, compressed, indices, table, compressed_table, cu, lengths,
                               compressed_lengths, residual, window, sinks});
     if (!c.tokens)
         return;
     auto stream = c10_npu::getCurrentNPUStream(device.index());
-    for (const auto &t : {q, kv, table, cu, lengths, sinks, out, scratch})
+    const auto acl_stream = stream.stream();
+    const LaunchWorkspace scratch(workspace, bytes, acl_stream);
+    for (const auto &t : {q, kv, table, cu, lengths, sinks, out})
         record(t, stream);
+    track(workspace, stream);
     for (const auto &t :
          {compressed, indices, compressed_table, compressed_lengths, residual, window})
         track(t, stream);
@@ -142,9 +148,9 @@ void run(const at::Tensor &q, const at::Tensor &kv, const std::optional<at::Tens
                             uintptr_t(ptr(compressed_table)), uintptr_t(ptr(cu)),
                             uintptr_t(ptr(lengths)), uintptr_t(ptr(compressed_lengths)),
                             uintptr_t(ptr(residual)), uintptr_t(ptr(window)), uintptr_t(ptr(sinks)),
-                            uintptr_t(ptr(out)), uintptr_t(ptr(scratch))},
+                            uintptr_t(ptr(out)), uintptr_t(scratch.data())},
                            c};
-    dsv41_attention_launch(stream.stream(), a);
+    dsv41_attention_launch(acl_stream, a);
 }
 
 } // namespace
@@ -158,7 +164,7 @@ TORCH_LIBRARY_FRAGMENT(dsv41, m) {
     const auto schema = "(Tensor q, Tensor kv, Tensor? compressed, Tensor? indices, Tensor table, "
                         "Tensor? compressed_table, Tensor cu, Tensor lengths, Tensor? "
                         "compressed_lengths, Tensor? residual, "
-                        "Tensor? window, Tensor sinks, Tensor(a!) out, Tensor(b!) workspace, int "
+                        "Tensor? window, Tensor sinks, Tensor(a!) out, Tensor(b!)? workspace, int "
                         "capacity, int ratio, "
                         "int mode, bool ring, int window_rows=128, int cores=0) -> ()";
     m.def((std::string("attention") + schema).c_str(), &run);
@@ -168,7 +174,7 @@ TORCH_LIBRARY_FRAGMENT(dsv41, m) {
              const std::optional<at::Tensor> &compressed_table, const at::Tensor &cu,
              const at::Tensor &lengths, const std::optional<at::Tensor> &compressed_lengths,
              const std::optional<at::Tensor> &residual, const std::optional<at::Tensor> &window,
-             const at::Tensor &sinks, const at::Tensor &out, const at::Tensor &scratch,
+             const at::Tensor &sinks, const at::Tensor &out, const std::optional<at::Tensor> &scratch,
              int64_t capacity, int64_t ratio, int64_t mode, bool ring, int64_t window_rows,
              int64_t cores) {
               native_jit::PrepareOnlyScope scope;

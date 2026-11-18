@@ -74,8 +74,6 @@ def _geometry(m, b, h, device):
 
 
 class MHC:
-    SLOTS = 2
-
     def __init__(self, *, rms_eps=1e-20):
         self.rms_eps = float(rms_eps)
         if not math.isfinite(self.rms_eps) or self.rms_eps <= 0:
@@ -92,7 +90,6 @@ class MHC:
         self.stats_kernel = self._stats_call
         self.batched_stats_kernel = self._stats_call
         self.stats_post_kernel = self._stats_post_call
-        self._rings = {}
         self._prepared = set()
 
     def _call(self, operation, *args):
@@ -152,7 +149,9 @@ class MHC:
             torch.empty((splits, rows), dtype=torch.float32, device=device),
         )
 
-    def _project_mixed(self, *, Residual, Fn, Projection, SquareSum, Inputs, Products):
+    def _project_mixed(
+        self, *, Residual, Fn, Projection, SquareSum, Inputs=None, Products=None
+    ):
         bm = self.geometry(Residual)[0]
         self._call(
             "mhc_project",
@@ -281,29 +280,6 @@ class MHC:
         require_disjoint((projection, squares, *triplet), (residual, fn, scale, base))
         return workspace
 
-    def _ring(self, residual):
-        bm, _, _, panel, stride, groups, *_ = self.geometry(residual)
-        stream = torch.npu.current_stream(residual.device)
-        key = (residual.device, int(stream.npu_stream), bm, panel, stride, groups)
-        if key not in self._rings:
-            shape = (groups, self.SLOTS, bm)
-            self._rings[key] = (
-                torch.empty(
-                    (*shape, panel), dtype=torch.float32, device=residual.device
-                ),
-                torch.empty(
-                    (*shape, stride), dtype=torch.float32, device=residual.device
-                ),
-            )
-        return self._rings[key]
-
-    def prepare(self, residual):
-        """Allocate this stream's rings; warm actual calls before Graph capture."""
-        _residual(residual)
-        with torch.npu.device(residual.device):
-            if residual.shape[0] > _BLOCK_ELEMENTS:
-                self._ring(residual)
-
     def _project(self, residual, fn, projection, squares):
         if not residual.shape[0]:
             return
@@ -312,14 +288,11 @@ class MHC:
                 Residual=residual, Fn=fn, Projection=projection, SquareSum=squares
             )
         else:
-            inputs, products = self._ring(residual)
             self.project_kernel(
                 Residual=residual,
                 Fn=fn,
                 Projection=projection,
                 SquareSum=squares,
-                Inputs=inputs,
-                Products=products,
             )
 
     def stats(self, residual, fn, scale, base, *, workspace=None):

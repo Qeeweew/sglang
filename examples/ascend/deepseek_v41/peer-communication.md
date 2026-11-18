@@ -9,7 +9,7 @@ SGLANG_OPT_DSV41_NPU_PEER_COMM=1 DSV41_ATTN_DP_SIZE=4 \
   bash examples/ascend/deepseek_v41/serve.sh
 ```
 
-DP8 使用相同开关，设置 `DSV41_ATTN_DP_SIZE=8`（也是 `serve.sh` 的默认值）。native ABI 为 23，旧产物需要重建。
+DP8 使用相同开关，设置 `DSV41_ATTN_DP_SIZE=8`（也是 `serve.sh` 的默认值）。native ABI 为 25，旧产物需要重建。
 
 支持同一主机、每进程一张 910B、BF16 ND 张量、hidden=5120。每个 attention DP 的 padded token 行数：DP4/TP2 为 1–128，DP8/TP1 为 1–64；全局通信容量均为 512 行。适用 target verify 和 draft；不是 HTTP request batch 的 1–128。超出范围的张量保留 HCCL。并发 forward / multi-stream 路径保留 HCCL；共享一个 communicator 的 eager 调用与 Graph replay 必须串行，所有 rank 的 collective 顺序一致。
 

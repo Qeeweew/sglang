@@ -23,7 +23,7 @@ native_jit::Kernel &entry(const w8a16::Arguments &a) {
 }
 } // namespace
 void w8a16_launch(void *stream, const w8a16::Arguments &a) {
-    const uint64_t jobs = uint64_t((a.rows + a.bm - 1) / a.bm) * (a.n / a.bn) * a.batches;
+    const uint64_t jobs = w8a16::jobs(a.rows, a.n, a.batches, a.bm, a.bn);
     entry(a).launch_persistent(stream, jobs, a.input, a.weight, a.scales, a.output, a.workspace, a.rows);
 }
 void w8a16_quantize_launch(void *stream, const w8a16::QuantizeSources &sources, int k, int workers) {

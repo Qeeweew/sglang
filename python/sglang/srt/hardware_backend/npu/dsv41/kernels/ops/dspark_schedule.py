@@ -24,7 +24,7 @@ class DSparkSchedule(NativeOperator):
         min_verify_len=1,
         max_verify_len=0,
         survival_eps=1e-6,
-        survival,
+        survival=None,
         out,
     ):
         """Prepare the actual physical layout before capture; retain fixed buffers."""

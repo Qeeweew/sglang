@@ -77,8 +77,6 @@ class Router(NativeOperator):
             raise ValueError(
                 "bucket must retain global weights and local expert geometry"
             )
-        if workspace is None:
-            workspace = self.bucket_workspace(ids, experts)
         require_disjoint(
             (out.ids, out.counts, out.offsets, out.order, out.metadata, workspace),
             (ids, weights),
@@ -103,8 +101,6 @@ class Router(NativeOperator):
     def bind_bucket(self, ids, weights, first, experts, *, out=None, workspace=None):
         if out is None:
             out = self.bucket_output(ids, weights, experts)
-        if workspace is None:
-            workspace = self.bucket_workspace(ids, experts)
         self.bucket(
             ids, weights, first, experts, out=out, workspace=workspace, _prepare=True
         )
@@ -113,7 +109,7 @@ class Router(NativeOperator):
         )
 
     def bind(self, logits, correction_bias=None, *, plan=False, **kwargs):
-        """Prepare stable outputs/workspace before capture; no hot allocation."""
+        """Prepare stable outputs and JIT entries before capture."""
         k = self._topk(logits, kwargs.get("topk"))
         local = kwargs.get("experts")
         if local is None:
@@ -123,9 +119,6 @@ class Router(NativeOperator):
         )
         kwargs.setdefault("weights_out", logits.new_empty((logits.shape[0], k)))
         if plan:
-            kwargs.setdefault(
-                "workspace", self.workspace(logits, topk=k, experts=local)
-            )
             kwargs.setdefault("counts_out", logits.new_empty(local, dtype=torch.int32))
             kwargs.setdefault(
                 "offsets_out", logits.new_empty(local + 1, dtype=torch.int32)
@@ -167,9 +160,9 @@ class Router(NativeOperator):
         local = logits.shape[1] if experts is None else experts
         if first < 0 or local <= 0 or first + local > logits.shape[1]:
             raise ValueError("invalid expert ownership range")
-        if plan and workspace is None:
-            workspace = self.workspace(logits, topk=k, experts=local)
-        topk_ids = workspace.ids if plan else ids_out
+        topk_ids = ids_out
+        if plan:
+            topk_ids = None if workspace is None else workspace.ids
         operation = self._library.prepare_router if _prepare else self._library.router
         ids, weights = operation(
             logits,
@@ -199,7 +192,7 @@ class Router(NativeOperator):
             allocate(metadata_out, (4 * (local + 1),), torch.int32),
         )
         require_disjoint(
-            (*out, workspace.ids, workspace.histogram),
+            (*out, ids, workspace.histogram if workspace is not None else None),
             (
                 logits,
                 correction_bias,
@@ -215,7 +208,7 @@ class Router(NativeOperator):
             first,
             local,
             out=out,
-            workspace=workspace.histogram,
+            workspace=workspace.histogram if workspace is not None else None,
             _prepare=_prepare,
         )
 

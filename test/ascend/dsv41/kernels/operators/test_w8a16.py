@@ -7,6 +7,10 @@ import time
 from pathlib import Path
 
 
+def workspace_elements(workers, bn, bk):
+    return workers * 2 * bn * bk
+
+
 def exhaustive_decode(torch, args):
     """All permitted positive-half scale bit patterns × all 256 INT8 codes.
 
@@ -17,7 +21,6 @@ def exhaustive_decode(torch, args):
     from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.w8a16 import (
         W8A16,
         repack_weight,
-        workspace_elements,
     )
     from dsv41.kernels.references.w8a16 import dequantize
 
@@ -93,6 +96,86 @@ def exhaustive_decode(torch, args):
     print(result, flush=True)
 
 
+def workspace_reuse(torch):
+    from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.w8a16 import (
+        W8A16,
+        repack_weight,
+    )
+    from torch_npu.npu import memory
+
+    from dsv41.kernels.references.w8a16 import reference
+
+    stream = torch.npu.Stream()
+    rows, n, k = 11, 2304, 1024
+    xc = (torch.randn(rows, k) * 0.125).bfloat16()
+    wc = torch.randint(-128, 128, (n, k), dtype=torch.int8)
+    sc = torch.full((k // 256, n), 2**-10, dtype=torch.float16)
+    with torch.npu.stream(stream):
+        x = xc.npu()
+        packed, scales = (value.npu() for value in repack_weight(wc, sc))
+        out = torch.empty((rows, n), device=x.device, dtype=x.dtype)
+        sort_input = torch.randn((64, 4096), device=x.device)
+        sort_out = (
+            torch.empty_like(sort_input),
+            torch.empty_like(sort_input, dtype=torch.long),
+        )
+        op = W8A16()
+        call = op.bind(x, packed, scales, out=out)
+        call()
+        torch.sort(sort_input, out=sort_out)
+    stream.synchronize()
+    bm, bn, bk = call.plan
+    cores = torch.npu.get_device_properties(0).cube_core_num
+    workers = min(cores, (rows + bm - 1) // bm * (n // bn))
+    expected_bytes = workspace_elements(workers, bn, bk) * x.element_size()
+
+    def allocations():
+        return [
+            (event["addr"], event["size"])
+            for trace in memory._snapshot()["device_traces"]
+            for event in trace
+            if event["action"] == "alloc"
+        ]
+
+    memory._record_memory_history("all", context=None, max_entries=1024)
+    try:
+        with torch.npu.stream(stream):
+            start = len(allocations())
+            op.bind(x, packed, scales, out=out)
+            assert len(allocations()) == start
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, stream=stream, auto_dispatch_capture=True):
+            call()
+            torch.sort(sort_input, out=sort_out)
+        scratch = [(addr, size) for addr, size in allocations()[start:] if size > 1024]
+        assert len(scratch) == 2, scratch
+        assert scratch[0][1] == expected_bytes, scratch
+        assert scratch[0][0] == scratch[1][0], scratch
+        with torch.npu.stream(stream):
+            xc.neg_()
+            x.copy_(xc)
+            sort_input.uniform_()
+            start = len(allocations())
+            graph.replay()
+        stream.synchronize()
+        assert len(allocations()) == start
+        torch.testing.assert_close(
+            out.cpu().float(), reference(xc, wc, sc).float(), rtol=0.008, atol=0.002
+        )
+        torch.testing.assert_close(
+            sort_out[0].cpu(), torch.sort(sort_input.cpu()).values
+        )
+    finally:
+        memory._record_memory_history(None)
+    return dict(
+        case="workspace_reuse",
+        status="passed",
+        active_workers=workers,
+        w8a16_bytes=expected_bytes,
+        sort_bytes=scratch[1][1],
+    )
+
+
 def run(args):
     if (
         os.environ.get("ASCEND_RT_VISIBLE_DEVICES") != str(args.physical)
@@ -105,7 +188,6 @@ def run(args):
     from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.w8a16 import (
         W8A16,
         repack_weight,
-        workspace_elements,
     )
     from dsv41.kernels.references.w8a16 import reference
 
@@ -151,8 +233,10 @@ def run(args):
         (4097, 1, 256, 512, 256, 256, 64),
         (2049, 1, 1280, 768, 256, 256, 64),
         (273, 2, 256, 512, 256, 256, 64),
+        (11, 1, 2304, 1024, None, None, None),
+        (79, 3, 1536, 768, None, None, None),
     ]
-    records = []
+    records = [workspace_reuse(torch)]
     stream = torch.npu.Stream()
     for dtype in (torch.bfloat16, torch.float16):
         for m, b, n, k, bk, bm, bn in cases:
@@ -167,9 +251,19 @@ def run(args):
             pc, spc = repack_weight(wc, sc)
             x, p, s = xc.npu(), pc.npu(), spc.npu()
             workers = torch.npu.get_device_properties(0).cube_core_num
+            if bn is None:
+                allocated = W8A16().bind(x, p, s)
+                assert allocated.output.shape == (*x.shape[:-1], n)
+                expected_plan = (16, 128, 512) if m == 11 else (128, 256, 256)
+                if workers == 20:
+                    assert allocated.plan == expected_plan
+                capacity = workspace_elements(workers, *allocated.plan[1:])
+                assert allocated.workspace is None
+            else:
+                capacity = workspace_elements(workers, bn, bk)
             out_storage = torch.full((m * b * n + 32,), -77, device="npu", dtype=dtype)
             workspace_storage = torch.full(
-                (workspace_elements(workers, bn, bk) + 32,),
+                (capacity + 32,),
                 -79,
                 device="npu",
                 dtype=dtype,
@@ -188,6 +282,8 @@ def run(args):
                 block_k=bk,
             )
             prepare_seconds = time.monotonic() - started
+            assert call.output.data_ptr() == out.data_ptr()
+            assert call.workspace.data_ptr() == workspace.data_ptr()
             pointers = [t.data_ptr() for t in (x, p, s, out, workspace)]
             torch.npu.synchronize()
             with torch.npu.stream(stream):

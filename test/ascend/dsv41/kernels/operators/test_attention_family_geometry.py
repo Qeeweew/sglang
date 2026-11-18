@@ -489,11 +489,7 @@ def attention_cases(records):
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph, stream=stream):
             invoke()
-        pointers = [
-            x.data_ptr()
-            for x in (*device, output, *op.kernel._workspaces.values())
-            if x is not None
-        ]
+        pointers = [x.data_ptr() for x in (*device, output) if x is not None]
         for generation in range(3):
             cpu = inputs(generation)
             expected = reference(cpu, mode, window_rows, ratio)
@@ -508,9 +504,7 @@ def attention_cases(records):
             torch.testing.assert_close(output.cpu(), expected, atol=0.005, rtol=0.02)
             assert bool((guard[0] == 17).all()) and bool((guard[-1] == 17).all())
             assert pointers == [
-                x.data_ptr()
-                for x in (*device, output, *op.kernel._workspaces.values())
-                if x is not None
+                x.data_ptr() for x in (*device, output) if x is not None
             ]
             records.append(
                 dict(

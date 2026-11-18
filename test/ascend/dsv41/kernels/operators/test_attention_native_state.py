@@ -138,7 +138,6 @@ def run_case(heads, mode, columns, counts, selected, cases, cores, alternate, re
     with torch.npu.graph(graph, stream=stream):
         invoke()
     addresses = [value.data_ptr() for value in (*device, output)]
-    workspaces = {value.data_ptr() for value in op.kernel._workspaces.values()}
     for generation, case in enumerate(cases):
         changed_counts = list(reversed(counts)) if generation % 2 else counts
         cpu = fixture(
@@ -164,9 +163,6 @@ def run_case(heads, mode, columns, counts, selected, cases, cores, alternate, re
         assert bool(torch.isfinite(output).all())
         assert bool((storage[0] == 13).all()) and bool((storage[-1] == 13).all())
         assert addresses == [value.data_ptr() for value in (*device, output)]
-        assert workspaces == {
-            value.data_ptr() for value in op.kernel._workspaces.values()
-        }
         records.append(
             dict(
                 heads=heads,
@@ -237,9 +233,7 @@ def direct_interleaving(records):
                 for _ in range(10):
                     poison_invoke()
                     invoke()
-            pointers = [
-                x.data_ptr() for x in (*device, guard, *op.kernel._workspaces.values())
-            ]
+            pointers = [x.data_ptr() for x in (*device, guard)]
             for generation in range(4):
                 current = [x.clone() for x in cpu]
                 current[0] = (current[0].float() + generation * 0.125).bfloat16()
@@ -270,10 +264,7 @@ def direct_interleaving(records):
                     out.cpu(), torch.stack(expected), atol=0.005, rtol=0.02
                 )
                 assert bool((guard[0] == 19).all()) and bool((guard[-1] == 19).all())
-                assert pointers == [
-                    x.data_ptr()
-                    for x in (*device, guard, *op.kernel._workspaces.values())
-                ]
+                assert pointers == [x.data_ptr() for x in (*device, guard)]
                 records.append(
                     dict(
                         kind="direct_interleaved_onchip_state",

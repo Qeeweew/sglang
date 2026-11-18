@@ -151,7 +151,7 @@ def run(args):
     hints = dict(max_expert_rows=1, mean_expert_rows=0)
     first = op.bind(xx, p, s, routing, out=yy, **hints)
     again = op.bind(xx, p, s, routing, out=yy, **hints)
-    assert first.workspace.data_ptr() == again.workspace.data_ptr()
+    assert first.workspace is again.workspace is None
     # A cumulative GroupList is no longer a native routing input.
     for invoke in (
         lambda: op.bind(xx, p, s, gl, out=yy, **hints),
@@ -174,7 +174,7 @@ def run(args):
     other_stream = torch.npu.Stream()
     with torch.npu.stream(other_stream):
         other = op.bind(xx, p, s, routing, out=yy, **hints)
-    assert other.workspace.data_ptr() != first.workspace.data_ptr()
+    assert other.workspace is None
     try:
         op.bind(xx, p, s, routing, out=probe[:n].view(1, n), **hints)
     except ValueError:

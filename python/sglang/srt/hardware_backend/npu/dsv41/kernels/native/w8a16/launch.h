@@ -14,6 +14,9 @@ struct Arguments {
     int k, n, batches, bm, bn, bk, workers;
     bool bf16;
 };
+inline int64_t jobs(int64_t rows, int64_t n, int64_t batches, int64_t bm, int64_t bn) {
+    return ((rows + bm - 1) / bm) * (n / bn) * batches;
+}
 // Host and device share byte formulas. No allocator or synchronization here.
 struct Storage {
     int local_elements, chunk_elements, scale_elements, scale_offset, decoded_offset, cast_offset, ub_bytes;

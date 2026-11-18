@@ -1,6 +1,7 @@
 #include "torch.h"
 #include "launch.h"
 #include "jit.h"
+#include "workspace.h"
 
 namespace native_host {
 namespace {
@@ -21,26 +22,28 @@ at::Tensor schedule(const at::Tensor &confidence, int64_t budget, int64_t minimu
     TORCH_CHECK_VALUE(!(eps < 0), "survival_eps must be nonnegative");
     const auto columns = std::min(maximum, gamma),
                stride = (rows + kRequestGroup - 1) / kRequestGroup * kRequestGroup;
-    auto scratch = workspace.value_or(at::Tensor());
     auto out = output.value_or(at::Tensor());
     c10_npu::NPUGuard guard(device);
-    if (!scratch.defined())
-        scratch = at::empty({columns, stride}, confidence.options());
     if (!out.defined())
         out = at::empty({rows}, confidence.options().dtype(at::kInt));
-    check(scratch, at::kFloat, device, {columns, stride});
+    if (workspace)
+        check(*workspace, at::kFloat, device, {columns, stride});
     check(out, at::kInt, device, {rows});
-    disjoint({scratch, out}, {confidence});
+    disjoint({workspace, out}, {confidence});
     if (!rows)
         return out;
     auto stream = c10_npu::getCurrentNPUStream(confidence.get_device());
-    for (const auto &t : {confidence, scratch, out})
+    const auto acl_stream = stream.stream();
+    const LaunchWorkspace scratch(workspace, budget > 0 ? columns * stride * sizeof(float) : 0,
+                                  acl_stream);
+    for (const auto &t : {confidence, out})
         record(t, stream);
+    track(workspace, stream);
     const auto blocks = core_count(confidence.get_device());
     if (budget > 0)
-        dsv41_dspark_schedule_prepare_launch(stream.stream(), u32(blocks), ptr(confidence),
-                                             ptr(scratch), rows, gamma, columns, stride, f32(eps));
-    dsv41_dspark_schedule_finish_launch(stream.stream(), u32(blocks), ptr(scratch), ptr(out), rows,
+        dsv41_dspark_schedule_prepare_launch(acl_stream, u32(blocks), ptr(confidence),
+                                             scratch.data(), rows, gamma, columns, stride, f32(eps));
+    dsv41_dspark_schedule_finish_launch(acl_stream, u32(blocks), scratch.data(), ptr(out), rows,
                                         columns, stride, budget, minimum, maximum);
     return out;
 }
@@ -48,9 +51,9 @@ at::Tensor schedule(const at::Tensor &confidence, int64_t budget, int64_t minimu
 TORCH_LIBRARY_FRAGMENT(dsv41, m) {
     m.def("prepare_dspark_schedule(Tensor confidence, int budget, int minimum, int maximum, float "
           "eps, "
-          "Tensor survival, Tensor out) -> ()",
+          "Tensor? survival, Tensor out) -> ()",
           [](const at::Tensor &confidence, int64_t budget, int64_t minimum, int64_t maximum,
-             double eps, const at::Tensor &survival, const at::Tensor &out) {
+             double eps, const std::optional<at::Tensor> &survival, const at::Tensor &out) {
               native_jit::PrepareOnlyScope prepare;
               schedule(confidence, budget, minimum, maximum, eps, survival, out);
           });

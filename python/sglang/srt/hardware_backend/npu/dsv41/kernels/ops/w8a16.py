@@ -2,12 +2,6 @@
 
 from dataclasses import dataclass
 
-BRIDGE_SLOTS = 2
-
-
-def workspace_elements(workers, bn, bk):
-    return workers * BRIDGE_SLOTS * bn * bk
-
 
 def quantize_bf16_weight(weight, out, scales):
     from ..runtime.native import load_library
@@ -78,51 +72,13 @@ class W8A16:
         workspace=None,
         block_m=None,
         block_n=None,
-        block_k=256,
+        block_k=None,
     ):
-        import torch
-        from sglang.srt.hardware_backend.npu.dsv41.kernels.runtime.native import (
-            load_library,
-        )
+        from ..runtime.native import load_library
 
-        if torch.npu.is_current_stream_capturing():
-            raise RuntimeError("bind W8A16 and warm up before Graph capture")
-        if activation.ndim not in (2, 3):
-            raise ValueError("activation must be [M,K] or [M,B,K]")
-        m = activation.shape[0]
-        batches = activation.shape[1] if activation.ndim == 3 else 1
-        if weight.ndim != 3 or weight.shape[0] % batches:
-            raise ValueError("weight must be repacked [B*N/16,K,16]")
-        n = weight.shape[0] // batches * 16
-        if block_m is None:
-            block_m = 16 if m <= 16 else 64 if m <= 64 else 256
-        workers = torch.npu.get_device_properties(activation.device).cube_core_num
-        if block_n is None:
-            # Prefer the larger panel that still fills a first wave. BM256
-            # needs BN128 to fit L0C; BK512 needs BN128 to fit double L1.
-            columns = (256, 128, 64) if block_m <= 128 and block_k <= 256 else (128, 64)
-            row_tiles = max(1, (m + block_m - 1) // block_m)
-            block_n = next(
-                (
-                    bn
-                    for bn in columns
-                    if n % bn == 0 and row_tiles * batches * (n // bn) >= workers
-                ),
-                64,
-            )
-        plan = (block_m, block_n, block_k)
-        if out is None:
-            out = torch.empty(
-                (m, batches, n) if activation.ndim == 3 else (m, n),
-                device=activation.device,
-                dtype=activation.dtype,
-            )
-        if workspace is None:
-            workspace = torch.empty(
-                workspace_elements(workers, block_n, block_k),
-                device=activation.device,
-                dtype=activation.dtype,
-            )
         native = load_library()
-        native.prepare_w8a16(activation, weight, scales, out, workspace, *plan)
+        out, bm, bn, bk = native.prepare_w8a16(
+            activation, weight, scales, out, workspace, block_m, block_n, block_k
+        )
+        plan = (bm, bn, bk)
         return PreparedW8A16(activation, weight, scales, out, workspace, plan, native)

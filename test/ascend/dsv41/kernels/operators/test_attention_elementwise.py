@@ -442,7 +442,6 @@ def dynamic_attention(records):
                 else SparseAttention(ratio=int(mode[1]), window_reuse=reuse)
             )
             artifact = native_library_path()
-            arena_address = None
             for batch, tokens, counts in shapes:
                 if reuse and batch != 1:
                     continue
@@ -475,14 +474,10 @@ def dynamic_attention(records):
                 assert bool((guard[:256] == 123).all().cpu()), label
                 assert bool((guard[-256:] == 123).all().cpu()), label
                 assert native_library_path() == artifact
-                workspace = next(iter(op.kernel._workspaces.values()))
-                if arena_address is None:
-                    arena_address = workspace.data_ptr()
-                assert workspace.data_ptr() == arena_address, label
                 print(
                     "PASS",
                     label,
-                    "eager, changed Graph, canaries, shared binary/arena",
+                    "eager, changed Graph, canaries, shared binary",
                     flush=True,
                 )
                 del graph

@@ -3,6 +3,7 @@
 #include <common/grouped_metadata.h>
 #include "launch.h"
 #include "jit.h"
+#include "workspace.h"
 
 extern "C" int rtGetL2CacheOffset(uint32_t device, uint64_t *offset);
 
@@ -108,7 +109,8 @@ uint64_t output_alias(int device) {
     return found->second;
 }
 void run(const at::Tensor &x, const at::Tensor &packed, const at::Tensor &scales,
-         const at::Tensor &routing, const at::Tensor &out, const at::Tensor &workspace, int64_t bm) {
+         const at::Tensor &routing, const at::Tensor &out,
+         const std::optional<at::Tensor> &workspace, int64_t bm) {
     TORCH_CHECK_VALUE(x.dim() == 2 && out.dim() == 2 && packed.dim() == 2 && packed.size(0) > 0 &&
                           packed.size(0) <= INT32_MAX,
                       "matrix inputs and positive expert count required");
@@ -125,16 +127,21 @@ void run(const at::Tensor &x, const at::Tensor &packed, const at::Tensor &scales
                       "compact metadata capacity must cover all experts");
     c10_npu::NPUGuard guard(device);
     const auto cores = gemm_cores(device.index());
-    check(workspace, at::kHalf, device);
     const int64_t count = cores * Storage::kSlots * g[STEP_K] * g[BN];
-    TORCH_CHECK_VALUE(workspace.numel() >= count, "workspace needs ", count, " FP16 elements");
+    if (workspace) {
+        check(*workspace, at::kHalf, device);
+        TORCH_CHECK_VALUE(workspace->numel() >= count, "workspace needs ", count, " FP16 elements");
+    }
     disjoint({out, workspace}, {x, packed, scales, routing});
     auto stream = c10_npu::getCurrentNPUStream(device.index());
-    for (const auto &t : {x, packed, scales, routing, out, workspace})
+    const auto acl_stream = stream.stream();
+    const LaunchWorkspace scratch(workspace, count * sizeof(at::Half), acl_stream);
+    for (const auto &t : {x, packed, scales, routing, out})
         record(t, stream);
+    track(workspace, stream);
     const auto alias = g[BM] >= Storage::kPrefillTileRows ? output_alias(device.index()) : 0;
     Arguments args{};
-    args.stream = stream.stream();
+    args.stream = acl_stream;
     args.cores = cores;
     args.experts = experts;
     args.activation = ptr(x);
@@ -142,7 +149,7 @@ void run(const at::Tensor &x, const at::Tensor &packed, const at::Tensor &scales
     args.scales = ptr(scales);
     args.routing = ptr(routing);
     args.output = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(out.data_ptr()) + alias);
-    args.workspace = ptr(workspace);
+    args.workspace = scratch.data();
     args.config = {int(g[K]), int(g[N])};
     args.tile_rows = int(g[BM]);
     args.tile_columns = int(g[BN]);
@@ -155,15 +162,16 @@ TORCH_LIBRARY_FRAGMENT(dsv41, m) {
           &select_config);
     m.def("quant_gmm_cores(int device) -> int", &gemm_cores);
     m.def("prepare_quant_gmm(Tensor x, Tensor packed, Tensor scales, Tensor routing, "
-          "Tensor(a!) out, Tensor(b!) workspace, int bm) -> ()",
+          "Tensor(a!) out, Tensor(b!)? workspace, int bm) -> ()",
           [](const at::Tensor &x, const at::Tensor &packed, const at::Tensor &scales,
-             const at::Tensor &routing, const at::Tensor &out, const at::Tensor &workspace,
+             const at::Tensor &routing, const at::Tensor &out,
+             const std::optional<at::Tensor> &workspace,
              int64_t bm) {
               native_jit::PrepareOnlyScope prepare;
               run(x, packed, scales, routing, out, workspace, bm);
           });
     m.def("quant_gmm(Tensor x, Tensor packed, Tensor scales, Tensor routing, "
-          "Tensor(a!) out, Tensor(b!) workspace, int bm) -> ()",
+          "Tensor(a!) out, Tensor(b!)? workspace, int bm) -> ()",
           &run);
 }
 } // namespace native_host

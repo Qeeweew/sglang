@@ -86,6 +86,29 @@ weights are converted to INT8 at load time, then repacked with raw FP16
 scales into N16 layout. Forward consumes and returns BF16 without quantizing
 activations. Expert weights stay MXFP4 on device.
 
+W8A16 uses two Vector lanes per Cube. Each lane loads INT8 and FP16 scales,
+then writes the decoded panel to a double-buffered GM workspace. Cube imports
+it into L1 before reusing the slot. Every row tile decodes the weight again;
+the workspace round trip alone moves four logical bytes per weight element
+per row tile. These bytes need not reach HBM if the workspace hits in L2.
+For a single row tile, automatic planning compares the weight work and
+number of K panels on the busiest Cube, rather than requiring a full first
+wave. Explicit plans and multi-row-tile prefill keep the previous selection.
+Native prepare selects and validates the tile, allocates missing output, and
+prepares the JIT entry before Graph capture. Launch uses the returned tile and
+requests scratch for the active Cube workers, retaining both slots per worker.
+
+W8A16, grouped GEMM, attention, QLI, mHC projection, router bucketing and
+DSpark schedule allocate private scratch in the C++ launch on the current
+stream. Prepare does not reserve these buffers. `raw_alloc_with_stream` uses
+the same Torch-NPU caching allocator as tensor allocations without constructing
+a temporary tensor. Sequential operators can reuse its storage; during capture
+the graph pool owns the recorded addresses. Replay does not allocate scratch.
+Explicit buffers, where supported, are caller-owned and must survive captured use.
+Do not overlap replays that alias a shared graph pool. Outputs and state that
+cross operator boundaries (including routing metadata, peer communication and
+KV) retain their existing ownership and ordering contracts.
+
 Attention and C1/C2 KV use BF16. Indexer keys use INT8 with FP16 scales.
 Engram tables retain FP8/E8M0 storage on the host. The resident MoE route
 uses Vector TopK followed by one local bucket kernel with INT32 metadata.
@@ -100,7 +123,7 @@ snapshots under immutable version directories. Keep the whole publication,
 not just the shared library. `DSV41_NATIVE_DIR` chooses a publication;
 `DSV41_JIT_CACHE_DIR` chooses a cache shared by the ranks on the node.
 
-Native ABI 23 requires rebuilding the host publication. CMake builds the host
+Native ABI 25 requires rebuilding the host publication. CMake builds the host
 extension. The router produces grouped GEMM metadata on the device.
 AICore kernels compile through DeepJIT for the model geometries actually bound.
 Prepare and warm them before Graph capture; hot calls and replay do not compile.
@@ -117,8 +140,8 @@ reduce tile winners on the same device before exchanging the usual single
 `(score, bitcast token ID)` per row. The final rank merge emits INT64 tokens.
 There is no TP-specific path. Sampled steps, saved logits and unsupported
 types use the original Torch local selection; strided gathered packets use
-the original Torch merge. Older ABI 23 publications fall back for each missing
-operator. Use the ordinary eager draft warmup or explicitly prepare with
+the original Torch merge. Compatible publications fall back for each missing
+optional operator. Use the ordinary eager draft warmup or explicitly prepare with
 `torch.ops.dsv41.precompile_dspark_markov()` on the initialized current NPU
 before standalone Graph capture.
 

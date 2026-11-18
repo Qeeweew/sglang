@@ -2,6 +2,7 @@
 #include "launch.h"
 #include "jit.h"
 #include "layout.h"
+#include "workspace.h"
 
 namespace native_host {
 namespace {
@@ -29,8 +30,8 @@ int64_t key_splits(int64_t rows, int64_t cores, int64_t heads, int64_t key_capac
                       "invalid QLI scheduling extent");
     return plan_key_splits(rows, cores, heads, key_capacity);
 }
-at::Tensor workspace(int64_t device, int64_t requested, int64_t heads, int64_t rows, int64_t topk,
-                     int64_t mode, int64_t key_capacity) {
+int64_t workspace_size(int64_t device, int64_t requested, int64_t heads, int64_t rows, int64_t topk,
+                       int64_t mode, int64_t key_capacity) {
     c10_npu::NPUGuard guard(at::Device(c10::DeviceType::PrivateUse1, device));
     TORCH_CHECK_VALUE(heads > 0 && heads <= kHeadCapacity && heads % kCubeRows == 0,
                       "QLI heads exceed pipeline capacity or Cube alignment");
@@ -43,15 +44,14 @@ at::Tensor workspace(int64_t device, int64_t requested, int64_t heads, int64_t r
     c.candidate_mode = u32(mode);
     c.query_tile_rows = u32(query_tile_rows(rows, cores, heads));
     c.key_splits = u32(key_splits(rows, cores, heads, key_capacity));
-    return at::empty(
-        {int64_t(workspace_bytes(c))},
-        at::TensorOptions().device(c10::DeviceType::PrivateUse1, device).dtype(at::kByte));
+    return workspace_bytes(c);
 }
 void run_qli(const at::Tensor &q, const at::Tensor &k, const at::Tensor &w, const at::Tensor &qs,
              const at::Tensor &ks, const at::Tensor &cu, const at::Tensor &lengths,
              const at::Tensor &residual, const at::Tensor &pages,
              const std::optional<at::Tensor> &candidates, const at::Tensor &indices,
-             const std::optional<at::Tensor> &candidate_out, const at::Tensor &scratch,
+             const std::optional<at::Tensor> &candidate_out,
+             const std::optional<at::Tensor> &workspace,
              int64_t ratio, int64_t mode, int64_t max_q, int64_t max_k, int64_t max_page,
              int64_t requested) {
     const auto device = q.device();
@@ -98,7 +98,6 @@ void run_qli(const at::Tensor &q, const at::Tensor &k, const at::Tensor &w, cons
         check(*candidates, at::kInt, device, {rows, kKeyTileCapacity});
     if (candidate_out)
         check(*candidate_out, at::kInt, device, {rows, kKeyTileCapacity});
-    check(scratch, at::kByte, device);
     c10_npu::NPUGuard guard(device);
     const auto cores = qli_cores(q.get_device(), requested);
     Config tiling{};
@@ -116,26 +115,33 @@ void run_qli(const at::Tensor &q, const at::Tensor &k, const at::Tensor &w, cons
     tiling.cores = u32(cores);
     tiling.query_tile_rows = u32(query_tile_rows(rows, cores, heads));
     tiling.key_splits = u32(key_splits(rows, cores, heads, pages.size(1) * k.size(1)));
-    TORCH_CHECK_VALUE(scratch.numel() >= int64_t(workspace_bytes(tiling)),
-                      "QLI workspace too small");
-    disjoint({indices, candidate_out},
-             {q, k, w, qs, ks, cu, lengths, residual, pages, candidates, scratch});
+    const auto bytes = int64_t(workspace_bytes(tiling));
+    if (workspace) {
+        check(*workspace, at::kByte, device);
+        TORCH_CHECK_VALUE(workspace->numel() >= bytes, "QLI workspace too small");
+    }
+    disjoint({indices, candidate_out, workspace},
+             {q, k, w, qs, ks, cu, lengths, residual, pages, candidates});
     if (!rows)
         return;
     auto stream = c10_npu::getCurrentNPUStream(q.get_device());
-    for (const auto &t : {q, k, w, qs, ks, cu, lengths, residual, pages, indices, scratch})
+    const auto acl_stream = stream.stream();
+    const LaunchWorkspace scratch(workspace, bytes, acl_stream);
+    for (const auto &t : {q, k, w, qs, ks, cu, lengths, residual, pages, indices})
         record(t, stream);
+    track(workspace, stream);
     track(candidates, stream);
     track(candidate_out, stream);
-    dsv41_qli_launch(stream.stream(), u32(cores), &tiling, ptr(q), ptr(k), ptr(w), ptr(qs), ptr(ks),
+    dsv41_qli_launch(acl_stream, u32(cores), &tiling, ptr(q), ptr(k), ptr(w), ptr(qs), ptr(ks),
                      ptr(cu), ptr(lengths), ptr(residual), ptr(pages), ptr(candidates),
-                     ptr(indices), ptr(candidate_out), ptr(scratch));
+                     ptr(indices), ptr(candidate_out), scratch.data());
 }
 void prepare_run_qli(const at::Tensor &q, const at::Tensor &k, const at::Tensor &w,
                      const at::Tensor &qs, const at::Tensor &ks, const at::Tensor &cu,
                      const at::Tensor &lengths, const at::Tensor &residual, const at::Tensor &pages,
                      const std::optional<at::Tensor> &candidates, const at::Tensor &indices,
-                     const std::optional<at::Tensor> &candidate_out, const at::Tensor &scratch,
+                     const std::optional<at::Tensor> &candidate_out,
+                     const std::optional<at::Tensor> &scratch,
                      int64_t ratio, int64_t mode, int64_t max_q, int64_t max_k, int64_t max_page,
                      int64_t requested) {
     native_jit::PrepareOnlyScope scope;
@@ -147,20 +153,20 @@ TORCH_LIBRARY_FRAGMENT(dsv41, m) {
     m.def("qli_geometry(int heads, int depth) -> ()", &validate_geometry);
     m.def("qli_query_tile_rows(int rows, int cores, int heads=32) -> int", &query_tile_rows);
     m.def("qli_key_splits(int rows, int cores, int heads, int key_capacity) -> int", &key_splits);
-    m.def("qli_workspace(int device, int cores, int heads=32, int rows=0, int topk=512, int "
-          "mode=3, int key_capacity=0) -> Tensor",
-          &workspace);
+    m.def("qli_workspace_bytes(int device, int cores, int heads=32, int rows=0, int topk=512, int "
+          "mode=3, int key_capacity=0) -> int",
+          &workspace_size);
     m.def("qli(Tensor q, Tensor k, Tensor w, Tensor qs, Tensor ks, Tensor cu, Tensor lengths, "
           "Tensor residual, Tensor pages, Tensor? candidates, Tensor(a!) indices, Tensor(b!)? "
           "candidate_out, "
-          "Tensor(c!) workspace, int ratio, int mode, int max_q, int max_k, int max_page, int "
+          "Tensor(c!)? workspace, int ratio, int mode, int max_q, int max_k, int max_page, int "
           "cores) -> ()",
           &run_qli);
     m.def("prepare_run_qli(Tensor q, Tensor k, Tensor w, Tensor qs, Tensor ks, Tensor cu, Tensor "
           "lengths, "
           "Tensor residual, Tensor pages, Tensor? candidates, Tensor(a!) indices, Tensor(b!)? "
           "candidate_out, "
-          "Tensor(c!) workspace, int ratio, int mode, int max_q, int max_k, int max_page, int "
+          "Tensor(c!)? workspace, int ratio, int mode, int max_q, int max_k, int max_page, int "
           "cores) -> ()",
           &prepare_run_qli);
 }

@@ -434,9 +434,6 @@ def run(args):
 
     # Real prefill sizes: full-output finiteness and an independent sample
     # spanning every group, repeated row tile and the end of the request.
-    ring_addresses = {
-        key: tuple(v.data_ptr() for v in buffers) for key, buffers in op._rings.items()
-    }
     for lm in (8192, 32768):
         print(f"mHC large prefill M={lm}", flush=True)
         r = torch.randn((lm, 4, 5120), generator=generator).bfloat16()
@@ -466,10 +463,6 @@ def run(args):
             atol=1e-5,
         )
         count += 1
-        assert ring_addresses == {
-            key: tuple(v.data_ptr() for v in buffers)
-            for key, buffers in op._rings.items()
-        }
         del nr_large, nf_large, ns_large, nb_large, large_workspace, actual, r
 
     if args.model:

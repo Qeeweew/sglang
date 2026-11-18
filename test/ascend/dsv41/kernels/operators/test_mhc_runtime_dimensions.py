@@ -95,21 +95,12 @@ def run():
             op.stats_post(x, r, fn, scale, base, workspace=ws, out=fused_updated)
 
         with torch.npu.stream(stream):
-            op.prepare(r)
             invoke()
         stream.synchronize()
-        rings = {
-            key: tuple(v.data_ptr() for v in values)
-            for key, values in op._rings.items()
-        }
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph, stream=stream):
             for _ in range(20):
                 invoke()
-        assert rings == {
-            key: tuple(v.data_ptr() for v in values)
-            for key, values in op._rings.items()
-        }
         pointers = [
             v.data_ptr()
             for v in (

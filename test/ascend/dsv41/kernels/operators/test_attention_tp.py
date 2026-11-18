@@ -44,10 +44,11 @@ def stream_isolation(records):
             tensors.append(values)
             outputs.append(output)
             references.append(attention_oracle(mode, cpu))
-        assert len({x.data_ptr() for x in op.kernel._workspaces.values()}) == 2
         for _ in range(3):
-            for graph in graphs:
-                graph.replay()
+            for stream, graph, output in zip(streams, graphs, outputs):
+                with torch.npu.stream(stream):
+                    output.fill_(float("nan"))
+                    graph.replay()
         torch.npu.synchronize()
         for output, expected in zip(outputs, references):
             torch.testing.assert_close(output.cpu(), expected, atol=0.005, rtol=0.02)
