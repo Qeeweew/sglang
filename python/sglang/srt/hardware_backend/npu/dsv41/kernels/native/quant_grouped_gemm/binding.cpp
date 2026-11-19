@@ -97,7 +97,7 @@ int64_t gemm_cores(int64_t device) {
                 "native quantized GEMM requires Ascend 910B mixed cores");
     return validated_devices.emplace(device, cores).first->second;
 }
-uint64_t output_alias(int device) {
+uint64_t l2_bypass_alias(int device) {
     thread_local std::unordered_map<int, uint64_t> aliases;
     auto found = aliases.find(device);
     if (found == aliases.end()) {
@@ -139,16 +139,18 @@ void run(const at::Tensor &x, const at::Tensor &packed, const at::Tensor &scales
     for (const auto &t : {x, packed, scales, routing, out})
         record(t, stream);
     track(workspace, stream);
-    const auto alias = g[BM] >= Storage::kPrefillTileRows ? output_alias(device.index()) : 0;
+    const auto alias = l2_bypass_alias(device.index());
+    const auto output_alias = g[BM] >= Storage::kPrefillTileRows ? alias : 0;
     Arguments args{};
     args.stream = acl_stream;
     args.cores = cores;
     args.experts = experts;
     args.activation = ptr(x);
-    args.packed = ptr(packed);
+    args.packed = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(packed.data_ptr()) + alias);
     args.scales = ptr(scales);
     args.routing = ptr(routing);
-    args.output = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(out.data_ptr()) + alias);
+    args.output =
+        reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(out.data_ptr()) + output_alias);
     args.workspace = scratch.data();
     args.config = {int(g[K]), int(g[N])};
     args.tile_rows = int(g[BM]);

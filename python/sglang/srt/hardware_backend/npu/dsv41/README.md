@@ -112,6 +112,10 @@ KV) retain their existing ownership and ordering contracts.
 Attention and C1/C2 KV use BF16. Indexer keys use INT8 with FP16 scales.
 Engram tables retain FP8/E8M0 storage on the host. The resident MoE route
 uses Vector TopK followed by one local bucket kernel with INT32 metadata.
+Grouped GEMM bypasses L2 for packed MXFP4 weight reads in decode and prefill.
+The FP16 handoff between AIV and AIC stays cached. This avoids filling L2
+with streamed weights but can increase HBM reads when weights would otherwise
+be reused from L2 across M tiles or calls.
 
 Large eager prefill batches compact scratch to the local EP routing count.
 Bounded replay uses the model's approximate SWA recovery.
