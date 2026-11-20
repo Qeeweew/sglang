@@ -22,7 +22,12 @@ services:
       sglang:
         condition: service_healthy
     volumes:
-      - ${DSV41_MODEL_DIR:?Set DSV41_MODEL_DIR to the checkpoint directory}:/models/deepseek-v4.1-flash:ro
+      - type: bind
+        source: ${DSV41_MODEL_DIR:?Set DSV41_MODEL_DIR to the MXFP4 or INT4 checkpoint}
+        target: /models/deepseek-v4.1-flash
+        read_only: true
+        bind:
+          create_host_path: false
     command:
       - --host
       - ${DSV41_ROUTER_BIND_HOST:-127.0.0.1}

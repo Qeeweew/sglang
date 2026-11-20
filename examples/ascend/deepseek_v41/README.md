@@ -1,14 +1,14 @@
-# 在 Ascend 910B 上运行原生 MXFP4 的 DeepSeek V4.1 Flash
+# 在 Ascend 910B 上运行 DeepSeek V4.1 Flash
 
-这套适配在单机八张 Ascend 910B 上加载原始 DeepSeek V4.1 Flash checkpoint。路由专家以 **MXFP4 压缩格式**常驻 NPU，由 Ascend C grouped GEMM 在计算时解码当前权重 tile。部署验证使用八张 64 GiB 的 910B3 和 1017 checkpoint。[模型权重](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) · [模型技术报告](https://arxiv.org/html/2609.19969)
+这套适配在单机八张 Ascend 910B 上支持原始 **MXFP4** checkpoint 和 **QuaRot G32 INT4** checkpoint。路由专家以压缩格式常驻 NPU，由 Ascend C grouped GEMM 在计算时解码当前权重 tile。部署验证使用八张 64 GiB 的 910B3 和 1017 checkpoint。[模型权重](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) · [模型技术报告](https://arxiv.org/html/2609.19969)
 
 ## 适配脉络
 
 ### 权重驻留与算子实现
 
-模型骨干有 552B 参数，Engram 另有 196B 参数。EP8 将每层 384 个路由专家均分，每张 NPU 驻留 48 个压缩专家。MoE 路由按专家归组 token，grouped GEMM 解码 MXFP4 权重及 scale 为 FP16 tile，矩阵核计算 gate/up 和 down 投影，以 FP32 累加。模型前向保持压缩权重驻留，临时解码的粒度是 tile。
+模型骨干有 552B 参数，Engram 另有 196B 参数。EP8 将每层 384 个路由专家均分，每张 NPU 驻留 48 个压缩专家。MoE 路由按专家归组 token。原始 checkpoint 的 grouped GEMM 将 MXFP4 权重和 scale 解码为 FP16 tile，再用 FP32 累加。QuaRot checkpoint 的 target 路由专家使用 G32 W4A8，target shared experts 使用 W8A8。[QuaRot G32 格式与导出](quarot-g32.md)
 
-部分 dense 投影和 shared experts 在加载时将原始 FP8 权重转为沿 K 维分组的 INT8，每组 256 个元素。W8A16 GEMM 从显存读取压缩权重并逐 tile 反量化，输入激活和输出用 BF16。Engram 保留 FP8/E8M0 格式，两张大表由主机内存承载，合计约 189 GiB，节点内各 rank 共享。
+部分 dense 投影和原始 checkpoint 的 shared experts 在加载时将 FP8 权重转为沿 K 维分组的 INT8，每组 256 个元素。W8A16 GEMM 从显存读取压缩权重并逐 tile 反量化，输入激活和输出用 BF16。Engram 保留 FP8/E8M0 格式，两张大表由主机内存承载，合计约 189 GiB，节点内各 rank 共享。
 
 ### 长上下文与推测解码
 
@@ -41,12 +41,19 @@ bash examples/ascend/deepseek_v41/build-image.sh
 
 ## 启动与验证
 
-将 `DSV41_MODEL_DIR` 设为完整 1017 checkpoint 目录。Compose 以只读方式挂载模型，默认监听 `127.0.0.1:31088`，启动 attention DP8/TP1 和 MoE EP8。
+通过 `DSV41_MODEL_DIR` 选择完整的 1017 checkpoint。两种模式使用同一镜像，SGLang 根据 checkpoint 配置加载对应的 target MoE。Compose 以只读方式挂载模型，默认监听 `127.0.0.1:31088`，启动 attention DP8/TP1 和 MoE EP8。
 
 ```bash
 export DSV41_MODEL_DIR=/path/to/DeepSeek-V4.1-Flash-1017
 docker compose -f examples/ascend/deepseek_v41/compose.yaml up -d
 docker compose -f examples/ascend/deepseek_v41/compose.yaml logs -f sglang
+```
+
+将 `DSV41_MODEL_DIR` 改为 QuaRot G32 checkpoint 目录，再运行 `up -d` 切换为 INT4。
+
+```bash
+export DSV41_MODEL_DIR=/path/to/DeepSeek-V4.1-Flash-1017-quarot-int4-g32
+docker compose -f examples/ascend/deepseek_v41/compose.yaml up -d
 ```
 
 用同一份 Compose 切换到 attention DP4/TP2。
@@ -67,7 +74,7 @@ docker compose -f examples/ascend/deepseek_v41/compose.yaml exec sglang \
 
 叠加 [`compose.router.yaml`](compose.router.yaml) 后，每个 attention DP rank 发布本地 Radix 缓存的写入和淘汰事件。`sgl-router` 对文本请求查找可复用的最长 token 前缀，将请求定向到对应 rank。前缀未命中或命中长度相同时，默认选路由器在途请求最少的候选 rank。DP8/TP1 和 DP4/TP2 共用此配置。[DP rank 路由说明](../../../sgl-router/REFERENCE.md#dp-rank-routing)
 
-从仓库根目录构建路由器镜像，再用两份 Compose 文件启动。沿用上面的 `DSV41_MODEL_DIR`，其中的 `tokenizer.json` 和 `config.json` 需可读。部署时可用 `DSV41_IMAGE` 指定已有引擎镜像。引擎在发布 KV 事件时会编译哈希扩展，使用这个 Dockerfile 构建的镜像包含扩展所需的 `libssl-dev`。
+从仓库根目录构建路由器镜像，再用两份 Compose 文件启动。引擎和路由器共用 `DSV41_MODEL_DIR`。切换 checkpoint 时，沿用同一组 Compose 文件执行 `up -d`，让两个服务都更新模型挂载。所选 checkpoint 的 `tokenizer.json` 和 `config.json` 需可读。部署时可用 `DSV41_IMAGE` 指定已有引擎镜像。引擎在发布 KV 事件时会编译哈希扩展，使用这个 Dockerfile 构建的镜像包含扩展所需的 `libssl-dev`。
 
 ```bash
 git archive HEAD docker/sgl-router.Dockerfile sgl-router rust | \

@@ -27,7 +27,12 @@ services:
       - /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64:ro
       - /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info:ro
       - /etc/ascend_install.info:/etc/ascend_install.info:ro
-      - ${DSV41_MODEL_DIR:?Set DSV41_MODEL_DIR to the checkpoint directory}:/models/deepseek-v4.1-flash:ro
+      - type: bind
+        source: ${DSV41_MODEL_DIR:?Set DSV41_MODEL_DIR to the MXFP4 or INT4 checkpoint}
+        target: /models/deepseek-v4.1-flash
+        read_only: true
+        bind:
+          create_host_path: false
       - deepjit-cache:/var/cache/dsv41/deepjit
     environment:
       DSV41_MODEL_PATH: /models/deepseek-v4.1-flash
