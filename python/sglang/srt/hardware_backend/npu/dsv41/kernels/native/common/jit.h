@@ -11,6 +11,8 @@
 
 namespace native_jit {
 
+using deep_jit::ascend::BlockSchedule;
+
 void configure(const std::string &source_root, const std::string &signature,
                const std::string &cache_root);
 
@@ -60,7 +62,7 @@ class Kernel {
     // the job count, contiguous partitions use their nonempty partition count.
     // Keep constexpr scheduling strides: once cyclic jobs fill the budget the
     // entire grid must launch. Empty-output metadata stages explicitly pass 1.
-    template <class... Args>
+    template <BlockSchedule Schedule = BlockSchedule::Normal, class... Args>
     void launch_persistent(void *stream, uint64_t task_blocks, const Args &...args) {
         TORCH_CHECK(workers_ > 0, "bind a worker plan before persistent launch");
         const auto &handle = prepare();
@@ -71,6 +73,8 @@ class Kernel {
         options.num_blocks = static_cast<int>(std::min<uint64_t>(workers_, task_blocks));
         options.num_ubuf_bytes = 0;
         options.num_launch_timeout_secs = 0;
+        if constexpr (Schedule != BlockSchedule::Normal)
+            options.block_schedule = Schedule;
         handle->launch(options, args...);
     }
 

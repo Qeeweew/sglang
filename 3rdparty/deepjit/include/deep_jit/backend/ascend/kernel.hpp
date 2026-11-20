@@ -249,7 +249,7 @@ public:
           offset += sizeof(args)), ...);
 
         // Set launch attributes
-        std::array<aclrtLaunchKernelAttr, 2> attributes{};
+        std::array<aclrtLaunchKernelAttr, 3> attributes{};
         size_t num_attributes = 0;
         if (not aicpu and *launch_options.num_ubuf_bytes > 0) {
             auto& attribute = attributes[num_attributes ++];
@@ -260,6 +260,11 @@ public:
             auto& attribute = attributes[num_attributes ++];
             attribute.id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT;
             attribute.value.timeout = static_cast<uint16_t>(*launch_options.num_launch_timeout_secs);
+        }
+        if (not aicpu and launch_options.block_schedule) {
+            auto& attribute = attributes[num_attributes ++];
+            attribute.id = ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE;
+            attribute.value.schemMode = static_cast<uint8_t>(*launch_options.block_schedule);
         }
 
         // Launch

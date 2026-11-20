@@ -17,10 +17,13 @@ def test_persistent_grid_and_partition_coverage(tmp_path):
 #pragma once
 #include <cstdint>
 #include <cassert>
+#include <optional>
 namespace deep_jit::ascend {
+enum class BlockSchedule : uint8_t { Normal = 0, Batch = 1 };
 struct LaunchOptions {
     void *stream;
     int num_blocks, num_ubuf_bytes, num_launch_timeout_secs;
+    std::optional<BlockSchedule> block_schedule;
 };
 inline LaunchOptions observed;
 inline int launches = 0;
@@ -61,6 +64,7 @@ int main() {
             entry.launch_persistent(stream, jobs, &value, uint64_t(123));
             if (jobs == 0) { assert(launches == before); continue; }
             assert(launches == before + 1);
+            assert(!observed.block_schedule);
             assert(observed.stream == stream && observed.num_ubuf_bytes == 0 &&
                    observed.num_launch_timeout_secs == 0);
             assert(observed.num_blocks >= 1 && observed.num_blocks <= int(maximum));
@@ -71,7 +75,10 @@ int main() {
             for (int visited : visits) assert(visited == 1);
             if (jobs && jobs < maximum) assert(observed.num_blocks == int(jobs));
         }
+        entry.launch_persistent<BlockSchedule::Batch>(stream, maximum, &value, uint64_t(123));
+        assert(observed.block_schedule == BlockSchedule::Batch && observed.num_blocks == int(maximum));
         entry.launch_persistent(stream, std::numeric_limits<uint64_t>::max(), &value, uint64_t(123));
+        assert(!observed.block_schedule);
         assert(observed.num_blocks == int(maximum));
         // Router's contiguous partitions are not a cyclic job grid. Every
         // partition in the launched prefix must be nonempty, even at 41/40.

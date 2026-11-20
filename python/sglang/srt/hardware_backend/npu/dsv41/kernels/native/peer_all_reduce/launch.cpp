@@ -5,6 +5,12 @@
 #include "torch.h"
 
 namespace {
+template <class... Args>
+void launch_peer(native_jit::Kernel &kernel, void *stream, const Args &...args) {
+    kernel.launch_persistent<native_jit::BlockSchedule::Batch>(stream, peer_all_reduce::kWorkers,
+                                                                args...);
+}
+
 native_jit::Kernel &entry() {
     static thread_local native_jit::Kernel kernel(
         "peer_all_reduce_sum", "peer_all_reduce/peer_all_reduce.asc", {"--cce-auto-sync=off"},
@@ -17,8 +23,7 @@ void prepare_peer_all_reduce() {
 }
 void launch_peer_all_reduce(void *stream, void *input, void *output, void *local, void *peer,
                             void *table, uint32_t elements) {
-    entry().launch_persistent(stream, peer_all_reduce::kWorkers, input, output, local, peer, table,
-                              elements);
+    launch_peer(entry(), stream, input, output, local, peer, table, elements);
 }
 
 namespace {
@@ -76,9 +81,8 @@ void launch_peer_moe(void *stream, void *input, void *inverse, void *ids, void *
                      void *shared, void *output, void *local, void *table, uint32_t rank,
                      uint32_t rows, uint32_t topk, bool gather, bool finalize,
                      uint32_t attention_tp, bool routed_bf16) {
-    moe_entry(gather, finalize, attention_tp, routed_bf16)
-        .launch_persistent(stream, peer_all_reduce::kWorkers, input, inverse, ids, weights, shared,
-                           output, local, table, rank, rows, topk);
+    launch_peer(moe_entry(gather, finalize, attention_tp, routed_bf16), stream, input, inverse,
+                ids, weights, shared, output, local, table, rank, rows, topk);
 }
 void launch_peer_mhc(void *stream, void *input, void *residual, void *pre, void *post, void *comb,
                      void *weight, void *updated, void *output, void *local, void *table,
@@ -87,13 +91,11 @@ void launch_peer_mhc(void *stream, void *input, void *residual, void *pre, void 
                      uint32_t attention_tp, bool routed_bf16) {
     auto &kernel = mhc_entry(world, normalize, attention_tp, routed_bf16);
     if (normalize)
-        kernel.launch_persistent(stream, peer_all_reduce::kWorkers, input, residual, pre, post,
-                                 comb, weight, updated, output, uint64_t(rows), local, table,
-                                 inverse, ids, weights, shared, rank, topk);
+        launch_peer(kernel, stream, input, residual, pre, post, comb, weight, updated, output,
+                    uint64_t(rows), local, table, inverse, ids, weights, shared, rank, topk);
     else
-        kernel.launch_persistent(stream, peer_all_reduce::kWorkers, input, residual, post, comb,
-                                 updated, uint64_t(rows), local, table, inverse, ids, weights,
-                                 shared, rank, topk);
+        launch_peer(kernel, stream, input, residual, post, comb, updated, uint64_t(rows), local,
+                    table, inverse, ids, weights, shared, rank, topk);
 }
 
 TORCH_LIBRARY_FRAGMENT(dsv41, m) {

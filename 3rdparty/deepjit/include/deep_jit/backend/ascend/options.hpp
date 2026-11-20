@@ -174,6 +174,8 @@ struct CompilerOptions {
     }
 };
 
+enum class BlockSchedule : uint8_t { Normal = 0, Batch = 1 };
+
 // Per-launch Ascend options. Unset fields inherit from runtime defaults.
 struct LaunchOptions {
     // Use current torch_npu stream if unset
@@ -182,6 +184,7 @@ struct LaunchOptions {
     std::optional<int> num_blocks;
     std::optional<int> num_ubuf_bytes;
     std::optional<int> num_launch_timeout_secs;
+    std::optional<BlockSchedule> block_schedule;
 
     static LaunchOptions default_options(const Env& env) {
         return {
@@ -189,6 +192,7 @@ struct LaunchOptions {
             .num_blocks = std::nullopt,
             .num_ubuf_bytes = 0,
             .num_launch_timeout_secs = env.get<int>("JIT_LAUNCH_TIMEOUT", 300),
+            .block_schedule = std::nullopt,
         };
     }
 
@@ -202,6 +206,8 @@ struct LaunchOptions {
             result.num_ubuf_bytes = overrides.num_ubuf_bytes;
         if (overrides.num_launch_timeout_secs)
             result.num_launch_timeout_secs = overrides.num_launch_timeout_secs;
+        if (overrides.block_schedule)
+            result.block_schedule = overrides.block_schedule;
         return result;
     }
 };

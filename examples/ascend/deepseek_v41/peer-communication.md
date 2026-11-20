@@ -29,7 +29,9 @@ DSpark 使用独立的 stage runner，也接入相同融合：attention post 同
 
 每组 communicator 的资源由 RuntimeContext 持有。TP2 每卡分配 2 MiB，EP8 每卡分配 8 MiB，均为独立 ACL 分配，避免导出 PyTorch allocator 中同页的其他数据。使用 ACL export key、bare TGID 白名单和带 peer access 的 import。地址表、IPC 映射、编译和 kernel handle 都在 eager warmup 中准备，capture / replay 只发射算子。
 
-固定 16 个 AIV worker，每条控制信号独占 512 字节。设备维护 epoch，Graph replay 不需要 CPU 修改计数。首轮 epoch 为 1；稳定轮次如下：
+每个 peer kernel 固定使用 16 个 AIV worker，并在启动时指定批调度（`schemMode=1`）：等本卡有足够资源再整组调度，避免部分 worker 已经开始轮询、其余 worker 却因争用无法运行。此设置不影响非 peer 算子。
+
+每条控制信号独占 512 字节。设备维护 epoch，Graph replay 不需要 CPU 修改计数。首轮 epoch 为 1；稳定轮次如下：
 
 ```mermaid
 sequenceDiagram
