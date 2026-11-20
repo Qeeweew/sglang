@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 import torch
 
-from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import mxfp4_a8
+from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import int4_g32_a8
+from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.h32_quant import h32_quant
 
 
 pytestmark = pytest.mark.skipif(
@@ -30,10 +31,10 @@ def test_h32(width, interleaved, dtype):
             (torch.cat((matrix, matrix), 1), torch.cat((matrix, -matrix), 1))
         )
     actual = source.npu()
-    codes, scale = mxfp4_a8.h32_quant(actual, interleaved)
+    codes, scale = h32_quant(actual, interleaved)
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph, stream=torch.npu.Stream(), auto_dispatch_capture=True):
-        replay_codes, replay_scale = mxfp4_a8.h32_quant(actual, interleaved)
+        replay_codes, replay_scale = h32_quant(actual, interleaved)
     for replay in (False, True):
         if replay:
             source = source.flip([1])
@@ -75,7 +76,7 @@ def test_g32_cube(depth, width, dtype):
     )
     weights = tuple(
         value[None].npu()
-        for value in mxfp4_a8.pack_g32(
+        for value in int4_g32_a8.pack_g32(
             torch.from_numpy(pack(signed)), torch.from_numpy(meta)
         )
     )
@@ -97,7 +98,7 @@ def test_g32_cube(depth, width, dtype):
 
     route = metadata(3, 0).npu()
     out = torch.empty((len(host), width), dtype=dtype, device=activation.device)
-    invoke = mxfp4_a8.bind(activation, weights, token, route, out=out, g32=True)
+    invoke = int4_g32_a8.bind(activation, weights, token, route, out=out)
     invoke()
     expected = g32_reference(
         (host[:3].astype(np.int32) @ product.astype(np.int32).T).astype(np.float32),
@@ -148,14 +149,16 @@ def test_g32_fp16_full_scale_and_overflow_across_tile_sizes():
     codes[:, 0] = 1
     factors = torch.full((width, depth // 64), 0x88, dtype=torch.uint8)
     metadata = torch.cat((factors, channel.view(torch.uint8).reshape(width, 4)), dim=1)
-    weights = tuple(value[None].npu() for value in mxfp4_a8.pack_g32(codes, metadata))
+    weights = tuple(
+        value[None].npu() for value in int4_g32_a8.pack_g32(codes, metadata)
+    )
     activation = torch.zeros(130, depth, dtype=torch.int8)
     activation[:, 0] = torch.tensor([1, -1], dtype=torch.int8).repeat(65)
     activation = activation.npu()
     token = torch.ones(130, device=activation.device)
     route = torch.tensor([1, 130, 0, 1, 0, 0, 130, 0], dtype=torch.int32).npu()
     out = torch.empty(130, width, device=activation.device, dtype=torch.float16)
-    invoke = mxfp4_a8.bind(activation, weights, token, route, out=out, g32=True)
+    invoke = int4_g32_a8.bind(activation, weights, token, route, out=out)
     invoke()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph, stream=torch.npu.Stream(), auto_dispatch_capture=True):
@@ -295,14 +298,14 @@ def test_joint_swiglu_and_separate_h32(shared_rows, capacity, dtype):
         library.joint_swiglu(
             shared, routed, count, out[:shared_rows], out[shared_rows:], 10.0
         )
-        return mxfp4_a8.h32_quant(out, True, count=count, shared_rows=shared_rows)
+        return h32_quant(out, True, count=count, shared_rows=shared_rows)
 
     def check(live, codes, scales):
         parts = [split(part) for part in (shared, routed[:live]) if len(part)]
         if parts:
             expected = torch.cat(parts)
             torch.testing.assert_close(out[: len(expected)], expected, atol=0, rtol=0)
-            ref_codes, ref_scales = mxfp4_a8.h32_quant(expected, True)
+            ref_codes, ref_scales = h32_quant(expected, True)
             assert torch.equal(codes[: len(expected)], ref_codes)
             assert torch.equal(scales[: len(expected)], ref_scales)
         assert (out[shared_rows + live :] == -123).all().item()
@@ -337,14 +340,12 @@ def test_all_signed_products():
             1,
         ),
     )
-    packed = [value[None].npu() for value in mxfp4_a8.pack_g32(*weights)]
+    packed = [value[None].npu() for value in int4_g32_a8.pack_g32(*weights)]
     x = torch.zeros(1, 256, dtype=torch.int8)
     x[0, 0] = 1
     output = torch.empty((1, 256), dtype=torch.float16, device="npu")
     route = torch.tensor([1, 1, 0, 1, 0, 0, 1, 0], dtype=torch.int32).npu()
-    invoke = mxfp4_a8.bind(
-        x.npu(), packed, torch.ones(1).npu(), route, out=output, g32=True
-    )
+    invoke = int4_g32_a8.bind(x.npu(), packed, torch.ones(1).npu(), route, out=output)
     invoke()
     expected = torch.arange(-8, 8).repeat(16) * factors
     torch.testing.assert_close(output.cpu().flatten(), expected.half(), atol=0, rtol=0)

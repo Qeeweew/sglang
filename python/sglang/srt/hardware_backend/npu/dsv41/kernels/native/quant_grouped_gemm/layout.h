@@ -8,7 +8,7 @@ inline constexpr int kScaleGroup = 32, kFractalRows = 16, kDmaBytes = 32, kVecto
 inline constexpr int kHalfVectorElements = kVectorBytes / kHalfBytes;
 inline constexpr int16_t kRankCorrectionBits = 0x4400;
 inline constexpr float kTaggedScaleCorrection = -0x1p-10f;
-inline constexpr int kShortMmadFractals = 10, kAccumulatorContinue = 2, kAccumulatorPublish = 3;
+inline constexpr int kAccumulatorContinue = 2, kAccumulatorPublish = 3;
 inline constexpr int kOperandReuseEvent = 3, kFootprintRetiredEvent = 5;
 inline constexpr int kMatrixStateEvent = 6, kFixStateEvent = 0, kScaleEventBase = 2;
 inline constexpr int kRightOperandEventBase = 2, kRetirementEvent = 7, kGroupFlagMode = 2;

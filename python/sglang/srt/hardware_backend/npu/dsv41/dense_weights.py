@@ -173,7 +173,6 @@ def adapt_get_method(original_get_method):
             from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
             if isinstance(layer, FusedMoE):
-                from sglang.srt.environ import envs
                 from sglang.srt.hardware_backend.npu.dsv41.moe import (
                     ResidentMXFP4Method,
                 )
@@ -181,8 +180,6 @@ def adapt_get_method(original_get_method):
                 return ResidentMXFP4Method(
                     is_draft=config._dsv41_is_draft,
                     g32=getattr(config, "_dsv41_g32", False),
-                    a8=envs.SGLANG_OPT_DSV41_NPU_TARGET_MOE_A8.get()
-                    and not config._dsv41_is_draft,
                 )
         return original_get_method(config, layer, prefix)
 

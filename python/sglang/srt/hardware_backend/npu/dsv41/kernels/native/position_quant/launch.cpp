@@ -1,8 +1,7 @@
 #include "launch.h"
 #include "params.h"
-#include "jit.h"
+#include "actual_entry.h"
 #include <algorithm>
-#include <map>
 #include <memory>
 #include <tuple>
 #include <torch/library.h>
@@ -26,13 +25,8 @@ struct PositionKey {
     }
 };
 native_jit::Kernel &entry(const PositionKey &k) {
-    static thread_local std::map<PositionKey, std::unique_ptr<native_jit::Kernel>> cache;
-    static thread_local PositionKey last_key{};
-    static thread_local native_jit::Kernel *last = nullptr;
-    if (last && last_key == k)
-        return *last;
-    auto &result = cache[k];
-    if (!result) {
+    static thread_local native_jit::KernelCache<PositionKey> entries;
+    return entries.get(k, [&] {
         const char *name = k.operation == 0   ? "position_rope"
                            : k.operation == 1 ? "position_quant"
                            : k.operation == 3 ? "rope_cache_gather"
@@ -64,12 +58,9 @@ native_jit::Kernel &entry(const PositionKey &k) {
         add("TILE_HEADS", k.tile_heads);
         add("TILE_TOKENS", k.tile_tokens);
         const auto workers = k.workers;
-        result = std::make_unique<native_jit::Kernel>(name, "position_quant/position_quant.asc",
-                                                      flags, workers);
-    }
-    last_key = k;
-    last = result.get();
-    return *result;
+        return std::make_unique<native_jit::Kernel>(name, "position_quant/position_quant.asc",
+                                                    flags, workers);
+    });
 }
 PositionKey position_key(uint32_t heads, uint32_t dim, uint32_t rotary_dim, uint32_t mode,
                          bool inverse, bool inplace, bool has_trig, uint32_t workers) {

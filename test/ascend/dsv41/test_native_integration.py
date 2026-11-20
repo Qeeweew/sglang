@@ -6,7 +6,7 @@ import pytest
 import torch
 
 
-@pytest.mark.parametrize("g32", [False, True], ids=["mxfp4", "w4a8"])
+@pytest.mark.parametrize("g32", [False, True], ids=["mxfp4", "int4_g32_a8"])
 @pytest.mark.parametrize(
     "counts,slot,max_len,rs,gatherv",
     [
@@ -199,7 +199,9 @@ def test_joint_experts_tbo_keeps_shared_on_its_microbatch(monkeypatch):
         assert input_ids is input_ids_global is batch._tbo_global_input_ids
         return hidden * 2, hidden[joint_shared_slice] + 1
 
-    with get_parallel().override(attn_dp_size=4, attn_dp_rank=2):
+    with get_parallel().override(
+        tp_size=4, tp_rank=2, attn_dp_size=4, attn_dp_rank=2, moe_ep_size=4
+    ):
         for counts in ([1, 3, 2, 1], [0, 2, 1, 1]):
             state = _StateDict()
             state.forward_batch = SimpleNamespace(
@@ -262,6 +264,9 @@ def test_joint_experts_peer_owner(monkeypatch, tp, rows, owner):
         parallel, "_workspace", lambda *args: torch.empty_like(global_input)
     )
     with get_parallel().override(
+        tp_size=8,
+        tp_rank=2 * tp + tp - 1,
+        moe_ep_size=8,
         attn_dp_size=8 // tp,
         attn_dp_rank=2,
         attn_tp_size=tp,

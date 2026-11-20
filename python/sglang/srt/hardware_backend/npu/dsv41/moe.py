@@ -29,26 +29,19 @@ def live_dp_counts(device, ranks):
 
 
 @cache
-def _expert_projections(experts, hidden, width, device, a8=False, g32=False):
-    from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import NativeGroupedGemm
+def _expert_projections(experts, hidden, width, device, g32):
+    device = torch.device("npu", device)
+    shapes = ((hidden, 2 * width), (width, hidden))
+    if g32:
+        from .kernels.ops.int4_g32_a8 import G32GroupedGemm
 
-    projection = NativeGroupedGemm
-    if a8:
-        from .kernels.ops.mxfp4_a8 import A8GroupedGemm
+        return tuple(G32GroupedGemm(k, n, device=device) for k, n in shapes)
 
-        projection = A8GroupedGemm
-    result = []
-    for down, (k, n) in enumerate(((hidden, 2 * width), (width, hidden))):
-        result.append(
-            projection(
-                k,
-                n,
-                experts=experts,
-                device=torch.device("npu", device),
-                **({"g32": True, "interleaved": bool(down)} if g32 else {}),
-            )
-        )
-    return tuple(result)
+    from .kernels.ops import NativeGroupedGemm
+
+    return tuple(
+        NativeGroupedGemm(k, n, experts=experts, device=device) for k, n in shapes
+    )
 
 
 @cache
@@ -155,12 +148,12 @@ def weight_packer(k, n, device):
 class ResidentMXFP4Method(FusedMoEMethodBase):
     fuse_routed_scaling_factor_in_topk = True
 
-    def __init__(self, *, a8=False, g32=False, is_draft=False):
-        self.a8, self.g32 = a8 or g32, g32
+    def __init__(self, *, g32=False, is_draft=False):
+        self.g32 = g32
         self.is_draft = is_draft
 
     def _weights(self, name):
-        fields = ("packed", "scales", "channel") if self.a8 else ("packed", "scales")
+        fields = ("packed", "scales", "channel") if self.g32 else ("packed", "scales")
         return tuple(getattr(self.layer, f"{name}_{field}") for field in fields)
 
     def create_weights(
@@ -204,8 +197,8 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
             ("gate_up", self.h, 2 * self.i),
             ("down", self.i, self.h),
         ):
-            if self.a8 and not (256 <= depth <= 8192 and width % 64 == 0):
-                raise ValueError("unsupported 910B A8 expert geometry")
+            if self.g32 and not (256 <= depth <= 8192 and width % 64 == 0):
+                raise ValueError("unsupported 910B INT4 G32 expert geometry")
             elements = depth * width
             fields = (
                 (
@@ -213,7 +206,7 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
                     ("scales", elements // 64, torch.uint8),
                     ("channel", width, torch.float32),
                 )
-                if self.a8
+                if self.g32
                 else (
                     ("packed", elements // 8, torch.int32),
                     ("scales", elements // 32, torch.uint8),
@@ -316,11 +309,10 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
                     self._weights("down"),
                 ),
             ):
-                if self.a8:
-                    from .kernels.ops.mxfp4_a8 import pack_expert, pack_g32
+                if self.g32:
+                    from .kernels.ops.int4_g32_a8 import pack_g32
 
-                    pack = pack_g32 if self.g32 else pack_expert
-                    for buffer, value in zip(target, pack(*pair), strict=True):
+                    for buffer, value in zip(target, pack_g32(*pair), strict=True):
                         buffer[expert_id].copy_(value)
                 else:
                     weight_packer(k, n, self.device).load_cpu(
@@ -333,7 +325,7 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
 
     def bind_local_experts(self, gate_up_weight, down_weight):
         up, down = _expert_projections(
-            self.e, self.h, self.i, torch.npu.current_device(), self.a8, self.g32
+            self.e, self.h, self.i, torch.npu.current_device(), self.g32
         )
         if self.g32:
             from .joint_experts import G32Projections
@@ -366,7 +358,7 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
             sum(buffer.nbytes for projection in weights for buffer in projection)
             / 2**30,
             "per-token A8, signed K32 factors"
-            if self.a8
+            if self.g32
             else "uint8 preprocessed FP16",
         )
 

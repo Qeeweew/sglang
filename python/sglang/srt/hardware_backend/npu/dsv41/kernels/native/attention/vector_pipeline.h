@@ -1,26 +1,24 @@
 #pragma once
+#include <common/device.h>
 #include <kernel_operator.h>
 #include <c_api/asc_simd.h>
 #include <attention/state.h>
 
 namespace attention {
+using native_device::ub_ptr;
 class VectorPipeline {
     const Sources &sources_;
     Workspace workspace_;
     RequestCursor cursor_;
     int32_t core_, subblock_, tasks_;
     int32_t compressed_batch_ = -1, compressed_available_ = 0, compressed_residual_ = 0;
-    template <class T>
-    __aicore__ __attribute__((always_inline)) __ubuf__ T *ub_pointer(uint32_t bytes) {
-        return reinterpret_cast<__ubuf__ T *>(uint64_t(bytes));
-    }
     __aicore__ __attribute__((always_inline)) void gather_selected_rows(int32_t task) {
         const int32_t token = core_ + task * kWorkerBudget;
         const auto m = cursor_.locate<false>(sources_, token);
         const bool vector_coordinates = kCoordinate32 && kCompressedColumns <= kPageTableCapacity &&
                                         kCompressedColumns % 8 == 0;
         const bool new_request = compressed_batch_ != m.batch;
-        auto page_table = ub_pointer<int32_t>(UbLayout::page_table);
+        auto page_table = ub_ptr<int32_t>(UbLayout::page_table);
         if (new_request) {
             compressed_batch_ = m.batch;
             compressed_available_ = gm_pointer<int32_t>(sources_.compressed_lengths)[m.batch];
@@ -42,8 +40,8 @@ class VectorPipeline {
         const int32_t valid_limit =
             min(int64_t(limit), int64_t(kCompressedColumns) * kCompressedPageRows);
         const int32_t owned_rows = kSelectedRows / 2;
-        auto ids = ub_pointer<int32_t>(UbLayout::indices);
-        auto coordinates = ub_pointer<int32_t>(UbLayout::row_indices);
+        auto ids = ub_ptr<int32_t>(UbLayout::indices);
+        auto coordinates = ub_ptr<int32_t>(UbLayout::row_indices);
         auto local_ids = ids + (subblock_ * owned_rows);
         auto local_coordinates = coordinates + (subblock_ * owned_rows);
         asc_copy_gm2ub(local_ids,
@@ -51,18 +49,12 @@ class VectorPipeline {
                         (int64_t(token) * kSelectedRows + subblock_ * owned_rows)),
                        uint32_t((owned_rows) * sizeof(int32_t)));
         if (vector_coordinates) {
-            {
-                set_flag(PIPE_MTE2, PIPE_V, ::event_t(kImmediateEvent));
-                wait_flag(PIPE_MTE2, PIPE_V, ::event_t(kImmediateEvent));
-            }
-            auto offsets = ub_pointer<int32_t>(UbLayout::offsets);
+            native_device::pipe_fence<PIPE_MTE2, PIPE_V, kImmediateEvent>();
+            auto offsets = ub_ptr<int32_t>(UbLayout::offsets);
             if (new_request) {
                 for (int32_t col = 0; col < 8; ++col)
                     offsets[col] = col;
-                {
-                    set_flag(PIPE_S, PIPE_V, ::event_t(kImmediateEvent));
-                    wait_flag(PIPE_S, PIPE_V, ::event_t(kImmediateEvent));
-                }
+                native_device::pipe_fence<PIPE_S, PIPE_V, kImmediateEvent>();
                 for (int32_t columns = 8; columns < kCompressedColumns; columns *= 2) {
                     asc_add_scalar((offsets + (columns)), offsets, columns, columns);
                     pipe_barrier(PIPE_V);
@@ -96,26 +88,22 @@ class VectorPipeline {
                 asc_mul_scalar(local_coordinates, local_coordinates, int32_t(kWidth), owned_rows);
                 pipe_barrier(PIPE_V);
             }
-            {
-                set_flag(PIPE_V, PIPE_S, ::event_t(kImmediateEvent));
-                wait_flag(PIPE_V, PIPE_S, ::event_t(kImmediateEvent));
-            }
+            native_device::pipe_fence<PIPE_V, PIPE_S, kImmediateEvent>();
         } else {
-            set_flag(PIPE_MTE2, PIPE_S, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_MTE2, PIPE_S, ::event_t(kImmediateEvent));
+            native_device::pipe_fence<PIPE_MTE2, PIPE_S, kImmediateEvent>();
         }
         const int32_t chunks = owned_rows / kGatherRows;
         for (int32_t step = 0; step <= chunks; ++step) {
             if (step < chunks) {
                 const int32_t slot = step % 2, first = subblock_ * owned_rows + step * kGatherRows;
                 auto rows =
-                    ub_pointer<BF16>(UbLayout::gather + slot * kGatherRows * kWidth * sizeof(BF16));
+                    ub_ptr<BF16>(uint32_t(UbLayout::gather + slot * kGatherRows * kWidth * sizeof(BF16)));
                 if (step >= 2 || task > 0) {
                     wait_flag(PIPE_MTE3, PIPE_MTE2, ::event_t(slot + 1));
                     wait_flag(PIPE_MTE3, PIPE_S, ::event_t(slot + 1));
                 }
                 auto masks =
-                    ub_pointer<float>(UbLayout::masks + slot * kGatherRows * sizeof(float));
+                    ub_ptr<float>(uint32_t(UbLayout::masks + slot * kGatherRows * sizeof(float)));
                 for (int32_t row = 0; row < kGatherRows; ++row) {
                     const int32_t selected_slot = first + row, index = ids[selected_slot];
                     const bool valid = selected_slot < count && index >= 0 && index < valid_limit;
@@ -149,9 +137,9 @@ class VectorPipeline {
                 const int32_t chunk = step - 1, slot = chunk % 2,
                               first = subblock_ * owned_rows + chunk * kGatherRows;
                 auto masks =
-                    ub_pointer<float>(UbLayout::masks + slot * kGatherRows * sizeof(float));
+                    ub_ptr<float>(uint32_t(UbLayout::masks + slot * kGatherRows * sizeof(float)));
                 auto rows =
-                    ub_pointer<BF16>(UbLayout::gather + slot * kGatherRows * kWidth * sizeof(BF16));
+                    ub_ptr<BF16>(uint32_t(UbLayout::gather + slot * kGatherRows * kWidth * sizeof(BF16)));
                 wait_flag(PIPE_S, PIPE_MTE3, ::event_t(slot + 1));
                 asc_copy_ub2gm((workspace_.bias(task) + (first)), masks,
                                uint32_t((kGatherRows) * sizeof(float)));
@@ -167,8 +155,8 @@ class VectorPipeline {
     template <bool Sum>
     __aicore__ __attribute__((always_inline)) void
     reduce_rows(__ubuf__ float *dst, __ubuf__ float *source, int32_t rows, int32_t columns) {
-        auto partial = ub_pointer<float>(UbLayout::partial),
-             merge = ub_pointer<float>(UbLayout::reduction_merge);
+        auto partial = ub_ptr<float>(UbLayout::partial),
+             merge = ub_ptr<float>(UbLayout::reduction_merge);
 
         // First reduce each 32B block, then reduce packed block results. This
         // retains the established floating-point sum tree for every row.
@@ -214,10 +202,7 @@ class VectorPipeline {
             // Long sequence rows use one scalar-vector instruction each. The
             // dependency retires the statistics producer before Scalar reads;
             // max/sub and reciprocal/multiply retain their FP32 operations.
-            {
-                set_flag(PIPE_V, PIPE_S, ::event_t(kImmediateEvent));
-                wait_flag(PIPE_V, PIPE_S, ::event_t(kImmediateEvent));
-            }
+            native_device::pipe_fence<PIPE_V, PIPE_S, kImmediateEvent>();
             for (int32_t row = 0; row < rows; ++row) {
                 const float value = values[row];
                 if constexpr (Multiply)
@@ -229,7 +214,7 @@ class VectorPipeline {
             }
             return;
         }
-        auto expanded = ub_pointer<float>(UbLayout::broadcast);
+        auto expanded = ub_ptr<float>(UbLayout::broadcast);
         asc_brcb(reinterpret_cast<__ubuf__ uint32_t *>(expanded),
                  reinterpret_cast<__ubuf__ uint32_t *>(values), 1, 8, uint8_t((rows + 7) / 8));
         pipe_barrier(PIPE_V);
@@ -252,7 +237,7 @@ class VectorPipeline {
     __aicore__ __attribute__((always_inline)) void softmax(int32_t task) {
         const int32_t token = core_ + task * kWorkerBudget, local_heads = kHeads / 2;
         const auto m = cursor_.locate(sources_, token);
-        auto bias = ub_pointer<float>(UbLayout::bias);
+        auto bias = ub_ptr<float>(UbLayout::bias);
         const int32_t direct_columns = kSparse ? kSparseWindowCapacity : kCapacity;
         // A fully visible direct window has zero bias. Its FP32 addition is
         // an identity, so initialize/apply only the genuinely masked columns.
@@ -284,13 +269,13 @@ class VectorPipeline {
                                                    : kCapacity <= 512  ? 32
                                                    : kCapacity <= 1024 ? 16
                                                                        : 4);
-        auto probabilities = ub_pointer<BF16>(UbLayout::probabilities);
-        auto maximum = ub_pointer<float>(UbLayout::maximum), sum = ub_pointer<float>(UbLayout::sum);
+        auto probabilities = ub_ptr<BF16>(UbLayout::probabilities);
+        auto maximum = ub_ptr<float>(UbLayout::maximum), sum = ub_ptr<float>(UbLayout::sum);
         if constexpr (kSparse) {
             for (int32_t local = 0; local < local_heads; local += head_tile) {
                 const int32_t rows = min(head_tile, local_heads - local);
                 asc_copy_gm2ub(
-                    ub_pointer<float>(UbLayout::scores + local * kCapacity * sizeof(float)),
+                    ub_ptr<float>(uint32_t(UbLayout::scores + local * kCapacity * sizeof(float))),
                     (workspace_.scores(task) + ((subblock_ * local_heads + local) * kCapacity)),
                     uint32_t((rows * kCapacity) * sizeof(float)));
                 set_flag(PIPE_MTE2, PIPE_V, ::event_t(local / head_tile + 1));
@@ -299,11 +284,11 @@ class VectorPipeline {
         for (int32_t local = 0; local < local_heads; local += head_tile) {
             const int32_t rows = min(head_tile, local_heads - local),
                           head = subblock_ * local_heads + local;
-            auto scores = ub_pointer<float>(UbLayout::scores +
-                                            (kSparse ? local * kCapacity * sizeof(float) : 0));
-            auto sink = ub_pointer<float>(UbLayout::sink + (kSparse ? local * sizeof(float) : 0));
+            auto scores = ub_ptr<float>(uint32_t(UbLayout::scores +
+                                            (kSparse ? local * kCapacity * sizeof(float) : 0)));
+            auto sink = ub_ptr<float>(uint32_t(UbLayout::sink + (kSparse ? local * sizeof(float) : 0)));
             auto sink_input =
-                kSparse ? ub_pointer<float>(UbLayout::sinks + local * sizeof(float)) : sink;
+                kSparse ? ub_ptr<float>(uint32_t(UbLayout::sinks + local * sizeof(float))) : sink;
             if constexpr (kSparse)
                 wait_flag(PIPE_MTE2, PIPE_V, ::event_t(local / head_tile + 1));
             else {
@@ -315,15 +300,9 @@ class VectorPipeline {
                 else {
                     for (int32_t row = 0; row < rows; ++row)
                         sink[row] = gm_pointer<float>(sources_.sinks)[head + row];
-                    {
-                        set_flag(PIPE_S, PIPE_V, ::event_t(kImmediateEvent));
-                        wait_flag(PIPE_S, PIPE_V, ::event_t(kImmediateEvent));
-                    }
+                    native_device::pipe_fence<PIPE_S, PIPE_V, kImmediateEvent>();
                 }
-                {
-                    set_flag(PIPE_MTE2, PIPE_V, ::event_t(kImmediateEvent));
-                    wait_flag(PIPE_MTE2, PIPE_V, ::event_t(kImmediateEvent));
-                }
+                native_device::pipe_fence<PIPE_MTE2, PIPE_V, kImmediateEvent>();
             }
             asc_mul_scalar(scores, scores, kScale, rows * kCapacity);
             pipe_barrier(PIPE_V);
@@ -354,10 +333,7 @@ class VectorPipeline {
             pipe_barrier(PIPE_V);
             if constexpr (kSparse) {
                 asc_float2bfloat16_rn(probabilities, scores, rows * kCapacity);
-                {
-                    set_flag(PIPE_V, PIPE_MTE3, ::event_t(kImmediateEvent));
-                    wait_flag(PIPE_V, PIPE_MTE3, ::event_t(kImmediateEvent));
-                }
+                native_device::pipe_fence<PIPE_V, PIPE_MTE3, kImmediateEvent>();
                 asc_copy_ub2gm((workspace_.probabilities(task) + (head * kCapacity)), probabilities,
                                uint32_t((rows * kCapacity) * sizeof(BF16)));
                 if (local + rows == local_heads)
@@ -368,8 +344,8 @@ class VectorPipeline {
             pipe_barrier(PIPE_V);
             if constexpr (kSparse)
                 asc_copy_ub2ub(
-                    ub_pointer<float>(UbLayout::final_denominator +
-                                      ((task % 2) * local_heads + local) * sizeof(float)),
+                    ub_ptr<float>(uint32_t(UbLayout::final_denominator +
+                                      ((task % 2) * local_heads + local) * sizeof(float))),
                     sum, uint32_t((rows) * sizeof(float)));
             else {
                 asc_duplicate(maximum, 1.0f, rows);
@@ -377,7 +353,7 @@ class VectorPipeline {
                 asc_div(sink, maximum, sum, rows);
                 pipe_barrier(PIPE_V);
                 if constexpr (kDraft) {
-                    auto refine = ub_pointer<float>(UbLayout::reciprocal_refinement);
+                    auto refine = ub_ptr<float>(UbLayout::reciprocal_refinement);
                     asc_mul(refine, sink, sum, rows);
                     pipe_barrier(PIPE_V);
                     asc_mul_scalar(refine, refine, -1.0f, rows);
@@ -390,10 +366,7 @@ class VectorPipeline {
                 broadcast_rows<true>(scores, sink, rows, kCapacity);
                 pipe_barrier(PIPE_V);
                 asc_float2bfloat16_rn(probabilities, scores, rows * kCapacity);
-                {
-                    set_flag(PIPE_V, PIPE_MTE3, ::event_t(kImmediateEvent));
-                    wait_flag(PIPE_V, PIPE_MTE3, ::event_t(kImmediateEvent));
-                }
+                native_device::pipe_fence<PIPE_V, PIPE_MTE3, kImmediateEvent>();
                 asc_copy_ub2gm((workspace_.probabilities(task) + (head * kCapacity)), probabilities,
                                uint32_t((rows * kCapacity) * sizeof(BF16)));
                 // Publish on the store pipe before waiting for UB reuse. The
@@ -404,14 +377,8 @@ class VectorPipeline {
             // Direct attention has no UB reader or writer after its final P
             // export. Intermediate tasks/groups still retire both reuse edges.
             if (kSparse || task + 1 < tasks_ || local + rows < local_heads) {
-                {
-                    set_flag(PIPE_MTE3, PIPE_V, ::event_t(kImmediateEvent));
-                    wait_flag(PIPE_MTE3, PIPE_V, ::event_t(kImmediateEvent));
-                }
-                {
-                    set_flag(PIPE_V, PIPE_MTE2, ::event_t(kImmediateEvent));
-                    wait_flag(PIPE_V, PIPE_MTE2, ::event_t(kImmediateEvent));
-                }
+                native_device::pipe_fence<PIPE_MTE3, PIPE_V, kImmediateEvent>();
+                native_device::pipe_fence<PIPE_V, PIPE_MTE2, kImmediateEvent>();
             }
         }
     }
@@ -419,40 +386,28 @@ class VectorPipeline {
         CrossCoreWaitFlag<2, PIPE_MTE2>(ProductReady);
         const int32_t token = core_ + task * kWorkerBudget, rows = kHeads / 2,
                       head = subblock_ * rows;
-        auto values = ub_pointer<float>(UbLayout::scores);
-        auto output = ub_pointer<BF16>(UbLayout::probabilities);
-        auto inverse = ub_pointer<float>(UbLayout::sink),
-             ones = ub_pointer<float>(UbLayout::maximum);
+        auto values = ub_ptr<float>(UbLayout::scores);
+        auto output = ub_ptr<BF16>(UbLayout::probabilities);
+        auto inverse = ub_ptr<float>(UbLayout::sink),
+             ones = ub_ptr<float>(UbLayout::maximum);
         auto denominator =
-            ub_pointer<float>(UbLayout::final_denominator + (task % 2) * rows * sizeof(float));
+            ub_ptr<float>(uint32_t(UbLayout::final_denominator + (task % 2) * rows * sizeof(float)));
         asc_copy_gm2ub(values, (workspace_.products(task) + (head * kWidth)),
                        uint32_t((rows * kWidth) * sizeof(float)));
         asc_duplicate(ones, 1.0f, rows);
         pipe_barrier(PIPE_V);
         asc_div(inverse, ones, denominator, rows);
         pipe_barrier(PIPE_V);
-        {
-            set_flag(PIPE_MTE2, PIPE_V, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_MTE2, PIPE_V, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_MTE2, PIPE_V, kImmediateEvent>();
         broadcast_rows<true>(values, inverse, rows, kWidth);
         pipe_barrier(PIPE_V);
         asc_float2bfloat16_rn(output, values, rows * kWidth);
-        {
-            set_flag(PIPE_V, PIPE_MTE3, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_V, PIPE_MTE3, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_V, PIPE_MTE3, kImmediateEvent>();
         asc_copy_ub2gm(
             (gm_pointer<BF16>(sources_.out) + ((int64_t(token) * kHeads + head) * kWidth)), output,
             uint32_t((rows * kWidth) * sizeof(BF16)));
-        {
-            set_flag(PIPE_MTE3, PIPE_V, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_MTE3, PIPE_V, ::event_t(kImmediateEvent));
-        }
-        {
-            set_flag(PIPE_V, PIPE_MTE2, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_V, PIPE_MTE2, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_MTE3, PIPE_V, kImmediateEvent>();
+        native_device::pipe_fence<PIPE_V, PIPE_MTE2, kImmediateEvent>();
     }
 
   public:
@@ -466,19 +421,13 @@ class VectorPipeline {
     }
     __aicore__ __attribute__((always_inline)) void run() {
         if constexpr (kSparse) {
-            asc_duplicate(ub_pointer<uint16_t>(UbLayout::gather), uint16_t(0),
+            asc_duplicate(ub_ptr<uint16_t>(UbLayout::gather), uint16_t(0),
                           kGatherBytes / sizeof(uint16_t));
-            {
-                set_flag(PIPE_V, PIPE_MTE2, ::event_t(kImmediateEvent));
-                wait_flag(PIPE_V, PIPE_MTE2, ::event_t(kImmediateEvent));
-            }
-            asc_copy_gm2ub(ub_pointer<float>(UbLayout::sinks),
+            native_device::pipe_fence<PIPE_V, PIPE_MTE2, kImmediateEvent>();
+            asc_copy_gm2ub(ub_ptr<float>(UbLayout::sinks),
                            (gm_pointer<float>(sources_.sinks) + (subblock_ * kHeads / 2)),
                            uint32_t((kHeads / 2) * sizeof(float)));
-            {
-                set_flag(PIPE_MTE2, PIPE_V, ::event_t(kImmediateEvent));
-                wait_flag(PIPE_MTE2, PIPE_V, ::event_t(kImmediateEvent));
-            }
+            native_device::pipe_fence<PIPE_MTE2, PIPE_V, kImmediateEvent>();
         }
         if (!kSparse && tasks_ == 1) {
             if constexpr (kSparse)
@@ -503,21 +452,12 @@ class VectorPipeline {
                 wait_flag(PIPE_MTE3, PIPE_S, ::event_t(slot + 1));
             }
         if constexpr (kSparse) {
-            {
-                set_flag(PIPE_V, PIPE_S, ::event_t(kImmediateEvent));
-                wait_flag(PIPE_V, PIPE_S, ::event_t(kImmediateEvent));
-            }
-            {
-                set_flag(PIPE_MTE2, PIPE_S, ::event_t(kImmediateEvent));
-                wait_flag(PIPE_MTE2, PIPE_S, ::event_t(kImmediateEvent));
-            }
+            native_device::pipe_fence<PIPE_V, PIPE_S, kImmediateEvent>();
+            native_device::pipe_fence<PIPE_MTE2, PIPE_S, kImmediateEvent>();
         }
         // For direct attention every input DMA feeds V, and every V operation
         // feeds the final P export. MTE3 therefore transitively retires them.
-        {
-            set_flag(PIPE_MTE3, PIPE_S, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_MTE3, PIPE_S, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_MTE3, PIPE_S, kImmediateEvent>();
     }
 };
 } // namespace attention

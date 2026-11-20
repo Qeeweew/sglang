@@ -1,4 +1,5 @@
 #pragma once
+#include <common/device.h>
 #include <mhc/vector_pipeline.h>
 namespace mhc {
 // Source-major [branches, rows, eight lanes] makes every Sinkhorn row one
@@ -26,14 +27,14 @@ __aicore__ inline void compute_statistics(GM_ADDR projection, GM_ADDR squares, G
                                               uint64_t padded_rows) {
     const uint32_t b = p.branches, lanes = kBlockFloats;
     constexpr StatsLayout l;
-    auto a = ub<float>(l.a), other = ub<float>(l.b);
-    auto stat = ub<float>(l.stat), gate = ub<float>(l.gate), bias = ub<float>(l.bias);
-    auto matrix = ub<float>(l.matrix), red = ub<float>(l.reduction);
-    auto broad = ub<float>(l.broadcast), column = ub<float>(l.column);
-    auto ones = ub<float>(l.ones), basecache = ub<float>(l.base);
-    auto gate_index = ub<uint32_t>(l.gate_index);
-    auto matrix_index = ub<uint32_t>(l.matrix_index);
-    auto matrix_bias = ub<float>(l.matrix_bias);
+    auto a = ub_ptr<float>(l.a), other = ub_ptr<float>(l.b);
+    auto stat = ub_ptr<float>(l.stat), gate = ub_ptr<float>(l.gate), bias = ub_ptr<float>(l.bias);
+    auto matrix = ub_ptr<float>(l.matrix), red = ub_ptr<float>(l.reduction);
+    auto broad = ub_ptr<float>(l.broadcast), column = ub_ptr<float>(l.column);
+    auto ones = ub_ptr<float>(l.ones), basecache = ub_ptr<float>(l.base);
+    auto gate_index = ub_ptr<uint32_t>(l.gate_index);
+    auto matrix_index = ub_ptr<uint32_t>(l.matrix_index);
+    auto matrix_bias = ub_ptr<float>(l.matrix_bias);
     const uint64_t live_mask = ((uint64_t(1) << b) - 1) * UINT64_C(0x0101010101010101);
     uint64_t mask[2] = {live_mask, 0};
     uint64_t gate_mask[2] = {live_mask & lane_bits(2 * r * lanes), 0};
@@ -46,17 +47,11 @@ __aicore__ inline void compute_statistics(GM_ADDR projection, GM_ADDR squares, G
     const uint64_t reduction_mask = lane_bits(b * r);
     auto projected = gm<float>(projection), squared = gm<float>(squares), scales = gm<float>(scale);
     if (!constants.resident) {
-        {
-            set_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
-            wait_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
-        }
+        native_device::pipe_fence<PIPE_V, PIPE_MTE2, VectorEvents::raw_free>();
         if (r != 1) {
             asc_copy_gm2ub_align(basecache, gm<float>(base), 1,
                                  p.projection_columns * sizeof(*(basecache)), 0, 0, 0, 0);
-            {
-                set_flag(PIPE_MTE2, PIPE_V, ::event_t(VectorEvents::loaded));
-                wait_flag(PIPE_MTE2, PIPE_V, ::event_t(VectorEvents::loaded));
-            }
+            native_device::pipe_fence<PIPE_MTE2, PIPE_V, VectorEvents::loaded>();
         }
         constants.pre_scale = scales[0];
         constants.post_scale = scales[1];
@@ -72,10 +67,7 @@ __aicore__ inline void compute_statistics(GM_ADDR projection, GM_ADDR squares, G
 #pragma unroll
             for (uint32_t lane = 0; lane < kBlockFloats; ++lane)
                 lane_index[lane] = int32_t(lane * sizeof(float));
-            {
-                set_flag(PIPE_S, PIPE_V, ::event_t(VectorEvents::scalar_write));
-                wait_flag(PIPE_S, PIPE_V, ::event_t(VectorEvents::scalar_write));
-            }
+            native_device::pipe_fence<PIPE_S, PIPE_V, VectorEvents::scalar_write>();
             {
                 asc_duplicate(gate_index, uint32_t(0), kRepeatFloats);
                 asc_set_vector_mask(UINT64_MAX, UINT64_MAX);
@@ -92,17 +84,11 @@ __aicore__ inline void compute_statistics(GM_ADDR projection, GM_ADDR squares, G
                 asc_duplicate(matrix_bias, -__builtin_inff(), kRepeatFloats);
                 asc_set_vector_mask(UINT64_MAX, UINT64_MAX);
             };
-            {
-                set_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
-                wait_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
-            }
+            native_device::pipe_fence<PIPE_V, PIPE_MTE2, VectorEvents::raw_free>();
             asc_copy_gm2ub_align(bias, gm<float>(base), 2, b * uint32_t(sizeof(float)), 0, 0, 0, 0);
             asc_copy_gm2ub_align(matrix_bias, (gm<float>(base) + (2 * b)), uint16_t(b),
                                  b * uint32_t(sizeof(float)), 0, 0, 0, 0);
-            {
-                set_flag(PIPE_MTE2, PIPE_V, ::event_t(VectorEvents::loaded));
-                wait_flag(PIPE_MTE2, PIPE_V, ::event_t(VectorEvents::loaded));
-            }
+            native_device::pipe_fence<PIPE_MTE2, PIPE_V, VectorEvents::loaded>();
             uint64_t inactive[2] = {~live_mask, 0};
             {
                 asc_set_vector_mask(inactive[1], inactive[0]);
@@ -130,10 +116,7 @@ __aicore__ inline void compute_statistics(GM_ADDR projection, GM_ADDR squares, G
 #pragma unroll
             for (uint32_t lane = 0; lane < kBlockFloats; ++lane)
                 lane_index[lane] = int32_t(lane * sizeof(float));
-            {
-                set_flag(PIPE_S, PIPE_V, ::event_t(VectorEvents::scalar_write));
-                wait_flag(PIPE_S, PIPE_V, ::event_t(VectorEvents::scalar_write));
-            }
+            native_device::pipe_fence<PIPE_S, PIPE_V, VectorEvents::scalar_write>();
             {
                 asc_duplicate(gate_index, uint32_t(0), round_up(2 * r * lanes, kRepeatFloats));
                 asc_set_vector_mask(UINT64_MAX, UINT64_MAX);
@@ -206,16 +189,10 @@ __aicore__ inline void compute_statistics(GM_ADDR projection, GM_ADDR squares, G
         }
         constants.resident = true;
     }
-    {
-        set_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
-        wait_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
-    }
+    native_device::pipe_fence<PIPE_V, PIPE_MTE2, VectorEvents::raw_free>();
     asc_copy_gm2ub_align(a, (projected + (first * p.projection_stride)), 1,
                          r * p.projection_stride * sizeof(*(a)), 0, 0, 0, 0);
-    {
-        set_flag(PIPE_MTE2, PIPE_V, ::event_t(VectorEvents::loaded));
-        wait_flag(PIPE_MTE2, PIPE_V, ::event_t(VectorEvents::loaded));
-    }
+    native_device::pipe_fence<PIPE_MTE2, PIPE_V, VectorEvents::loaded>();
     // Fixed storage capacity with constant lane indices keeps the live
     // square sums in Scalar registers. R itself remains a runtime extent.
     float sums[kStatsRowCapacity];
@@ -233,17 +210,11 @@ __aicore__ inline void compute_statistics(GM_ADDR projection, GM_ADDR squares, G
         ((simple_span ? merge_elements : kRepeatFloats) + kRepeatFloats - 1) / kRepeatFloats;
     asc_set_vector_mask(0, merge_mask);
     for (uint32_t split = 1; split < p.splits; ++split) {
-        {
-            set_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
-            wait_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
-        }
+        native_device::pipe_fence<PIPE_V, PIPE_MTE2, VectorEvents::raw_free>();
         asc_copy_gm2ub_align(
             other, (projected + ((uint64_t(split) * padded_rows + first) * p.projection_stride)),
             1, r * p.projection_stride * sizeof(*(other)), 0, 0, 0, 0);
-        {
-            set_flag(PIPE_MTE2, PIPE_V, ::event_t(VectorEvents::loaded));
-            wait_flag(PIPE_MTE2, PIPE_V, ::event_t(VectorEvents::loaded));
-        }
+        native_device::pipe_fence<PIPE_MTE2, PIPE_V, VectorEvents::loaded>();
         if (simple_span)
             asc_add(a, a, other, merge_repeats, 1, 1, 1, kRepeatBlocks, kRepeatBlocks,
                     kRepeatBlocks);
@@ -257,18 +228,12 @@ __aicore__ inline void compute_statistics(GM_ADDR projection, GM_ADDR squares, G
             if (row < r)
                 sums[row] += squared[uint64_t(split) * padded_rows + first + row];
     }
-    {
-        set_flag(PIPE_V, PIPE_S, ::event_t(VectorEvents::scalar_read));
-        wait_flag(PIPE_V, PIPE_S, ::event_t(VectorEvents::scalar_read));
-    }
+    native_device::pipe_fence<PIPE_V, PIPE_S, VectorEvents::scalar_read>();
 #pragma unroll
     for (uint32_t row = 0; row < kStatsRowCapacity; ++row)
         if (row < r)
             stat[row] = sums[row] * p.inverse_input_width + epsilon;
-    {
-        set_flag(PIPE_S, PIPE_V, ::event_t(VectorEvents::scalar_write));
-        wait_flag(PIPE_S, PIPE_V, ::event_t(VectorEvents::scalar_write));
-    }
+    native_device::pipe_fence<PIPE_S, PIPE_V, VectorEvents::scalar_write>();
     const uint32_t row_elements = r;
     const uint64_t row_mask =
         row_elements >= kRepeatFloats ? UINT64_MAX : (uint64_t(1) << row_elements) - 1;
@@ -448,10 +413,7 @@ __aicore__ inline void compute_statistics(GM_ADDR projection, GM_ADDR squares, G
     }
     const uint32_t valid = rows - first < r ? rows - first : r;
     if (publish) {
-        {
-            set_flag(PIPE_V, PIPE_MTE3, ::event_t(VectorEvents::store_ready));
-            wait_flag(PIPE_V, PIPE_MTE3, ::event_t(VectorEvents::store_ready));
-        }
+        native_device::pipe_fence<PIPE_V, PIPE_MTE3, VectorEvents::store_ready>();
         asc_copy_ub2gm_align((gm<float>(pre) + (first * b)), gate, uint16_t(valid),
                              b * uint32_t(sizeof(float)), 0, 0, 0, 0);
         asc_copy_ub2gm_align((gm<float>(post) + (first * b)), (gate + (r * lanes)), uint16_t(valid),
@@ -461,18 +423,12 @@ __aicore__ inline void compute_statistics(GM_ADDR projection, GM_ADDR squares, G
                                  (matrix + (source * r * lanes)), uint16_t(valid),
                                  b * uint32_t(sizeof(float)), 0, 0, 0,
                                  (b * b - b) * uint32_t(sizeof(float)));
-        {
-            set_flag(PIPE_MTE3, PIPE_V, ::event_t(VectorEvents::stored));
-            wait_flag(PIPE_MTE3, PIPE_V, ::event_t(VectorEvents::stored));
-        }
+        native_device::pipe_fence<PIPE_MTE3, PIPE_V, VectorEvents::stored>();
     }
 #if defined(MHC_STATS_POST)
     // The fused post stage reads matrix/gate directly from this disjoint
     // resident arena. Publish only the Vector -> Scalar dependency.
-    {
-        set_flag(PIPE_V, PIPE_S, ::event_t(VectorEvents::scalar_read));
-        wait_flag(PIPE_V, PIPE_S, ::event_t(VectorEvents::scalar_read));
-    }
+    native_device::pipe_fence<PIPE_V, PIPE_S, VectorEvents::scalar_read>();
 #endif
 }
 } // namespace mhc

@@ -58,7 +58,11 @@
       "backend": "jit"
     },
     {
-      "name": "mxfp4_a8",
+      "name": "h32_quant",
+      "backend": "jit"
+    },
+    {
+      "name": "int4_g32_a8",
       "backend": "jit"
     },
     {

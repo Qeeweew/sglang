@@ -42,8 +42,6 @@ inline constexpr uint32_t kDefaultTopk = 512;
 inline constexpr uint32_t kSourceCandidates = 1;
 inline constexpr uint32_t kConsumerCandidates = 2;
 inline constexpr uint32_t kNoCandidates = 3;
-// CANN adv_api/detail/matmul/stage/compute/mmad_compute.h arch2201 contract.
-inline constexpr uint32_t kUnfencedMmadFractals = 10;
 QLI_HOST_DEVICE constexpr uint64_t align32(uint64_t value) {
     return (value + kSortRun - 1) / kSortRun * kSortRun;
 }

@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch_npu  # noqa: F401
 
-from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import mxfp4_a8
+from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import int4_g32_a8
 from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.quant_grouped_gemm import (
     NativeGroupedGemm,
 )
@@ -137,20 +137,19 @@ def measure(args, projection, tokens, weights, rng, cases):
         next(iter(fixed.values())),
     ).clone()
     mx = NativeGroupedGemm(depth, width, experts=EXPERTS)
-    scratch = codes.new_empty(load_library().mxfp4_a8_scratch(depth, width, 0))
+    scratch = codes.new_empty(load_library().int4_g32_a8_scratch(depth, width, 0))
     output = torch.empty(
         (capacity, width), device="npu", dtype=getattr(torch, args.g32_dtype)
     )
     mx_output = torch.empty_like(output, dtype=torch.float16)
     grouped = [
-        mxfp4_a8.bind(
+        int4_g32_a8.bind(
             activation,
             (codes, factors, channel),
             units,
             record,
             out=output,
             workspace=scratch,
-            g32=True,
         )
         for record in routing.unbind()
     ]

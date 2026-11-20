@@ -1,4 +1,6 @@
 #pragma once
+#include <common/cube.h>
+#include <common/device.h>
 #include <mhc/vector_pipeline.h>
 namespace mhc {
 // Two-slot GM ring between an AIC and its two AIVs. Mode2 combines the two
@@ -53,8 +55,7 @@ class CubeProject {
         set_fmatrix(uint64_t(p_.tile_rows) | (uint64_t(1) << 16));
         // SDK HardEvent has no S_MTE1; this exact matrix-state publication is
         // the only scalar-pipe intrinsic used by this component.
-        set_flag(PIPE_S, PIPE_MTE1, ::event_t(kStatePublished));
-        wait_flag(PIPE_S, PIPE_MTE1, ::event_t(kStatePublished));
+        native_device::pipe_fence<PIPE_S, PIPE_MTE1, kStatePublished>();
     }
     __aicore__ void run(GM_ADDR fn, GM_ADDR inputs, GM_ADDR products, uint32_t group, uint64_t rows) {
         const uint32_t row_tiles = (rows + p_.tile_rows - 1) / p_.tile_rows;
@@ -79,8 +80,7 @@ class CubeProject {
             asc_copy_gm2l1_nd2nz(weight_l1(), f + panel * p_.panel_k, 1,
                                  uint16_t(p_.projection_columns), uint16_t(valid), 0,
                                  uint16_t(p_.input_width), uint16_t(p_.projection_stride), 1, 0);
-            set_flag(PIPE_MTE2, PIPE_MTE1, ::event_t(fnready_));
-            wait_flag(PIPE_MTE2, PIPE_MTE1, ::event_t(fnready_));
+            native_device::pipe_fence<PIPE_MTE2, PIPE_MTE1, fnready_>();
             for (uint32_t task = 0; task < tasks; ++task) {
                 const uint32_t ring_slot = task % kSlots;
                 CrossCoreWaitFlag<2, PIPE_MTE2>(InputReady + ring_slot);
@@ -121,21 +121,16 @@ class CubeProject {
                                 uint8_t(p_.projection_stride * kMmadK /
                                         (kMatrixRows * kBlockFloats)),
                                 1, 0);
-                            set_flag(PIPE_MTE1, PIPE_M, ::event_t(kOperandReadyBase + os));
-                            wait_flag(PIPE_MTE1, PIPE_M, ::event_t(kOperandReadyBase + os));
-                            asc_mmad(accumulator_l0c(), activation_l0a(os), weight_l0b(os),
-                                     p_.tile_rows, kMmadK, p_.projection_stride, 0, false, false,
-                                     part == 0 && chunk == 0);
-                            if (p_.tile_rows / kMatrixRows * (p_.projection_stride / kMatrixRows) <
-                                10)
-                                pipe_barrier(PIPE_M);
+                            native_device::pipe_fence<PIPE_MTE1, PIPE_M>(kOperandReadyBase + os);
+                            native_device::mmad(accumulator_l0c(), activation_l0a(os),
+                                                weight_l0b(os), p_.tile_rows, kMmadK,
+                                                p_.projection_stride, 0, part == 0 && chunk == 0);
                             set_flag(PIPE_M, PIPE_MTE1, ::event_t(kOperandCreditBase + os));
                         }
                         set_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(kL1CreditBase + slot));
                     }
                 }
-                set_flag(PIPE_M, PIPE_FIX, ::event_t(product_));
-                wait_flag(PIPE_M, PIPE_FIX, ::event_t(product_));
+                native_device::pipe_fence<PIPE_M, PIPE_FIX, product_>();
                 if (task >= kSlots)
                     CrossCoreWaitFlag<2, PIPE_FIX>(ProductFree + ring_slot);
                 // SDK v220 row-major export owns this ND-state write and FIX barrier.
@@ -149,22 +144,17 @@ class CubeProject {
                 set_flag(PIPE_FIX, PIPE_M, ::event_t(accumulator_));
                 CrossCoreSetFlag<2, PIPE_FIX>(ProductReady + ring_slot);
             }
-            set_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(fnfree_));
-            wait_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(fnfree_));
+            native_device::pipe_fence<PIPE_MTE1, PIPE_MTE2, fnfree_>();
         }
         wait_flag(PIPE_FIX, PIPE_M, ::event_t(accumulator_));
         for (uint32_t slot = 0; slot < kSlots; ++slot) {
             wait_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(kL1CreditBase + slot));
             wait_flag(PIPE_M, PIPE_MTE1, ::event_t(kOperandCreditBase + slot));
         }
-        set_flag(PIPE_MTE2, PIPE_S, ::event_t(kGmLoadsDrained));
-        wait_flag(PIPE_MTE2, PIPE_S, ::event_t(kGmLoadsDrained));
-        set_flag(PIPE_MTE1, PIPE_S, ::event_t(kL1ReadsDrained));
-        wait_flag(PIPE_MTE1, PIPE_S, ::event_t(kL1ReadsDrained));
-        set_flag(PIPE_M, PIPE_S, ::event_t(kMmadDrained));
-        wait_flag(PIPE_M, PIPE_S, ::event_t(kMmadDrained));
-        set_flag(PIPE_FIX, PIPE_S, ::event_t(kFixWritesDrained));
-        wait_flag(PIPE_FIX, PIPE_S, ::event_t(kFixWritesDrained));
+        native_device::pipe_fence<PIPE_MTE2, PIPE_S, kGmLoadsDrained>();
+        native_device::pipe_fence<PIPE_MTE1, PIPE_S, kL1ReadsDrained>();
+        native_device::pipe_fence<PIPE_M, PIPE_S, kMmadDrained>();
+        native_device::pipe_fence<PIPE_FIX, PIPE_S, kFixWritesDrained>();
     }
 };
 __aicore__ inline void project_vector(GM_ADDR residual, GM_ADDR projection, GM_ADDR squares,
@@ -179,12 +169,12 @@ __aicore__ inline void project_vector(GM_ADDR residual, GM_ADDR projection, GM_A
     const uint32_t half = p.tile_rows / 2, k = p.panel_k, n = p.projection_stride;
     const ProjectionVectorLayout layout(p.tile_rows, k, n);
     const uint32_t vr = layout.rows;
-    auto raw = ub<bfloat16_t>(layout.raw);
-    auto value = ub<float>(layout.value), squared = ub<float>(layout.squared);
-    auto scratch = ub<float>(layout.scratch);
-    auto sums = ub<float>(layout.sums);
-    auto acc = ub<float>(layout.accumulator), product = ub<float>(layout.product);
-    auto stat = ub<float>(layout.stat);
+    auto raw = ub_ptr<bfloat16_t>(layout.raw);
+    auto value = ub_ptr<float>(layout.value), squared = ub_ptr<float>(layout.squared);
+    auto scratch = ub_ptr<float>(layout.scratch);
+    auto sums = ub_ptr<float>(layout.sums);
+    auto acc = ub_ptr<float>(layout.accumulator), product = ub_ptr<float>(layout.product);
+    auto stat = ub_ptr<float>(layout.stat);
     auto r = gm<bfloat16_t>(residual);
     auto proj = gm<float>(projection), sq = gm<float>(squares), in = gm<float>(inputs),
          out = gm<float>(products);
@@ -198,10 +188,7 @@ __aicore__ inline void project_vector(GM_ADDR residual, GM_ADDR projection, GM_A
                 const uint32_t task = step - kSlots, slot = task % kSlots;
                 const uint64_t row = uint64_t(rg + task * p.row_groups) * p.tile_rows + lane * half;
                 CrossCoreWaitFlag<2, PIPE_MTE2>(ProductReady + slot);
-                {
-                    set_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
-                    wait_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
-                }
+                native_device::pipe_fence<PIPE_V, PIPE_MTE2, VectorEvents::raw_free>();
                 asc_copy_gm2ub_align(
                     product,
                     (out + ((uint64_t(group) * kSlots + slot) * p.tile_rows * n + lane * half * n)),
@@ -216,10 +203,7 @@ __aicore__ inline void project_vector(GM_ADDR residual, GM_ADDR projection, GM_A
                     asc_copy_gm2ub_align(acc,
                                          (proj + ((uint64_t(split) * padded_rows + row) * n)), 1,
                                          half * n * sizeof(*(acc)), 0, 0, 0, 0);
-                {
-                    set_flag(PIPE_MTE2, PIPE_V, ::event_t(VectorEvents::loaded));
-                    wait_flag(PIPE_MTE2, PIPE_V, ::event_t(VectorEvents::loaded));
-                }
+                native_device::pipe_fence<PIPE_MTE2, PIPE_V, VectorEvents::loaded>();
                 if (task + kSlots < tasks)
                     CrossCoreSetFlag<2, PIPE_MTE2>(ProductFree + slot);
                 {
@@ -227,16 +211,10 @@ __aicore__ inline void project_vector(GM_ADDR residual, GM_ADDR projection, GM_A
                     asc_set_vector_mask(UINT64_MAX, UINT64_MAX);
                 };
                 pipe_barrier(PIPE_V);
-                {
-                    set_flag(PIPE_V, PIPE_MTE3, ::event_t(VectorEvents::store_ready));
-                    wait_flag(PIPE_V, PIPE_MTE3, ::event_t(VectorEvents::store_ready));
-                }
+                native_device::pipe_fence<PIPE_V, PIPE_MTE3, VectorEvents::store_ready>();
                 asc_copy_ub2gm_align((proj + ((uint64_t(split) * padded_rows + row) * n)), acc, 1,
                                      half * n * sizeof(*(acc)), 0, 0, 0, 0);
-                {
-                    set_flag(PIPE_MTE3, PIPE_V, ::event_t(VectorEvents::stored));
-                    wait_flag(PIPE_MTE3, PIPE_V, ::event_t(VectorEvents::stored));
-                }
+                native_device::pipe_fence<PIPE_MTE3, PIPE_V, VectorEvents::stored>();
             }
             if (step < tasks) {
                 const uint32_t slot = step % kSlots;
@@ -250,16 +228,10 @@ __aicore__ inline void project_vector(GM_ADDR residual, GM_ADDR projection, GM_A
                     };
                     pipe_barrier(PIPE_V);
                 } else {
-                    {
-                        set_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
-                        wait_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
-                    }
+                    native_device::pipe_fence<PIPE_V, PIPE_MTE2, VectorEvents::raw_free>();
                     asc_copy_gm2ub_align(sums, (sq + (uint64_t(split) * padded_rows + row)), 1,
                                          half * sizeof(*(sums)), 0, 0, 0, 0);
-                    {
-                        set_flag(PIPE_MTE2, PIPE_V, ::event_t(VectorEvents::loaded));
-                        wait_flag(PIPE_MTE2, PIPE_V, ::event_t(VectorEvents::loaded));
-                    }
+                    native_device::pipe_fence<PIPE_MTE2, PIPE_V, VectorEvents::loaded>();
                 }
                 for (uint32_t first = 0; first < half; first += vr) {
                     const uint64_t token = row + first;
@@ -268,8 +240,7 @@ __aicore__ inline void project_vector(GM_ADDR residual, GM_ADDR projection, GM_A
                     if (first)
                         wait_flag(PIPE_V, PIPE_MTE2, ::event_t(ev.raw_reuse[0]));
                     else {
-                        set_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
-                        wait_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
+                        native_device::pipe_fence<PIPE_V, PIPE_MTE2, VectorEvents::raw_free>();
                     }
                     if (valid_rows < vr || valid_k < k) {
                         {
@@ -278,10 +249,7 @@ __aicore__ inline void project_vector(GM_ADDR residual, GM_ADDR projection, GM_A
                             asc_set_vector_mask(UINT64_MAX, UINT64_MAX);
                         };
                         pipe_barrier(PIPE_V);
-                        {
-                            set_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
-                            wait_flag(PIPE_V, PIPE_MTE2, ::event_t(VectorEvents::raw_free));
-                        }
+                        native_device::pipe_fence<PIPE_V, PIPE_MTE2, VectorEvents::raw_free>();
                     }
                     if (valid_rows)
                         asc_copy_gm2ub(
@@ -289,10 +257,7 @@ __aicore__ inline void project_vector(GM_ADDR residual, GM_ADDR projection, GM_A
                             uint16_t(valid_k * kBf16Bytes / kDataBlockBytes),
                             uint16_t((p.input_width - valid_k) * kBf16Bytes / kDataBlockBytes),
                             uint16_t((k - valid_k) * kBf16Bytes / kDataBlockBytes));
-                    {
-                        set_flag(PIPE_MTE2, PIPE_V, ::event_t(VectorEvents::loaded));
-                        wait_flag(PIPE_MTE2, PIPE_V, ::event_t(VectorEvents::loaded));
-                    }
+                    native_device::pipe_fence<PIPE_MTE2, PIPE_V, VectorEvents::loaded>();
                     if (first)
                         wait_flag(PIPE_MTE3, PIPE_V, ::event_t(ev.packed_reuse[0]));
                     {
@@ -302,10 +267,7 @@ __aicore__ inline void project_vector(GM_ADDR residual, GM_ADDR projection, GM_A
                     if (first + vr < half)
                         set_flag(PIPE_V, PIPE_MTE2, ::event_t(ev.raw_reuse[0]));
                     pipe_barrier(PIPE_V);
-                    {
-                        set_flag(PIPE_V, PIPE_MTE3, ::event_t(VectorEvents::store_ready));
-                        wait_flag(PIPE_V, PIPE_MTE3, ::event_t(VectorEvents::store_ready));
-                    }
+                    native_device::pipe_fence<PIPE_V, PIPE_MTE3, VectorEvents::store_ready>();
                     asc_copy_ub2gm_align(
                         (in + ((uint64_t(group) * kSlots + slot) * p.tile_rows * k +
                                (lane * half + first) * k)),
@@ -326,26 +288,17 @@ __aicore__ inline void project_vector(GM_ADDR residual, GM_ADDR projection, GM_A
                     };
                     pipe_barrier(PIPE_V);
                 }
-                {
-                    set_flag(PIPE_V, PIPE_MTE3, ::event_t(VectorEvents::store_ready));
-                    wait_flag(PIPE_V, PIPE_MTE3, ::event_t(VectorEvents::store_ready));
-                }
+                native_device::pipe_fence<PIPE_V, PIPE_MTE3, VectorEvents::store_ready>();
                 asc_copy_ub2gm_align((sq + (uint64_t(split) * padded_rows + row)), sums, 1,
                                      half * sizeof(*(sums)), 0, 0, 0, 0);
-                {
-                    set_flag(PIPE_MTE3, PIPE_V, ::event_t(VectorEvents::stored));
-                    wait_flag(PIPE_MTE3, PIPE_V, ::event_t(VectorEvents::stored));
-                }
+                native_device::pipe_fence<PIPE_MTE3, PIPE_V, VectorEvents::stored>();
             }
         }
     }
     {
-        set_flag(PIPE_MTE2, PIPE_S, ::event_t(VectorEvents::load_drained));
-        wait_flag(PIPE_MTE2, PIPE_S, ::event_t(VectorEvents::load_drained));
-        set_flag(PIPE_MTE3, PIPE_S, ::event_t(VectorEvents::store_drained));
-        wait_flag(PIPE_MTE3, PIPE_S, ::event_t(VectorEvents::store_drained));
-        set_flag(PIPE_V, PIPE_S, ::event_t(VectorEvents::scalar_read));
-        wait_flag(PIPE_V, PIPE_S, ::event_t(VectorEvents::scalar_read));
+        native_device::pipe_fence<PIPE_MTE2, PIPE_S, VectorEvents::load_drained>();
+        native_device::pipe_fence<PIPE_MTE3, PIPE_S, VectorEvents::store_drained>();
+        native_device::pipe_fence<PIPE_V, PIPE_S, VectorEvents::scalar_read>();
     }
 }
 } // namespace mhc

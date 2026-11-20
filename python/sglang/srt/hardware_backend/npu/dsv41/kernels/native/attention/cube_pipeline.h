@@ -1,4 +1,6 @@
 #pragma once
+#include <common/cube.h>
+#include <common/device.h>
 #include <kernel_operator.h>
 #include <c_api/asc_simd.h>
 #include <type_traits>
@@ -135,24 +137,19 @@ class CubePipeline {
         // The first task has no earlier L1 reader. Later tasks retire the
         // previous PV import before the Q/P arena is overwritten.
         if (task) {
-            set_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(kImmediateEvent));
+            native_device::pipe_fence<PIPE_MTE1, PIPE_MTE2, kImmediateEvent>();
         }
         asc_copy_gm2l1_nd2nz(
             l1_pointer(0), (gm_pointer<BF16>(sources_.q) + (int64_t(token) * kHeads * kWidth)), 1,
             uint16_t(kHeads), uint16_t(kWidth), 0, uint16_t(kWidth), uint16_t(kTileRows), 1, 0);
-        {
-            set_flag(PIPE_MTE2, PIPE_MTE1, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_MTE2, PIPE_MTE1, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_MTE2, PIPE_MTE1, kImmediateEvent>();
         const int32_t query_parts = (kWidth + kDotRows - 1) / kDotRows;
 #pragma unroll
         for (int32_t part = 0; part < kWidthCapacity / kDotRows; ++part) {
             if (part >= query_parts)
                 continue;
             if (!part && task) {
-                set_flag(PIPE_M, PIPE_MTE1, ::event_t(kQueryReuseEvent));
-                wait_flag(PIPE_M, PIPE_MTE1, ::event_t(kQueryReuseEvent));
+                native_device::pipe_fence<PIPE_M, PIPE_MTE1, kQueryReuseEvent>();
             }
             load_left(l0a_pointer(part * kTileRows * kDotRows * sizeof(BF16)),
                       l1_pointer(part * kTileRows * kDotRows * sizeof(BF16)),
@@ -189,26 +186,17 @@ class CubePipeline {
                     asc_copy_l12l0b(l0b_pointer(part),
                                     (planes[panel] + (part * kDotRows * kDotRows)), 0,
                                     uint8_t(kDotRows * depth / kMatrixFractalElements), 1, 0);
-                    {
-                        set_flag(PIPE_MTE1, PIPE_M, ::event_t(kImmediateEvent));
-                        wait_flag(PIPE_MTE1, PIPE_M, ::event_t(kImmediateEvent));
-                    }
+                    native_device::pipe_fence<PIPE_MTE1, PIPE_M, kImmediateEvent>();
                     if (!panel && !part && tile >= 2)
                         wait_flag(PIPE_FIX, PIPE_M, ::event_t((tile % 2) + 6));
-                    asc_mmad(l0c_pointer(tile % 2),
-                             l0a_pointer((panel * 2 + part) * kTileRows * kDotRows * sizeof(BF16)),
-                             l0b_pointer(part), uint16_t(kTileRows), uint16_t(depth), kDotRows, 0,
-                             false, false, !panel && !part);
-                    if (kTileRows / kMatrixFractalRows * (kDotRows / kMatrixFractalRows) <
-                        kUnfencedMmadFractals)
-                        pipe_barrier(PIPE_M);
+                    native_device::mmad(
+                        l0c_pointer(tile % 2),
+                        l0a_pointer((panel * 2 + part) * kTileRows * kDotRows * sizeof(BF16)),
+                        l0b_pointer(part), kTileRows, depth, kDotRows, 0, !panel && !part);
                     set_flag(PIPE_M, PIPE_MTE1, ::event_t(kB0ReuseEventBase + part));
                 }
             }
-            {
-                set_flag(PIPE_M, PIPE_FIX, ::event_t(kImmediateEvent));
-                wait_flag(PIPE_M, PIPE_FIX, ::event_t(kImmediateEvent));
-            }
+            native_device::pipe_fence<PIPE_M, PIPE_FIX, kImmediateEvent>();
             store_matrix((workspace_.scores(task) + (tile * kDotRows)), l0c_pointer(tile % 2),
                          kDotRows, kCapacity);
             set_flag(PIPE_FIX, PIPE_M, ::event_t((tile % 2) + 6));
@@ -217,8 +205,7 @@ class CubePipeline {
             // At the final tile, ScoreReady -> P publication -> ProbabilityReady
             // completes the readers before PV imports P into the Q/P arena.
             if (tile >= 2 && tile + 1 < kCapacity / kDotRows) {
-                set_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(kImmediateEvent));
-                wait_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(kImmediateEvent));
+                native_device::pipe_fence<PIPE_MTE1, PIPE_MTE2, kImmediateEvent>();
             }
         }
         CrossCoreSetFlag<2, PIPE_FIX>(ScoreReady);
@@ -238,10 +225,7 @@ class CubePipeline {
             wait_flag(PIPE_FIX, PIPE_M, ::event_t((tile % 2) + 6));
         asc_copy_gm2l1_nd2nz(l1_pointer(0), workspace_.probabilities(task), 1, uint16_t(kHeads),
                              uint16_t(cached), 0, uint16_t(kCapacity), uint16_t(kTileRows), 1, 0);
-        {
-            set_flag(PIPE_MTE2, PIPE_MTE1, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_MTE2, PIPE_MTE1, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_MTE2, PIPE_MTE1, kImmediateEvent>();
         for (int32_t column = 0; column < kWidth; column += kFeaturePanelColumns) {
             const int32_t parts = min(2, (kWidth - column + kDotRows - 1) / kDotRows);
             for (int32_t step = 0; step <= tiles; ++step) {
@@ -292,25 +276,16 @@ class CubePipeline {
                             features);
                         if (part + 1 == parts && tile >= 2)
                             set_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(slot + 1));
-                        {
-                            set_flag(PIPE_MTE1, PIPE_M, ::event_t(kImmediateEvent));
-                            wait_flag(PIPE_MTE1, PIPE_M, ::event_t(kImmediateEvent));
-                        }
-                        asc_mmad(l0c_pointer(part), a, l0b_pointer(part), uint16_t(kTileRows),
-                                 kDotRows, uint16_t(features), 0, false, false, tile == 0);
-                        if (kTileRows / kMatrixFractalRows * (features / kMatrixFractalRows) <
-                            kUnfencedMmadFractals)
-                            pipe_barrier(PIPE_M);
+                        native_device::pipe_fence<PIPE_MTE1, PIPE_M, kImmediateEvent>();
+                        native_device::mmad(l0c_pointer(part), a, l0b_pointer(part), kTileRows,
+                                            kDotRows, features, 0, tile == 0);
                         set_flag(PIPE_M, PIPE_MTE1, ::event_t(kB0ReuseEventBase + part));
                     }
                 }
             }
             for (int32_t slot = max(2, tiles - 2); slot < tiles; ++slot)
                 wait_flag(PIPE_MTE1, PIPE_MTE2, ::event_t((slot % 2) + 1));
-            {
-                set_flag(PIPE_M, PIPE_FIX, ::event_t(kImmediateEvent));
-                wait_flag(PIPE_M, PIPE_FIX, ::event_t(kImmediateEvent));
-            }
+            native_device::pipe_fence<PIPE_M, PIPE_FIX, kImmediateEvent>();
             if constexpr (kSparse)
                 store_matrix((workspace_.products(task) + (column)), l0c_pointer(0),
                              min(kFeaturePanelColumns, kWidth - column), kWidth);
@@ -318,10 +293,7 @@ class CubePipeline {
                 store_matrix(
                     (gm_pointer<BF16>(sources_.out) + (int64_t(token) * kHeads * kWidth + column)),
                     l0c_pointer(0), min(kFeaturePanelColumns, kWidth - column), kWidth);
-            {
-                set_flag(PIPE_FIX, PIPE_M, ::event_t(kImmediateEvent));
-                wait_flag(PIPE_FIX, PIPE_M, ::event_t(kImmediateEvent));
-            }
+            native_device::pipe_fence<PIPE_FIX, PIPE_M, kImmediateEvent>();
         }
         if constexpr (kSparse)
             CrossCoreSetFlag<2, PIPE_FIX>(ProductReady);
@@ -337,10 +309,7 @@ class CubePipeline {
     }
     __aicore__ __attribute__((always_inline)) void run() {
         asc_set_l0c_copy_params(1, 0, 0);
-        {
-            set_flag(PIPE_S, PIPE_FIX, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_S, PIPE_FIX, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_S, PIPE_FIX, kImmediateEvent>();
         // Entry InitSocState owns zero PADDING/L1_3D_SIZE on arch2201.
         // No stage changes them; FMATRIX and L3D_RPT still need setup here.
         set_l3d_rpt(uint64_t(1) << 16);
@@ -348,10 +317,7 @@ class CubePipeline {
         // operand is one spatial row, matching rows | (1 << 16).
         set_fmatrix(uint64_t(kTileRows) | (uint64_t(1) << 16));
         set_fmatrix_b(uint64_t(kDotRows) | (uint64_t(1) << 16));
-        {
-            set_flag(PIPE_S, PIPE_MTE1, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_S, PIPE_MTE1, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_S, PIPE_MTE1, kImmediateEvent>();
         // Only the direct window needs padding initialization. Sparse selected
         // panels are fully replaced by gather; window/draft need at most two.
         const int32_t resident_rows = kSparse ? kDotRows : min(int32_t(kCapacity), 2 * kDotRows);
@@ -408,20 +374,13 @@ class CubePipeline {
         // MTE2. Retire those Wait instructions themselves, even after their
         // MTE1 producers and the final matrix export have completed.
         if (kCapacity > 2 * kDotRows) {
-            set_flag(PIPE_MTE2, PIPE_S, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_MTE2, PIPE_S, ::event_t(kImmediateEvent));
+            native_device::pipe_fence<PIPE_MTE2, PIPE_S, kImmediateEvent>();
         }
         // Consume the two L0B credits on MTE1 before returning. The final PV
         // export already retired all operand imports through MTE1->M and
         // M->FIX; its FIX->M wait makes the M drain cover that export too.
-        {
-            set_flag(PIPE_MTE1, PIPE_S, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_MTE1, PIPE_S, ::event_t(kImmediateEvent));
-        }
-        {
-            set_flag(PIPE_M, PIPE_S, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_M, PIPE_S, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_MTE1, PIPE_S, kImmediateEvent>();
+        native_device::pipe_fence<PIPE_M, PIPE_S, kImmediateEvent>();
     }
 };
 } // namespace attention

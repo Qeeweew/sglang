@@ -1,9 +1,11 @@
 #pragma once
+#include <common/device.h>
 #include <kernel_operator.h>
 #include <c_api/asc_simd.h>
 #include <qli/layout.h>
 
 namespace qli {
+using native_device::ub_ptr;
 using namespace AscendC;
 inline constexpr uint32_t kImmediateEvent = 0;
 
@@ -101,9 +103,6 @@ static_assert(kMatrixRows * kKeyRows * sizeof(int32_t) <= arch2201::kL0CBytes / 
 
 template <class T> __aicore__ inline __gm__ T *gm_pointer(uintptr_t address) {
     return reinterpret_cast<__gm__ T *>(address);
-}
-template <class T> __aicore__ inline __ubuf__ T *ub_pointer(uint32_t offset) {
-    return reinterpret_cast<__ubuf__ T *>(uint64_t(offset));
 }
 template <class T> __aicore__ inline __cbuf__ T *l1_pointer(uint32_t offset) {
     return reinterpret_cast<__cbuf__ T *>(uint64_t(offset));

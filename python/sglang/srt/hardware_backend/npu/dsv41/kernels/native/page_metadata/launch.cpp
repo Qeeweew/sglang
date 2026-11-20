@@ -1,8 +1,7 @@
 #include "launch.h"
-#include "jit.h"
+#include "actual_entry.h"
 #include <algorithm>
 #include <array>
-#include <map>
 #include <memory>
 #include <torch/library.h>
 namespace {
@@ -10,13 +9,8 @@ namespace {
 // Proposal block is stable geometry; request batch and prefixes are runtime.
 using MetadataKey = std::array<int64_t, 7>;
 native_jit::Kernel &entry(const MetadataKey &key) {
-    static thread_local std::map<MetadataKey, std::unique_ptr<native_jit::Kernel>> cache;
-    static thread_local MetadataKey last_key{};
-    static thread_local native_jit::Kernel *last = nullptr;
-    if (last && last_key == key)
-        return *last;
-    auto &result = cache[key];
-    if (!result) {
+    static thread_local native_jit::KernelCache<MetadataKey> entries;
+    return entries.get(key, [&] {
         const std::vector<std::string> flags{
             "--cce-auto-sync=off",
             "-DPAGE_METADATA_REQUEST_ROWS=" + std::to_string(key[0]),
@@ -26,12 +20,9 @@ native_jit::Kernel &entry(const MetadataKey &key) {
             "-DPAGE_METADATA_WINDOW_ROWS=" + std::to_string(key[4]),
             "-DPAGE_METADATA_WORKERS=" + std::to_string(key[5]),
             "-DPAGE_METADATA_BLOCK=" + std::to_string(key[6])};
-        result = std::make_unique<native_jit::Kernel>(
+        return std::make_unique<native_jit::Kernel>(
             "draft_page_metadata", "page_metadata/page_metadata.asc", flags, uint32_t(key[5]));
-    }
-    last_key = key;
-    last = result.get();
-    return *result;
+    });
 }
 } // namespace
 extern "C" void

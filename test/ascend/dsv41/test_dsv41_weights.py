@@ -194,7 +194,6 @@ class LinearPolicyTest(unittest.TestCase):
     def test_g32_checkpoint_selects_only_target_experts(self):
         from types import SimpleNamespace
 
-        from sglang.srt.environ import envs
         from sglang.srt.hardware_backend.npu.dsv41.dense_weights import (
             adapt_get_config,
             adapt_get_method,
@@ -215,10 +214,7 @@ class LinearPolicyTest(unittest.TestCase):
         hf = SimpleNamespace(
             model_type="deepseek_v41", dsv41_target_moe_format="quarot_h32_int4_g32_v1"
         )
-        with (
-            patch.dict(os.environ, SGLANG_DSV41_910B="1"),
-            envs.SGLANG_OPT_DSV41_NPU_TARGET_MOE_A8.override(False),
-        ):
+        with patch.dict(os.environ, SGLANG_DSV41_910B="1"):
             resolve = adapt_get_config(quant_config)
             method = adapt_get_method(lambda *args: None)
             for draft in (False, True):
@@ -241,12 +237,11 @@ class LinearPolicyTest(unittest.TestCase):
                     W8A16LinearMethod,
                 )
                 resident = method(cfg, FusedMoE.__new__(FusedMoE), "experts")
-                self.assertEqual((resident.a8, resident.g32), (not draft, not draft))
+                self.assertEqual(resident.g32, not draft)
 
-    def test_a8_is_opt_in_and_target_only(self):
+    def test_source_checkpoint_selects_mxfp4_for_target_and_draft(self):
         from types import SimpleNamespace
 
-        from sglang.srt.environ import envs
         from sglang.srt.hardware_backend.npu.dsv41.dense_weights import adapt_get_method
         from sglang.srt.hardware_backend.npu.dsv41.moe import ResidentMXFP4Method
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -254,16 +249,13 @@ class LinearPolicyTest(unittest.TestCase):
         with patch.dict(os.environ, SGLANG_DSV41_910B="1"):
             method = adapt_get_method(lambda *args: None)
             layer = FusedMoE.__new__(FusedMoE)
-            for flag in (False, True):
-                with envs.SGLANG_OPT_DSV41_NPU_TARGET_MOE_A8.override(flag):
-                    for draft in (False, True):
-                        config = SimpleNamespace(
-                            _dsv41_bf16_dense=True, _dsv41_is_draft=draft
-                        )
-                        resident = method(config, layer, "experts")
-                        self.assertIsInstance(resident, ResidentMXFP4Method)
-                        self.assertEqual(resident.a8, flag and not draft)
-                    self.assertIsNone(method(SimpleNamespace(), layer, "experts"))
+            for draft in (False, True):
+                config = SimpleNamespace(_dsv41_bf16_dense=True, _dsv41_is_draft=draft)
+                resident = method(config, layer, "experts")
+                self.assertIsInstance(resident, ResidentMXFP4Method)
+                self.assertFalse(resident.g32)
+                self.assertEqual(resident.is_draft, draft)
+            self.assertIsNone(method(SimpleNamespace(), layer, "experts"))
 
     def test_w8a16_covers_dense_shared_and_draft_linears(self):
         from sglang.srt.hardware_backend.npu.dsv41.dense_weights import adapt_get_method

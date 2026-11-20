@@ -88,9 +88,9 @@ def load_library(path=None):
             validate_jit_toolchain(publication)
             torch.ops.load_library(str(path))
             abi = torch.ops.dsv41.abi()
-            if abi != 28:
+            if abi != 29:
                 raise RuntimeError(
-                    f"incompatible Torch-NPU extension ABI {abi} (expected 28): {path}; rebuild"
+                    f"incompatible Torch-NPU extension ABI {abi} (expected 29): {path}; rebuild"
                 )
             torch.ops.dsv41.configure_jit(
                 publication["kernel_source_root"],

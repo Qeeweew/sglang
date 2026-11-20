@@ -94,13 +94,8 @@ whereas routed MXFP4 down writes FP16 for FP32 weighted combine. The peer wire
 format is unchanged. Source MXFP4 and G32 target experts use the same EP8
 schedule: transport does not run shared before gather. Fixed-size shards and
 unequal DP segments both pass their owner rows to the joint SwiGLU, and add
-shared only after the routed sum returns. No checkpoint repack is needed
-beyond the existing loader; the draft and MXFP4-A8 modes are unchanged.
-
-To opt into per-token INT8 for both routed target projections, set
-`SGLANG_OPT_DSV41_NPU_TARGET_MOE_A8=1` before startup. Default serving and
-draft/MTP keep the original FP16 expert GEMMs. For the resident layout, see
-[MXFP4 × A8 packing and execution](../../../../../../examples/ascend/deepseek_v41/mxfp4-a8.md).
+shared only after the routed sum returns. Source MXFP4 experts use FP16
+activations for both target and draft projections.
 
 The G32 checkpoint instead selects signed INT4 × INT8 grouped GEMM for the
 target experts without any environment switch. Both shared and routed target
@@ -143,6 +138,30 @@ be reused from L2 across M tiles or calls.
 Large eager prefill batches compact scratch to the local EP routing count.
 Bounded replay uses the model's approximate SWA recovery.
 
+## Native operator library
+
+The component name in `kernels/native/components.json` selects a directory for
+the host build and the DeepJIT source snapshot. The Python operator wrappers
+live in `kernels/ops/`. In each native component, `binding.cpp` checks tensor
+contracts, `launch.cpp` selects a prepared kernel on the current stream, and
+the `.asc` entry runs the device pipeline.
+
+| Computation | Native components |
+| --- | --- |
+| Dense and expert projections | `projection`, `w8a16`, `quant_grouped_gemm` (MXFP4 weights × FP16), `int4_g32_a8` (signed G32 weights × INT8) |
+| Format conversion | `fp8_weight`, `mxfp4_weight`, `h32_quant` (H32 transform and token quantization for both shared and routed projections) |
+| Attention, KV and index selection | `attention`, `qli`, `position_quant`, `compressor`, `page_metadata`, `ced` |
+| Routing, activation and model-specific operations | `router`, `moe_routes`, `elementwise`, `mhc`, `engram`, `engram_ops` |
+| Speculative decoding and communication | `dspark_schedule`, `dspark_markov`, `peer_all_reduce` |
+
+`common/grouped_schedule.h` maps compact route records to the same sequence of
+tiles on the Cube and both Vector lanes for either expert weight format.
+`common/cube.h` owns the 910B short-MMAD barrier and the 16-bit L1 operand
+imports. `common/device.h` supplies typed UB byte offsets and immediate
+same-core event handoffs. Each pipeline assigns its own event IDs and owns its
+split-phase and cross-core synchronization. On the host, `common/actual_entry.h`
+caches geometry-specialized JIT handles per thread.
+
 ## Build and deployment boundaries
 
 The native builder publishes `libdsv41_kernels.so`, its manifest, and source
@@ -150,7 +169,7 @@ snapshots under immutable version directories. Keep the whole publication,
 not just the shared library. `DSV41_NATIVE_DIR` chooses a publication;
 `DSV41_JIT_CACHE_DIR` chooses a cache shared by the ranks on the node.
 
-Native ABI 28 requires rebuilding the host publication. CMake builds the host
+Native ABI 29 requires rebuilding the host publication. CMake builds the host
 extension. The router produces grouped GEMM metadata on the device.
 AICore kernels compile through DeepJIT for the model geometries actually bound.
 Prepare and warm them before Graph capture; hot calls and replay do not compile.

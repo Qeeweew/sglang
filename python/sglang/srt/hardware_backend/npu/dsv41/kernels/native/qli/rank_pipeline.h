@@ -1,4 +1,5 @@
 #pragma once
+#include <common/device.h>
 #include <qli/state.h>
 
 namespace qli {
@@ -12,17 +13,11 @@ inline constexpr int32_t kNegativePenaltyBits = int32_t(0xf149f2cau); // FP32 -1
 class RankPipeline {
   public:
     __aicore__ static void initialize_sequence() {
-        auto sequence = ub_pointer<int32_t>(UbLayout::sequence);
-        {
-            set_flag(PIPE_V, PIPE_S, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_V, PIPE_S, ::event_t(kImmediateEvent));
-        }
+        auto sequence = ub_ptr<int32_t>(UbLayout::sequence);
+        native_device::pipe_fence<PIPE_V, PIPE_S, kImmediateEvent>();
         for (uint32_t lane = 0; lane < kDmaWords; ++lane)
             sequence[lane] = lane;
-        {
-            set_flag(PIPE_S, PIPE_V, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_S, PIPE_V, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_S, PIPE_V, kImmediateEvent>();
 #pragma unroll
         for (uint32_t span = kDmaWords; span < kKeyTileCapacity; span *= 2) {
             asc_add_scalar((sequence + (span)), sequence, int32_t(span), span);
@@ -30,7 +25,7 @@ class RankPipeline {
         }
     }
     __aicore__ static void sequence(__ubuf__ int32_t *ids, int32_t first, uint32_t count) {
-        asc_add_scalar(ids, ub_pointer<int32_t>(UbLayout::sequence), first, count);
+        asc_add_scalar(ids, ub_ptr<int32_t>(UbLayout::sequence), first, count);
     }
     __aicore__ static constexpr uint32_t sort_count(uint32_t count) {
         uint32_t result = kSortRun;
@@ -55,8 +50,8 @@ class RankPipeline {
     }
     __aicore__ static __ubuf__ float *sort(__ubuf__ float *values, __ubuf__ uint32_t *indices,
                                            uint32_t count) {
-        auto current = ub_pointer<float>(UbLayout::sort0),
-             next = ub_pointer<float>(UbLayout::sort1);
+        auto current = ub_ptr<float>(UbLayout::sort0),
+             next = ub_ptr<float>(UbLayout::sort1);
         if ASCEND_IS_AIV {
             vbitsort(current, values, indices, uint8_t(count / kSortRun));
         }
@@ -88,7 +83,7 @@ class RankPipeline {
         const uint64_t lengths = uint64_t(keep) | (uint64_t(count) << kLengthBits);
         constexpr uint64_t kControl =
             1 | (uint64_t((1u << kRankMergeInputs) - 1) << kValidListShift);
-        auto result = ub_pointer<float>(UbLayout::merge);
+        auto result = ub_ptr<float>(UbLayout::merge);
         if ASCEND_IS_AIV {
             vmrgsort4(result, input, lengths, kControl);
         }

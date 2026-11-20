@@ -24,7 +24,6 @@ constexpr int kOperandReuseEventBase = 3, kStateEvent = 6, kDrainEvent = 7;
 constexpr int kWeightPanelEventBase = kSlots;
 constexpr int kAccumulatorEvent = 0, kFootprintRetiredEvent = 5, kGroupFlagMode = 2;
 constexpr int kAccumulatorContinue = 2, kAccumulatorPublish = 3;
-constexpr int kShortMmadFractals = 10;
 enum PanelFlag : uint16_t { kPanel0Ready = 0, kPanel1Ready = 1, kPanel0Free = 2, kPanel1Free = 3 };
 struct Tile { int64_t row; int column, batch, valid, matrix_rows; };
 __aicore__ inline Tile coordinates(int64_t job, int64_t rows) {

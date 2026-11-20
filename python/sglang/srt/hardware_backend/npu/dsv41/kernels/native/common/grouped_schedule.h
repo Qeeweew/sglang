@@ -1,8 +1,8 @@
 #pragma once
 #include <kernel_operator.h>
 #include <common/grouped_metadata.h>
-#include <quant_grouped_gemm/tiling.h>
-namespace quant_gmm {
+
+namespace grouped_gemm {
 // One monotone task sequence, independently replayed by the AIC and both AIVs.
 struct Tile {
     int expert, row, col;
@@ -13,6 +13,7 @@ struct Tile {
 // A global cyclic task assignment carries N-tile imbalance across experts.
 template <int TileRows, int TileColumns> struct Schedule {
     // Eight-by-eight task swizzle reuses neighboring panels across cores.
+    static constexpr int kMinSwizzleRows = 128;
     static constexpr uint32_t kSwizzleTiles = 8;
     __gm__ volatile int32_t *routing;
     int experts, visit = 0, Panels;
@@ -52,7 +53,7 @@ template <int TileRows, int TileColumns> struct Schedule {
             mi = local / Ntiles;
             ni = local % Ntiles;
         }
-        if constexpr (TileRows >= Storage::kPrefillTileRows) {
+        if constexpr (TileRows >= kMinSwizzleRows) {
             if (mtiles > 1) {
                 uint32_t mbase = (mi / kSwizzleTiles) * kSwizzleTiles;
                 uint32_t height = mtiles - mbase < kSwizzleTiles ? mtiles - mbase : kSwizzleTiles;
@@ -72,4 +73,4 @@ template <int TileRows, int TileColumns> struct Schedule {
     }
 };
 
-} // namespace quant_gmm
+} // namespace grouped_gemm

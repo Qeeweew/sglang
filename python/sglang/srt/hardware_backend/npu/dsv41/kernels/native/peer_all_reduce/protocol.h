@@ -1,4 +1,5 @@
 #pragma once
+#include <common/device.h>
 #include <kernel_operator.h>
 #include <c_api/asc_simd.h>
 #include <peer_all_reduce/layout.h>
@@ -50,31 +51,24 @@ __aicore__ inline uint64_t begin(GM_ADDR local, GM_ADDR table, uint32_t world) {
             publish(signal(local, 4, c), epoch);
     }
     await(signal(local, 4, AscendC::GetBlockIdx()), epoch);
-    set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+    native_device::pipe_fence<PIPE_S, PIPE_MTE2, EVENT_ID0>();
     return epoch;
 }
 __aicore__ inline void finish(GM_ADDR local, uint64_t epoch) {
-    set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
-    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
-    set_flag(PIPE_V, PIPE_S, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
+    native_device::pipe_fence<PIPE_MTE2, PIPE_S, EVENT_ID0>();
+    native_device::pipe_fence<PIPE_MTE3, PIPE_S, EVENT_ID0>();
+    native_device::pipe_fence<PIPE_V, PIPE_S, EVENT_ID0>();
     publish(signal(local, 0, AscendC::GetBlockIdx()), epoch);
     publish(signal(local, 2, AscendC::GetBlockIdx()), epoch);
     aggregate(local, 2, epoch);
 }
 __aicore__ inline void loaded() {
-    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    native_device::pipe_fence<PIPE_MTE2, PIPE_V, EVENT_ID0>();
 }
 __aicore__ inline void stored() {
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    native_device::pipe_fence<PIPE_MTE3, PIPE_MTE2, EVENT_ID0>();
 }
 __aicore__ inline void vector_store() {
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    native_device::pipe_fence<PIPE_V, PIPE_MTE3, EVENT_ID0>();
 }
 } // namespace peer_protocol

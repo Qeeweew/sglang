@@ -1,4 +1,6 @@
 #pragma once
+#include <common/cube.h>
+#include <common/device.h>
 #include <qli/schedule.h>
 
 namespace qli {
@@ -15,10 +17,7 @@ class CubePipeline {
 
     __aicore__ void load_query(const Task &task) {
         // Prior task's Q/W imports must retire before their L1 spans change.
-        {
-            set_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_MTE1, PIPE_MTE2, kImmediateEvent>();
         if (task.queries < kQueries) {
             asc_fill_value_config fill{};
             fill.repeat = 1;
@@ -37,15 +36,9 @@ class CubePipeline {
         // GM weights are task-local input after this DMA. The vector actors
         // may now prepare the next task in the same fixed-address GM span.
         CrossCoreSetFlag<2, PIPE_MTE2>(WeightCredit);
-        {
-            set_flag(PIPE_MTE2, PIPE_MTE1, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_MTE2, PIPE_MTE1, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_MTE2, PIPE_MTE1, kImmediateEvent>();
         if constexpr (kCachedLeftOperands) {
-            {
-                set_flag(PIPE_M, PIPE_MTE1, ::event_t(kImmediateEvent));
-                wait_flag(PIPE_M, PIPE_MTE1, ::event_t(kImmediateEvent));
-            }
+            native_device::pipe_fence<PIPE_M, PIPE_MTE1, kImmediateEvent>();
             load_query_operand();
             asc_copy_l12l0a(l0a_pointer<half>(kWeightOperandOffset),
                             l1_pointer<half>(L1Layout::weights), 0, uint8_t(kMatrixRows / 16), 1,
@@ -88,10 +81,7 @@ class CubePipeline {
                 wait_flag(PIPE_M, PIPE_MTE1, ::event_t(kQkEvent));
         } else {
             // The preceding head MMAD must release the shared L0B operand.
-            {
-                set_flag(PIPE_M, PIPE_MTE1, ::event_t(kImmediateEvent));
-                wait_flag(PIPE_M, PIPE_MTE1, ::event_t(kImmediateEvent));
-            }
+            native_device::pipe_fence<PIPE_M, PIPE_MTE1, kImmediateEvent>();
         }
         if constexpr (!kCachedLeftOperands)
             load_query_operand();
@@ -99,25 +89,16 @@ class CubePipeline {
                         (l1_pointer<int8_t>(L1Layout::key) + (slot * kKeyRows * kDepth)), 0,
                         uint8_t(((columns + 15) / 16) * (kDepth / 32)), 1, 0);
         set_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(kKeyEvent + slot));
-        {
-            set_flag(PIPE_MTE1, PIPE_M, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_MTE1, PIPE_M, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_MTE1, PIPE_M, kImmediateEvent>();
         if constexpr (kPipelinedRightOperands)
             if (reused)
                 wait_flag(PIPE_FIX, PIPE_M, ::event_t(kQkEvent));
-        asc_mmad(l0c_pointer<int32_t>(), l0a_pointer<int8_t>(), l0b_pointer<int8_t>(), kMatrixRows,
-                 kDepth, uint16_t(columns), uint8_t(0), false, false, true);
-        // SDK basic Mmad does not supply this arch2201 short-matrix fence.
-        if (kMatrixRows / kCubeRows * ((columns + kCubeRows - 1) / kCubeRows) <
-            kUnfencedMmadFractals)
-            pipe_barrier(PIPE_M);
+        native_device::mmad<native_device::MmadColumns::Tail>(
+            l0c_pointer<int32_t>(), l0a_pointer<int8_t>(), l0b_pointer<int8_t>(), kMatrixRows,
+            kDepth, columns, uint8_t(0), true);
         if constexpr (kPipelinedRightOperands)
             set_flag(PIPE_M, PIPE_MTE1, ::event_t(kQkEvent));
-        {
-            set_flag(PIPE_M, PIPE_FIX, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_M, PIPE_FIX, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_M, PIPE_FIX, kImmediateEvent>();
         set_quant_pre(0x3a800000); // exact FP32 1/1024 before FP16 rounding
         if constexpr (kPipelinedRightOperands)
             if (relu_reused)
@@ -131,10 +112,7 @@ class CubePipeline {
             set_flag(PIPE_FIX, PIPE_MTE1, ::event_t(kReluEvent + slot));
             set_flag(PIPE_FIX, PIPE_M, ::event_t(kQkEvent));
         } else {
-            {
-                set_flag(PIPE_FIX, PIPE_MTE1, ::event_t(kImmediateEvent));
-                wait_flag(PIPE_FIX, PIPE_MTE1, ::event_t(kImmediateEvent));
-            }
+            native_device::pipe_fence<PIPE_FIX, PIPE_MTE1, kImmediateEvent>();
         }
     }
     __aicore__ void weight_heads(const Task &task, uint32_t columns, uint32_t slot,
@@ -144,10 +122,7 @@ class CubePipeline {
                 wait_flag(PIPE_M, PIPE_MTE1, ::event_t(kHeadEvent));
             wait_flag(PIPE_FIX, PIPE_MTE1, ::event_t(kReluEvent + relu_slot));
         } else {
-            {
-                set_flag(PIPE_M, PIPE_MTE1, ::event_t(kImmediateEvent));
-                wait_flag(PIPE_M, PIPE_MTE1, ::event_t(kImmediateEvent));
-            }
+            native_device::pipe_fence<PIPE_M, PIPE_MTE1, kImmediateEvent>();
         }
         // One diagonal weight matrix handles all query rows in one MMAD.
         // Its zero off-diagonal heads preserve each independent head sum.
@@ -162,25 +137,17 @@ class CubePipeline {
                         true, padded_columns);
         if constexpr (kPipelinedRightOperands)
             set_flag(PIPE_MTE1, PIPE_FIX, ::event_t(kReluEvent + relu_slot));
-        {
-            set_flag(PIPE_MTE1, PIPE_M, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_MTE1, PIPE_M, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_MTE1, PIPE_M, kImmediateEvent>();
         auto result = l0c_pointer<float>(arch2201::kL0CBytes / 2);
         if constexpr (kPipelinedRightOperands)
             if (reused)
                 wait_flag(PIPE_FIX, PIPE_M, ::event_t(kHeadEvent));
-        asc_mmad(result, l0a_pointer<half>(kWeightOperandOffset),
-                 l0b_pointer<half>(kHeadOperandOffset), kCubeRows, kMatrixRows, uint16_t(columns),
-                 uint8_t(0), false, false, true);
-        if ((columns + kCubeRows - 1) / kCubeRows < kUnfencedMmadFractals)
-            pipe_barrier(PIPE_M);
+        native_device::mmad<native_device::MmadColumns::Tail>(
+            result, l0a_pointer<half>(kWeightOperandOffset), l0b_pointer<half>(kHeadOperandOffset),
+            kCubeRows, kMatrixRows, columns, uint8_t(0), true);
         if constexpr (kPipelinedRightOperands)
             set_flag(PIPE_M, PIPE_MTE1, ::event_t(kHeadEvent));
-        {
-            set_flag(PIPE_M, PIPE_FIX, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_M, PIPE_FIX, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_M, PIPE_FIX, kImmediateEvent>();
         asc_copy_l0c2gm((workspace_.scores(slot) + (destination)), result, uint16_t(columns),
                         uint16_t(task.queries), kKeyTileCapacity, kCubeRows, 0,
                         uint64_t(QuantMode_t::NoQuant), 0, false, true);
@@ -200,14 +167,8 @@ class CubePipeline {
         set_fmatrix_b(uint64_t(kMatrixRows) | (uint64_t(1) << 16));
         set_l3d_rpt(uint64_t(1) << 16);
         asc_set_l0c_copy_params(1, 0, 0);
-        {
-            set_flag(PIPE_S, PIPE_MTE1, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_S, PIPE_MTE1, ::event_t(kImmediateEvent));
-        }
-        {
-            set_flag(PIPE_S, PIPE_FIX, ::event_t(kImmediateEvent));
-            wait_flag(PIPE_S, PIPE_FIX, ::event_t(kImmediateEvent));
-        }
+        native_device::pipe_fence<PIPE_S, PIPE_MTE1, kImmediateEvent>();
+        native_device::pipe_fence<PIPE_S, PIPE_FIX, kImmediateEvent>();
         TaskCursor cursor(args_);
         Task task{};
         uint64_t published = 0;

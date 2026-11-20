@@ -1,12 +1,11 @@
 #pragma once
+#include <common/device.h>
 #include <kernel_operator.h>
 #include <c_api/asc_simd.h>
 #include <mhc/geometry.h>
 namespace mhc {
+using native_device::ub_ptr;
 using namespace AscendC;
-template <class T> __aicore__ inline __ubuf__ T *ub(uint32_t bytes) {
-    return reinterpret_cast<__ubuf__ T *>(uint64_t(bytes));
-}
 template <class T> __aicore__ inline __gm__ T *gm(GM_ADDR address) {
     return reinterpret_cast<__gm__ T *>(address);
 }
@@ -102,10 +101,7 @@ __aicore__ inline float inverse_rms(__ubuf__ float *stat, float inverse_width, V
     asc_div(stat, (stat + (kBlockFloats)), stat, scalar_repeats, 1, 1, 1, kRepeatBlocks,
             kRepeatBlocks, kRepeatBlocks);
     pipe_barrier(PIPE_V);
-    {
-        set_flag(PIPE_V, PIPE_S, ::event_t(VectorEvents::scalar_read));
-        wait_flag(PIPE_V, PIPE_S, ::event_t(VectorEvents::scalar_read));
-    }
+    native_device::pipe_fence<PIPE_V, PIPE_S, VectorEvents::scalar_read>();
     return stat[0];
 }
 #if defined(MHC_COMBINE)

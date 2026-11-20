@@ -4,14 +4,15 @@ from typing import NamedTuple
 
 import torch
 
-from .kernels.ops.mxfp4_a8 import A8GroupedGemm, h32_quant
+from .kernels.ops.h32_quant import h32_quant
+from .kernels.ops.int4_g32_a8 import G32GroupedGemm
 from .linear import SharedW8A8Method, W8A16LinearMethod
 from .moe import ResidentMXFP4Method
 
 
 class G32Projections(NamedTuple):
-    gate_up: A8GroupedGemm
-    down: A8GroupedGemm
+    gate_up: G32GroupedGemm
+    down: G32GroupedGemm
     gate_up_weight: tuple[torch.Tensor, ...]
     down_weight: tuple[torch.Tensor, ...]
 
@@ -21,7 +22,6 @@ def can_join(mlp):
     if (
         not isinstance(method, ResidentMXFP4Method)
         or method.is_draft
-        or (method.a8 and not method.g32)
         or not getattr(mlp, "_shared_expert_tp1", False)
     ):
         return False

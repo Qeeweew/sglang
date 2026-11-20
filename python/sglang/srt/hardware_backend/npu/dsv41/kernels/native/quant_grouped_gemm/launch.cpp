@@ -1,30 +1,24 @@
 #include "launch.h"
-#include "jit.h"
+#include "actual_entry.h"
 #include <array>
 #include <stdexcept>
 #include "torch.h"
-#include <map>
 #include <memory>
 namespace {
 // Actual BM/BN resource plans only; native NZ has no stripe-capacity table.
 using Key = std::array<int, 6>; // BM, BN, K, N, experts, workers
 
 native_jit::Kernel &entry(const quant_gmm::Arguments &args) {
-    static thread_local std::map<Key, std::unique_ptr<native_jit::Kernel>> entries;
-    static thread_local Key last_key{};
-    static thread_local native_jit::Kernel *last = nullptr;
+    static thread_local native_jit::KernelCache<Key> entries;
     const auto &shape = args.config;
     const Key key{args.tile_rows, args.tile_columns, shape.k, shape.n,
                   args.experts, args.cores};
-    if (last && key == last_key)
-        return *last;
-    auto &kernel = entries[key];
-    if (!kernel) {
+    return entries.get(key, [&] {
         const auto tag = "quant_gmm_m" + std::to_string(args.tile_rows) + "_n" +
                          std::to_string(args.tile_columns) + "_k" + std::to_string(shape.k) + "_columns" +
                          std::to_string(shape.n) + "_experts" +
                          std::to_string(args.experts) + "_w" + std::to_string(args.cores);
-        kernel = std::make_unique<native_jit::Kernel>(
+        return std::make_unique<native_jit::Kernel>(
             tag.c_str(), "quant_grouped_gemm/grouped_gemm.asc",
             std::vector<std::string>{"--cce-auto-sync=off",
                                      "-DQUANT_GMM_BM=" + std::to_string(args.tile_rows),
@@ -34,10 +28,7 @@ native_jit::Kernel &entry(const quant_gmm::Arguments &args) {
                                      "-DQUANT_GMM_EXPERTS=" + std::to_string(args.experts),
                                      "-DQUANT_GMM_WORKERS=" + std::to_string(args.cores)},
             args.cores);
-    }
-    last_key = key;
-    last = kernel.get();
-    return *last;
+    });
 }
 } // namespace
 extern "C" void dsv41_quant_gmm_launch(const quant_gmm::Arguments &args) {

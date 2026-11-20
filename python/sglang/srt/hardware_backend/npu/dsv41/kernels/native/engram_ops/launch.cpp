@@ -1,9 +1,8 @@
 #include "launch.h"
 #include "layout.h"
-#include "jit.h"
+#include "actual_entry.h"
 #include "torch.h"
 #include <array>
-#include <map>
 #include <sstream>
 namespace {
 enum class Stage : int64_t { Hash, Commit, Gate };
@@ -16,13 +15,8 @@ struct Geometry {
     auto operator<=>(const Geometry &) const = default;
 };
 native_jit::Kernel &entry(const Geometry &g) {
-    static thread_local std::map<Geometry, std::unique_ptr<native_jit::Kernel>> entries;
-    static thread_local Geometry last_geometry{};
-    static thread_local native_jit::Kernel *last = nullptr;
-    if (last && last_geometry == g)
-        return *last;
-    auto &kernel = entries[g];
-    if (!kernel) {
+    static thread_local native_jit::KernelCache<Geometry> entries;
+    return entries.get(g, [&] {
         std::vector<std::string> flags{"--cce-auto-sync=off"};
         auto field = [&](const char *name, int64_t value) {
             flags.emplace_back(std::string("-DENGRAM_OPS_") + name + "=" + std::to_string(value));
@@ -55,12 +49,9 @@ native_jit::Kernel &entry(const Geometry &g) {
             inverse << std::hexfloat << float(1.0 / std::sqrt(double(g.width))) << 'f';
             flags.emplace_back("-DENGRAM_OPS_INV_SQRT_WIDTH=" + inverse.str());
         }
-        kernel = std::make_unique<native_jit::Kernel>(tag, "engram_ops/engram_ops.asc", flags,
-                                                      uint32_t(g.workers));
-    }
-    last_geometry = g;
-    last = kernel.get();
-    return *last;
+        return std::make_unique<native_jit::Kernel>(tag, "engram_ops/engram_ops.asc", flags,
+                                                    uint32_t(g.workers));
+    });
 }
 } // namespace
 extern "C" void dsv41_engram_hash_launch(

@@ -69,7 +69,7 @@ class SharedW8A8Method(UnquantizedLinearMethod):
         layer.weight_scale_inv.data = layer.weight_scale_inv.flatten()
 
     def apply(self, layer, x, bias=None):
-        from .kernels.ops.mxfp4_a8 import h32_quant
+        from .kernels.ops.h32_quant import h32_quant
 
         if x.numel() == 0:
             return x.new_empty((*x.shape[:-1], layer.weight_scale_inv.numel()))

@@ -1,4 +1,5 @@
 #pragma once
+#include <common/device.h>
 #include <peer_all_reduce/protocol.h>
 
 namespace peer_moe {
@@ -40,8 +41,7 @@ struct View {
         return reinterpret_cast<__gm__ bfloat16_t *>(region(r) + p::kMoeReturnOffset);
     }
     __aicore__ void ready(uint32_t kind) const {
-        set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+        native_device::pipe_fence<PIPE_MTE2, PIPE_S, EVENT_ID0>();
         s::publish(s::signal(local, kind, AscendC::GetBlockIdx()), epoch);
     }
     __aicore__ void all_ready(uint32_t kind) const {
@@ -60,8 +60,7 @@ __aicore__ inline void gather(const View &v, GM_ADDR input, GM_ADDR output) {
     const uint32_t destination = v.first_row(v.rank) * H;
     for (uint32_t offset = channel * T; offset < v.owned * H; offset += stride) {
         asc_copy_gm2ub(raw, x + offset, T * 2);
-        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+        native_device::pipe_fence<PIPE_MTE2, PIPE_MTE3, EVENT_ID0>();
         // Push the owned row directly into every destination's compact gather
         // plane. Rotate destinations to avoid synchronized many-to-one bursts.
         for (uint32_t step = 0; step < 8; ++step)
@@ -71,15 +70,13 @@ __aicore__ inline void gather(const View &v, GM_ADDR input, GM_ADDR output) {
     v.ready(1);
     for (uint32_t rank = 0; rank < 8; ++rank) {
         s::await(s::signal(v.region(rank), 1, channel), v.epoch);
-        set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+        native_device::pipe_fence<PIPE_S, PIPE_MTE2, EVENT_ID0>();
         const uint32_t count = v.owned_rows(rank);
         auto out = reinterpret_cast<__gm__ bfloat16_t *>(output) + v.first_row(rank) * H;
         for (uint32_t offset = channel * T; offset < count * H; offset += stride) {
             const uint32_t source = v.first_row(rank) * H;
             asc_copy_gm2ub(raw, v.payload(v.rank) + source + offset, T * 2);
-            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            native_device::pipe_fence<PIPE_MTE2, PIPE_MTE3, EVENT_ID0>();
             asc_copy_ub2gm(out + offset, raw, T * 2);
             s::stored();
         }
@@ -118,20 +115,17 @@ __aicore__ inline void publish_partial(const View &v, GM_ADDR input, GM_ADDR inv
                 pipe_barrier(PIPE_V);
                 asc_add(sum, sum, fp, T);
                 pipe_barrier(PIPE_V);
-                set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-                wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+                native_device::pipe_fence<PIPE_V, PIPE_MTE2, EVENT_ID0>();
             }
             asc_float2bfloat16_rn(packed, sum, T);
             s::vector_store();
         } else {
             asc_copy_gm2ub(packed, reinterpret_cast<__gm__ bfloat16_t *>(input) + offset, T * 2);
-            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            native_device::pipe_fence<PIPE_MTE2, PIPE_MTE3, EVENT_ID0>();
         }
         asc_copy_ub2gm(v.payload(v.rank) + offset, packed, T * 2);
         s::stored();
-        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        native_device::pipe_fence<PIPE_MTE3, PIPE_V, EVENT_ID0>();
     }
     v.ready(1);
 }
@@ -145,8 +139,7 @@ __aicore__ inline void reduce_owned(const View &v, GM_ADDR shared) {
     const uint32_t source_channel = (first / T + channel) % p::kWorkers;
     for (uint32_t rank = 0; rank < 8; ++rank)
         s::await(s::signal(v.region(rank), 1, source_channel), v.epoch);
-    set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+    native_device::pipe_fence<PIPE_S, PIPE_MTE2, EVENT_ID0>();
     const uint32_t owned = v.owned < v.shard_rows ? v.owned : v.shard_rows;
     for (uint32_t offset = channel * T; offset < owned * H; offset += stride) {
         asc_duplicate(sum, 0.f, T);
@@ -175,8 +168,7 @@ __aicore__ inline void reduce_owned(const View &v, GM_ADDR shared) {
                 pipe_barrier(PIPE_V);
                 asc_add(sum, sum, fp, T);
                 pipe_barrier(PIPE_V);
-                set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-                wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+                native_device::pipe_fence<PIPE_V, PIPE_MTE2, EVENT_ID0>();
             }
         }
         // Preserve the BF16 expert-sum boundary before adding shared once.
@@ -185,8 +177,7 @@ __aicore__ inline void reduce_owned(const View &v, GM_ADDR shared) {
         if (shared) {
             asc_bfloat162float(sum, raw, T);
             pipe_barrier(PIPE_V);
-            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-            wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+            native_device::pipe_fence<PIPE_V, PIPE_MTE2, EVENT_ID0>();
             asc_copy_gm2ub(raw, reinterpret_cast<__gm__ bfloat16_t *>(shared) + offset, T * 2);
             s::loaded();
             asc_bfloat162float(fp, raw, T);
@@ -199,8 +190,7 @@ __aicore__ inline void reduce_owned(const View &v, GM_ADDR shared) {
         s::vector_store();
         asc_copy_ub2gm(v.returned(v.rank) + offset, raw, T * 2);
         s::stored();
-        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        native_device::pipe_fence<PIPE_MTE3, PIPE_V, EVENT_ID0>();
     }
     v.ready(3);
 }
@@ -210,14 +200,12 @@ __aicore__ inline void restore(const View &v, GM_ADDR output) {
     const uint32_t channel = AscendC::GetBlockIdx();
     for (uint32_t rank = v.rank / TP * TP; rank < v.rank / TP * TP + TP; ++rank) {
         s::await(s::signal(v.region(rank), 3, channel), v.epoch);
-        set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+        native_device::pipe_fence<PIPE_S, PIPE_MTE2, EVENT_ID0>();
         const uint32_t count = v.owned_rows(rank);
         auto out = reinterpret_cast<__gm__ bfloat16_t *>(output) + rank % TP * v.shard_rows * H;
         for (uint32_t offset = channel * T; offset < count * H; offset += p::kWorkers * T) {
             asc_copy_gm2ub(raw, v.returned(rank) + offset, T * 2);
-            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            native_device::pipe_fence<PIPE_MTE2, PIPE_MTE3, EVENT_ID0>();
             asc_copy_ub2gm(out + offset, raw, T * 2);
             s::stored();
         }

@@ -1,10 +1,13 @@
 #pragma once
+#include <common/device.h>
 #include <kernel_operator.h>
 #include <c_api/asc_simd.h>
 #include <quant_grouped_gemm/layout.h>
-#include <quant_grouped_gemm/schedule.h>
+#include <common/grouped_schedule.h>
 
 namespace quant_gmm {
+using native_device::ub_ptr;
+using grouped_gemm::Tile;
 using namespace AscendC;
 // Native FP16 NZ stream: [owned N16 blocks, StepK, 16]. Input panel credits
 // and output byte-chunk credits are independent. Both AIVs publish a panel;
@@ -13,18 +16,15 @@ template <class P> class DecodePipeline {
     using Shape = PanelShape<P>;
     __gm__ uint8_t *packed_, *scales_;
     __gm__ half *workspace_;
-    template <class T> __aicore__ inline __ubuf__ T *ub_address(int bytes) {
-        return reinterpret_cast<__ubuf__ T *>(uint64_t(bytes));
-    }
     __aicore__ inline void initialize() {
-        asc_duplicate(ub_address<int16_t>(P::ThresholdOffset), kRankCorrectionBits,
+        asc_duplicate(ub_ptr<int16_t>(P::ThresholdOffset), kRankCorrectionBits,
                       uint32_t(kHalfVectorElements));
         asc_sync_pipe(PIPE_V);
     }
     __aicore__ inline void unpack_scales(int slot) {
         asc_sync_pipe(PIPE_V);
-        auto factors = ub_address<half>(P::ScaleOutputOffset);
-        auto raw = ub_address<uint16_t>(P::ScaleOffset + slot * P::ScaleSlotBytes);
+        auto factors = ub_ptr<half>(P::ScaleOutputOffset);
+        auto raw = ub_ptr<uint16_t>(P::ScaleOffset + slot * P::ScaleSlotBytes);
         constexpr int scale_elements = P::LocalBlocks * P::ScaleGroups * P::C0Elements;
         // A compact N16 scale row is16 bytes, while vector operands need
         // 32-byte addresses. Convert byte values in a temporary prefix,
@@ -58,10 +58,10 @@ template <class P> class DecodePipeline {
         asc_int42half(decoded, reinterpret_cast<__ubuf__ int4b_t *>(raw), repeats, 1, 1, 8, 2);
         if (release) set_flag(PIPE_V, PIPE_MTE2, ::event_t(slot));
         asc_sync_pipe(PIPE_V);
-        auto absolute = ub_address<int16_t>(P::AbsoluteOffset);
+        auto absolute = ub_ptr<int16_t>(P::AbsoluteOffset);
         asc_abs(reinterpret_cast<__ubuf__ half *>(absolute), decoded, repeats, 1, 1, 8, 8);
         asc_sync_pipe(PIPE_V);
-        asc_sub_relu(absolute, absolute, ub_address<int16_t>(P::ThresholdOffset), repeats,
+        asc_sub_relu(absolute, absolute, ub_ptr<int16_t>(P::ThresholdOffset), repeats,
                      1, 1, 1, 8, 8, 0);
         asc_sync_pipe(PIPE_V);
         auto bits = reinterpret_cast<__ubuf__ int16_t *>(decoded);
@@ -71,7 +71,7 @@ template <class P> class DecodePipeline {
         for (int group = 0; group < P::MicroElements / P::AtomElements; ++group)
             if (group < elements / P::AtomElements)
                 asc_mul(decoded + group * P::AtomElements, decoded + group * P::AtomElements,
-                    ub_address<half>(P::ScaleOutputOffset) +
+                    ub_ptr<half>(P::ScaleOutputOffset) +
                         (first / P::AtomElements + group) * P::C0Elements,
                     uint8_t(P::AtomElements / kHalfVectorElements), 1, 1, 0, 8, 8, 0);
     }
@@ -88,16 +88,16 @@ template <class P> class DecodePipeline {
         const int64_t scale_offset = (int64_t(tile.expert) * Shape::k * Shape::n / kScaleGroup +
             int64_t(column) * (Shape::k / kScaleGroup) + start / kScaleGroup * P::C0Elements) * P::ScaleElementBytes;
         if constexpr (Shape::step_k == Shape::k)
-            asc_copy_gm2ub_align(ub_address<uint8_t>(P::ScaleOffset + slot * P::ScaleSlotBytes),
+            asc_copy_gm2ub_align(ub_ptr<uint8_t>(P::ScaleOffset + slot * P::ScaleSlotBytes),
                 scales_ + scale_offset, uint16_t(1),
                 uint32_t(P::LocalBlocks * P::ScaleGroups * P::C0Elements), 0, 0, 0, 0);
         else
-            asc_copy_gm2ub_align(ub_address<uint8_t>(P::ScaleOffset + slot * P::ScaleSlotBytes),
+            asc_copy_gm2ub_align(ub_ptr<uint8_t>(P::ScaleOffset + slot * P::ScaleSlotBytes),
                 scales_ + scale_offset, uint16_t(P::LocalBlocks),
                 uint32_t(P::ScaleGroups * P::C0Elements * P::ScaleElementBytes), 0, 0,
                 uint32_t((Shape::k - Shape::step_k) / kScaleGroup * P::C0Elements * P::ScaleElementBytes), 0);
         set_flag(PIPE_MTE2, PIPE_V, ::event_t(slot + kScaleEventBase));
-        asc_copy_gm2ub(ub_address<uint8_t>(slot * P::CodeCapacity), packed_ + code_offset,
+        asc_copy_gm2ub(ub_ptr<uint8_t>(slot * P::CodeCapacity), packed_ + code_offset,
             uint16_t(P::LocalBlocks), uint16_t(Shape::step_k * P::C0Elements / kPackedPerByte / kDmaBytes),
             uint16_t((Shape::k - Shape::step_k) * P::C0Elements / kPackedPerByte / kDmaBytes), 0);
         set_flag(PIPE_MTE2, PIPE_V, ::event_t(slot));
@@ -115,10 +115,10 @@ template <class P> class DecodePipeline {
             if (future) set_flag(PIPE_V, PIPE_MTE2, ::event_t(slot + kScaleEventBase));
             wait_flag(PIPE_MTE2, PIPE_V, ::event_t(slot));
         }
-        auto decoded = ub_address<half>(P::DecodedOffset + output_slot * P::DecodeCapacity);
+        auto decoded = ub_ptr<half>(P::DecodedOffset + output_slot * P::DecodeCapacity);
         for (int local = 0; local < elements; local += P::MicroElements) {
             const int count = min(P::MicroElements, elements - local);
-            decode_micro(decoded + local, ub_address<uint8_t>(slot * P::CodeCapacity + (first + local) / 2),
+            decode_micro(decoded + local, ub_ptr<uint8_t>(slot * P::CodeCapacity + (first + local) / 2),
                 first + local, count, future && inner + 1 == P::Blocks && local + count == elements, slot);
         }
         set_flag(PIPE_V, PIPE_MTE3, ::event_t(output_slot));
@@ -136,7 +136,7 @@ template <class P> class DecodePipeline {
         const int64_t destination = (int64_t(core) * kSlots + slot) *
             (Shape::workspace_panel_bytes / kHalfBytes) + lane * P::LocalElements + first;
         asc_copy_ub2gm(workspace_ + destination,
-            ub_address<half>(P::DecodedOffset + output_slot * P::DecodeCapacity), uint32_t(elements * kHalfBytes));
+            ub_ptr<half>(P::DecodedOffset + output_slot * P::DecodeCapacity), uint32_t(elements * kHalfBytes));
         if (inner + 1 == P::Blocks) {
             if (slot == 0) CrossCoreSetFlag<kGroupFlagMode, PIPE_MTE3>(kPanel0Ready);
             else CrossCoreSetFlag<kGroupFlagMode, PIPE_MTE3>(kPanel1Ready);
@@ -149,7 +149,7 @@ template <class P> class DecodePipeline {
                                int experts, int cores) {
         packed_ = packed; scales_ = scales; workspace_ = reinterpret_cast<__gm__ half *>(workspace);
         const int core = GetBlockIdx() / kVectorLanesPerCube, lane = GetSubBlockIdx();
-        Schedule<P::Rows, P::Columns> schedule(routing, experts, Shape::panels, Shape::n);
+        grouped_gemm::Schedule<P::Rows, P::Columns> schedule(routing, experts, Shape::panels, Shape::n);
         Tile tile{};
         if (!schedule.next(core, tile)) return;
         initialize();
@@ -181,11 +181,9 @@ template <class P> class DecodePipeline {
                 else CrossCoreWaitFlag<kGroupFlagMode, PIPE_MTE3>(kPanel1Free);
             }
         if (known < 0 && count > 0) {
-            set_flag(PIPE_MTE2, PIPE_S, ::event_t(kRetirementEvent));
-            wait_flag(PIPE_MTE2, PIPE_S, ::event_t(kRetirementEvent));
+            native_device::pipe_fence<PIPE_MTE2, PIPE_S, kRetirementEvent>();
         }
-        set_flag(PIPE_MTE3, PIPE_S, ::event_t(kRetirementEvent));
-        wait_flag(PIPE_MTE3, PIPE_S, ::event_t(kRetirementEvent));
+        native_device::pipe_fence<PIPE_MTE3, PIPE_S, kRetirementEvent>();
     }
 };
 } // namespace quant_gmm

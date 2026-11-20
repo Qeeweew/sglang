@@ -37,7 +37,7 @@ attention::Config attention_geometry(int64_t tokens, int64_t heads, int64_t batc
     // fence. Use the next legal M extent; this extent is derived from the bound geometry.
     if (mode == 0 && tokens <= cores &&
         heads * attention::kDotRows / attention::kMatrixFractalElements <
-            attention::kUnfencedMmadFractals)
+            arch2201::kUnfencedMmadFractals)
         tile_rows = attention::kSmallQueryTileRows;
     int compressed_page_rows = page_rows / ratio;
     int shift = 0;

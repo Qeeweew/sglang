@@ -1,6 +1,7 @@
 // BF16 tail64 RoPE with compact FP32 trig. Only the rotated span is read or
 // written in-place. Strided DMA packs a tile of heads/tokens into the UB.
 #pragma once
+#include <common/device.h>
 #include <kernel_operator.h>
 #include <position_quant/params.h>
 using namespace AscendC;
@@ -43,8 +44,7 @@ __aicore__ inline void rope_copy_in(__ubuf__ bfloat16_t *raw, __gm__ bfloat16_t 
     // A non-power-of-two head count can leave holes between token rows.
     if (nh < bh) {
         asc_duplicate(reinterpret_cast<__ubuf__ half *>(raw), half(0), nt * bh * R);
-        set_flag(PIPE_V, PIPE_MTE2, ::event_t(position_quant::kPartialHeadPaddingRetired));
-        wait_flag(PIPE_V, PIPE_MTE2, ::event_t(position_quant::kPartialHeadPaddingRetired));
+        native_device::pipe_fence<PIPE_V, PIPE_MTE2, position_quant::kPartialHeadPaddingRetired>();
     }
     if (nh == heads) {
         asc_copy_gm2ub_align(
@@ -90,14 +90,12 @@ __aicore__ inline void copy_unrotated_prefix(__gm__ bfloat16_t *source,
                                  reinterpret_cast<__gm__ uint8_t *>((source + (first * dim))), count,
                                  uint32_t((dim - rotary_dim) * sizeof(bfloat16_t)), 0, 0,
                                  uint32_t(rotary_dim * sizeof(bfloat16_t)), 0);
-            set_flag(PIPE_MTE2, PIPE_MTE3, ::event_t(prefix_event));
-            wait_flag(PIPE_MTE2, PIPE_MTE3, ::event_t(prefix_event));
+            native_device::pipe_fence<PIPE_MTE2, PIPE_MTE3, prefix_event>();
             asc_copy_ub2gm_align(reinterpret_cast<__gm__ uint8_t *>((destination + (first * dim))),
                                  reinterpret_cast<__ubuf__ uint8_t *>(staging), count,
                                  uint32_t((dim - rotary_dim) * sizeof(bfloat16_t)), 0, 0, 0,
                                  uint32_t(rotary_dim * sizeof(bfloat16_t)));
-            set_flag(PIPE_MTE3, PIPE_MTE2, ::event_t(prefix_event));
-            wait_flag(PIPE_MTE3, PIPE_MTE2, ::event_t(prefix_event));
+            native_device::pipe_fence<PIPE_MTE3, PIPE_MTE2, prefix_event>();
         }
     }
 }
@@ -135,8 +133,7 @@ __global__ __aicore__ void rope_tail_kernel(GM_ADDR input, GM_ADDR cosine, GM_AD
     constexpr TEventID loaded = 2;
     asc_copy_gm2ub(swap_ids, lut, uint32_t((R) * sizeof(float)));
     asc_copy_gm2ub(trig_ids, (lut + (R)), uint32_t((R) * sizeof(float)));
-    set_flag(PIPE_MTE2, PIPE_V, ::event_t(loaded));
-    wait_flag(PIPE_MTE2, PIPE_V, ::event_t(loaded));
+    native_device::pipe_fence<PIPE_MTE2, PIPE_V, loaded>();
     uint32_t capacity = bh * bt * R;
     for (uint32_t n = R; n < capacity; n *= 2) {
         asc_add_scalar((swap_ids + (n)), swap_ids, static_cast<int32_t>(n * 4), n);
@@ -203,8 +200,7 @@ __global__ __aicore__ void rope_tail_kernel(GM_ADDR input, GM_ADDR cosine, GM_AD
         // Raw BF16 and compact trig may be loaded again only after their
         // final Vector reader retires; output has an independent lifetime.
         set_flag(PIPE_V, PIPE_MTE2, ::event_t(slot));
-        set_flag(PIPE_V, PIPE_MTE3, ::event_t(slot));
-        wait_flag(PIPE_V, PIPE_MTE3, ::event_t(slot));
+        native_device::pipe_fence<PIPE_V, PIPE_MTE3>(slot);
         if (nh == heads) {
             asc_copy_ub2gm_align(
                 reinterpret_cast<__gm__ uint8_t *>((y + (token * heads * dim + dim - R))),
@@ -226,10 +222,7 @@ __global__ __aicore__ void rope_tail_kernel(GM_ADDR input, GM_ADDR cosine, GM_AD
         wait_flag(PIPE_V, PIPE_MTE2, ::event_t(slot));
         wait_flag(PIPE_MTE3, PIPE_V, ::event_t(slot));
     }
-    set_flag(PIPE_V, PIPE_S, ::event_t(position_quant::kRopeConsumerDrain));
-    wait_flag(PIPE_V, PIPE_S, ::event_t(position_quant::kRopeConsumerDrain));
-    set_flag(PIPE_MTE2, PIPE_S, ::event_t(position_quant::kRopeConsumerDrain));
-    wait_flag(PIPE_MTE2, PIPE_S, ::event_t(position_quant::kRopeConsumerDrain));
-    set_flag(PIPE_MTE3, PIPE_S, ::event_t(position_quant::kRopeConsumerDrain));
-    wait_flag(PIPE_MTE3, PIPE_S, ::event_t(position_quant::kRopeConsumerDrain));
+    native_device::pipe_fence<PIPE_V, PIPE_S, position_quant::kRopeConsumerDrain>();
+    native_device::pipe_fence<PIPE_MTE2, PIPE_S, position_quant::kRopeConsumerDrain>();
+    native_device::pipe_fence<PIPE_MTE3, PIPE_S, position_quant::kRopeConsumerDrain>();
 }

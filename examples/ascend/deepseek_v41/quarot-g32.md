@@ -4,12 +4,12 @@
 
 The target-only export is `DeepSeek-V4.1-Flash-1017-quarot-int4-g32`.
 `text_config.dsv41_target_moe_format=quarot_h32_int4_g32_v1` selects it on the
-910B backend. Do not set the old MXFP4-A8 switch to select this encoding.
+910B backend.
 MTP/DSpark retains its original weights and quantization. Attention, Engram
 and the residual stream retain their original basis. Target conversion reads
 weights only; evaluation prompts never participate in fitting.
 
-### Joint shared/routed execution (native ABI 28)
+### Joint shared/routed execution (native ABI 29)
 
 With EP8 sequence-parallel dispatch, the first collective still gathers BF16
 tokens. Each receiving rank quantizes the gathered token matrix **once**.

@@ -4,8 +4,12 @@
 // Host/device allocation contract for the project's sole target, Ascend 910B.
 // CANN 9.1 asc/include/utils/base/sys_constants.h, __NPU_ARCH__ == 2201.
 // The SDK reserves 256 bytes from UB/L1; these are usable allocation budgets.
-// This header contains no events, barriers or pipeline ownership.
+// Shared numeric limits used by host planning and device code.
 namespace arch2201 {
+// CANN 9.1 adv_api/detail/matmul/stage/compute/mmad_compute.h, Compute().
+inline constexpr int kMmadFractal = 16;
+inline constexpr int kUnfencedMmadFractals = 10;
+
 inline constexpr uint64_t kKiB = 1024;
 inline constexpr uint64_t kSdkReservedBytes = 256;
 inline constexpr uint64_t kUbBytes = 192 * kKiB - kSdkReservedBytes;

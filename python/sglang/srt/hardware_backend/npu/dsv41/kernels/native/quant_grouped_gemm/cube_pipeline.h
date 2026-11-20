@@ -1,11 +1,14 @@
 #pragma once
+#include <common/cube.h>
+#include <common/device.h>
 #include <cstdint>
 #include <kernel_operator.h>
 #include <c_api/asc_simd.h>
 #include <quant_grouped_gemm/layout.h>
-#include <quant_grouped_gemm/schedule.h>
+#include <common/grouped_schedule.h>
 
 namespace quant_gmm {
+using grouped_gemm::Tile;
 using namespace AscendC;
 
 // Two L1 panels and two L0 operands overlap MTE2 -> MTE1 -> M. AIC reads the
@@ -31,16 +34,14 @@ template <class P> class CubePipeline {
     }
     __aicore__ inline void initialize() {
         asc_set_l0c_copy_params(1, 0, 0);
-        set_flag(PIPE_S, PIPE_FIX, ::event_t(kFixStateEvent));
-        wait_flag(PIPE_S, PIPE_FIX, ::event_t(kFixStateEvent));
+        native_device::pipe_fence<PIPE_S, PIPE_FIX, kFixStateEvent>();
         set_l3d_rpt(uint64_t(1) << 16);
         // Entry InitSocState() already establishes zero padding and boundary.
         set_left_matrix_rows(P::Rows);
         set_fmatrix_b(uint64_t(Shape::step_k) | (uint64_t(1) << 16));
         // Register writes need Scalar->MTE1 ordering; these pipe pairs have
         // no HardEvent enumerator, so issue their explicit pipe/event instructions.
-        set_flag(PIPE_S, PIPE_MTE1, ::event_t(kMatrixStateEvent));
-        wait_flag(PIPE_S, PIPE_MTE1, ::event_t(kMatrixStateEvent));
+        native_device::pipe_fence<PIPE_S, PIPE_MTE1, kMatrixStateEvent>();
     }
     __aicore__ inline void compute_chunk(int rows, int generation, int known, int panel, int chunk,
                                          int depth) {
@@ -52,30 +53,26 @@ template <class P> class CubePipeline {
         auto accumulator_l0c = reinterpret_cast<__cc__ float *>(uint64_t(0));
         if (dot >= kSlots)
             wait_flag(PIPE_M, PIPE_MTE1, ::event_t(kOperandReuseEvent + operand_slot));
-        if (rows == kFractalRows) {
-            asc_copy_l12l0a(activation_l0a, activation_l1(slot) + chunk * P::DotK * rows, 0,
-                            uint8_t(depth / kFractalRows), 1, 0);
-        } else {
-            asc_copy_l12l0a(activation_l0a, activation_l1(slot) + chunk * P::DotK * rows, depth,
-                            rows, 0, 0, 1, 1, 1, 1, 1, 1, false, false, false, false, depth);
-        }
+        if (rows == kFractalRows)
+            asc_copy_l12l0a(activation_l0a, activation_l1(slot) + chunk * P::DotK * rows,
+                            0, uint8_t(depth / kFractalRows), 1, 0);
+        else
+            native_device::load_a16_3d(activation_l0a, activation_l1(slot) + chunk * P::DotK * rows,
+                                       rows, depth);
         if (chunk + 1 == Shape::chunks && (known < 0 || generation + kSlots < known))
             set_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(slot));
         if (!chunk)
             wait_flag(PIPE_MTE2, PIPE_MTE1, ::event_t(slot + kRightOperandEventBase));
-        asc_copy_l12l0b(weight_l0b, weight_l1(slot) + chunk * P::DotK * kFractalRows, P::Columns,
-                        depth, 0, 0, 1, 1, 1, 1, 1, 1, false, false, false, true, P::Columns);
+        native_device::load_b16_transposed(
+            weight_l0b, weight_l1(slot) + chunk * P::DotK * kFractalRows, P::Columns, depth);
         if (chunk + 1 == Shape::chunks && (known < 0 || generation + kSlots < known))
             set_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(slot + kRightOperandEventBase));
-        set_flag(PIPE_MTE1, PIPE_M, ::event_t(operand_slot));
-        wait_flag(PIPE_MTE1, PIPE_M, ::event_t(operand_slot));
+        native_device::pipe_fence<PIPE_MTE1, PIPE_M>(operand_slot);
         const uint8_t unit_flag = panel + 1 == Shape::panels && chunk + 1 == Shape::chunks
                                       ? kAccumulatorPublish
                                       : kAccumulatorContinue;
-        asc_mmad(accumulator_l0c, activation_l0a, weight_l0b, uint16_t(rows), uint16_t(depth),
-                 uint16_t(P::Columns), unit_flag, false, false, panel == 0 && chunk == 0);
-        if (rows / kFractalRows * (P::Columns / kFractalRows) < kShortMmadFractals)
-            pipe_barrier(PIPE_M);
+        native_device::mmad(accumulator_l0c, activation_l0a, weight_l0b, rows, depth, P::Columns,
+                            unit_flag, panel == 0 && chunk == 0);
         set_flag(PIPE_M, PIPE_MTE1, ::event_t(kOperandReuseEvent + operand_slot));
     }
     __aicore__ inline void compute_tile(const Tile &tile, int generation, int known,
@@ -83,15 +80,12 @@ template <class P> class CubePipeline {
         const int slot = (generation & (kSlots - 1));
         const int rows = PanelShape<P>::matrix_rows(tile.valid);
         if (!panel && generation > 0 && rows != previous_rows) {
-            set_flag(PIPE_FIX, PIPE_MTE1, ::event_t(kFootprintRetiredEvent));
-            wait_flag(PIPE_FIX, PIPE_MTE1, ::event_t(kFootprintRetiredEvent));
+            native_device::pipe_fence<PIPE_FIX, PIPE_MTE1, kFootprintRetiredEvent>();
         }
         if (!panel && rows > kFractalRows && rows != previous_rows) {
-            set_flag(PIPE_MTE1, PIPE_S, ::event_t(kMatrixStateEvent));
-            wait_flag(PIPE_MTE1, PIPE_S, ::event_t(kMatrixStateEvent));
+            native_device::pipe_fence<PIPE_MTE1, PIPE_S, kMatrixStateEvent>();
             set_left_matrix_rows(rows);
-            set_flag(PIPE_S, PIPE_MTE1, ::event_t(kMatrixStateEvent));
-            wait_flag(PIPE_S, PIPE_MTE1, ::event_t(kMatrixStateEvent));
+            native_device::pipe_fence<PIPE_S, PIPE_MTE1, kMatrixStateEvent>();
         }
         if (!panel)
             previous_rows = rows;
@@ -166,14 +160,10 @@ template <class P> class CubePipeline {
         }
         // Keep the original four independent exit pairs. They include the
         // final credit consumers on MTE2/MTE1, not just the exported result.
-        set_flag(PIPE_MTE2, PIPE_S, ::event_t(kRetirementEvent));
-        wait_flag(PIPE_MTE2, PIPE_S, ::event_t(kRetirementEvent));
-        set_flag(PIPE_MTE1, PIPE_S, ::event_t(kRetirementEvent));
-        wait_flag(PIPE_MTE1, PIPE_S, ::event_t(kRetirementEvent));
-        set_flag(PIPE_M, PIPE_S, ::event_t(kRetirementEvent));
-        wait_flag(PIPE_M, PIPE_S, ::event_t(kRetirementEvent));
-        set_flag(PIPE_FIX, PIPE_S, ::event_t(kRetirementEvent));
-        wait_flag(PIPE_FIX, PIPE_S, ::event_t(kRetirementEvent));
+        native_device::pipe_fence<PIPE_MTE2, PIPE_S, kRetirementEvent>();
+        native_device::pipe_fence<PIPE_MTE1, PIPE_S, kRetirementEvent>();
+        native_device::pipe_fence<PIPE_M, PIPE_S, kRetirementEvent>();
+        native_device::pipe_fence<PIPE_FIX, PIPE_S, kRetirementEvent>();
     }
 
   public:
@@ -183,7 +173,7 @@ template <class P> class CubePipeline {
         output_ = reinterpret_cast<__gm__ half *>(output);
         workspace_ = reinterpret_cast<__gm__ half *>(workspace);
         const int core = GetBlockIdx();
-        Schedule<P::Rows, P::Columns> schedule(routing, experts, Shape::panels, Shape::n);
+        grouped_gemm::Schedule<P::Rows, P::Columns> schedule(routing, experts, Shape::panels, Shape::n);
         Tile next{}, current{};
         if (schedule.next(core, next)) {
             // Empty actors own no flags or local buffers to retire.

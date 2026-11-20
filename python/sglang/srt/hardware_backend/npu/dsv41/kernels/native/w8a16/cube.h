@@ -1,4 +1,6 @@
 #pragma once
+#include <common/cube.h>
+#include <common/device.h>
 #include <w8a16/layout.h>
 
 namespace w8a16 {
@@ -52,15 +54,12 @@ class CubePipeline {
         const int slot = generation % kSlots, panel = generation % kPanels;
         const int rows = tile.matrix_rows;
         if (!panel && generation > 0 && rows != previous_rows_) {
-            set_flag(PIPE_FIX, PIPE_MTE1, ::event_t(kFootprintRetiredEvent));
-            wait_flag(PIPE_FIX, PIPE_MTE1, ::event_t(kFootprintRetiredEvent));
+            native_device::pipe_fence<PIPE_FIX, PIPE_MTE1, kFootprintRetiredEvent>();
         }
         if (!panel && rows != previous_rows_) {
-            set_flag(PIPE_MTE1, PIPE_S, ::event_t(kStateEvent));
-            wait_flag(PIPE_MTE1, PIPE_S, ::event_t(kStateEvent));
+            native_device::pipe_fence<PIPE_MTE1, PIPE_S, kStateEvent>();
             set_fmatrix(uint64_t(rows) | (uint64_t(1) << 16));
-            set_flag(PIPE_S, PIPE_MTE1, ::event_t(kStateEvent));
-            wait_flag(PIPE_S, PIPE_MTE1, ::event_t(kStateEvent));
+            native_device::pipe_fence<PIPE_S, PIPE_MTE1, kStateEvent>();
             previous_rows_ = rows;
         }
         wait_flag(PIPE_MTE2, PIPE_MTE1, ::event_t(slot));
@@ -75,27 +74,21 @@ class CubePipeline {
                 asc_copy_l12l0a(left, activation_l1(slot) + chunk * kMemory.dot_k * rows,
                                 0, uint8_t(kMemory.dot_k / kC0), 1, 0);
             else
-                asc_copy_l12l0a(reinterpret_cast<__ca__ half *>(left),
-                    reinterpret_cast<__cbuf__ half *>(activation_l1(slot) + chunk * kMemory.dot_k * rows),
-                    kMemory.dot_k, rows, 0, 0, 1, 1, 1, 1, 1, 1, false, false, false, false, kMemory.dot_k);
+                native_device::load_a16_3d(left, activation_l1(slot) + chunk * kMemory.dot_k * rows,
+                                           rows, kMemory.dot_k);
             if (chunk + 1 == chunks && generation + kSlots < count)
                 set_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(slot));
             if (!chunk)
                 wait_flag(PIPE_MTE2, PIPE_MTE1, ::event_t(slot + kWeightPanelEventBase));
-            // NZ stream is [N16,BK,16]; this 3D import transposes each right
-            // operand into Cube's ZZ order, matching grouped GEMM's orientation.
-            asc_copy_l12l0b(reinterpret_cast<__cb__ half *>(right),
-                reinterpret_cast<__cbuf__ half *>(weight_l1(slot) + chunk * kMemory.dot_k * kC0),
-                kColumns, kMemory.dot_k, 0, 0, 1, 1, 1, 1, 1, 1, false, false, false, true, kColumns);
+            native_device::load_b16_transposed(right, weight_l1(slot) + chunk * kMemory.dot_k * kC0,
+                                               kColumns, kMemory.dot_k);
             if (chunk + 1 == chunks && generation + kSlots < count)
                 set_flag(PIPE_MTE1, PIPE_MTE2, ::event_t(slot + kWeightPanelEventBase));
-            set_flag(PIPE_MTE1, PIPE_M, ::event_t(operand_slot));
-            wait_flag(PIPE_MTE1, PIPE_M, ::event_t(operand_slot));
+            native_device::pipe_fence<PIPE_MTE1, PIPE_M>(operand_slot);
             const uint8_t unit_flag = panel + 1 == kPanels && chunk + 1 == chunks
                                           ? kAccumulatorPublish : kAccumulatorContinue;
-            asc_mmad(accumulator, left, right, uint16_t(rows), uint16_t(kMemory.dot_k),
-                     uint16_t(kColumns), unit_flag, false, false, panel == 0 && chunk == 0);
-            if (rows / kC0 * (kColumns / kC0) < kShortMmadFractals) pipe_barrier(PIPE_M);
+            native_device::mmad(accumulator, left, right, rows, kMemory.dot_k, kColumns, unit_flag,
+                                panel == 0 && chunk == 0);
             set_flag(PIPE_M, PIPE_MTE1, ::event_t(kOperandReuseEventBase + operand_slot));
         }
         if (panel + 1 == kPanels) {
@@ -111,13 +104,11 @@ class CubePipeline {
         output_ = reinterpret_cast<__gm__ Output *>(output);
         workspace_ = reinterpret_cast<__gm__ Element *>(workspace);
         asc_set_l0c_copy_params(1, 0, 0);
-        set_flag(PIPE_S, PIPE_FIX, ::event_t(kAccumulatorEvent));
-        wait_flag(PIPE_S, PIPE_FIX, ::event_t(kAccumulatorEvent));
+        native_device::pipe_fence<PIPE_S, PIPE_FIX, kAccumulatorEvent>();
         set_l3d_rpt(uint64_t(1) << 16);
         set_fmatrix(uint64_t(kRows) | (uint64_t(1) << 16));
         set_fmatrix_b(uint64_t(kPanelK) | (uint64_t(1) << 16));
-        set_flag(PIPE_S, PIPE_MTE1, ::event_t(kStateEvent));
-        wait_flag(PIPE_S, PIPE_MTE1, ::event_t(kStateEvent));
+        native_device::pipe_fence<PIPE_S, PIPE_MTE1, kStateEvent>();
         const int core = GetBlockIdx();
         const int64_t jobs = (rows + kRows - 1) / kRows * (kLogicalN / kColumns) * kBatches;
         const int count = int((jobs - core + kWorkers - 1) / kWorkers) * kPanels;
@@ -133,14 +124,10 @@ class CubePipeline {
         for (int slot = 0; slot < kSlots; ++slot)
             if (count * chunks > slot)
                 wait_flag(PIPE_M, PIPE_MTE1, ::event_t(kOperandReuseEventBase + slot));
-        set_flag(PIPE_MTE2, PIPE_S, ::event_t(kDrainEvent));
-        wait_flag(PIPE_MTE2, PIPE_S, ::event_t(kDrainEvent));
-        set_flag(PIPE_MTE1, PIPE_S, ::event_t(kDrainEvent));
-        wait_flag(PIPE_MTE1, PIPE_S, ::event_t(kDrainEvent));
-        set_flag(PIPE_M, PIPE_S, ::event_t(kDrainEvent));
-        wait_flag(PIPE_M, PIPE_S, ::event_t(kDrainEvent));
-        set_flag(PIPE_FIX, PIPE_S, ::event_t(kDrainEvent));
-        wait_flag(PIPE_FIX, PIPE_S, ::event_t(kDrainEvent));
+        native_device::pipe_fence<PIPE_MTE2, PIPE_S, kDrainEvent>();
+        native_device::pipe_fence<PIPE_MTE1, PIPE_S, kDrainEvent>();
+        native_device::pipe_fence<PIPE_M, PIPE_S, kDrainEvent>();
+        native_device::pipe_fence<PIPE_FIX, PIPE_S, kDrainEvent>();
     }
 };
 } // namespace w8a16

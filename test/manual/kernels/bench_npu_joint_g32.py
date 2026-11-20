@@ -17,7 +17,7 @@ from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import (
     FP8Weight,
     Router,
 )
-from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.mxfp4_a8 import pack_g32
+from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.int4_g32_a8 import pack_g32
 from sglang.srt.hardware_backend.npu.dsv41.linear import (
     SharedW8A8Method,
     W8A16LinearMethod,
@@ -236,7 +236,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--captures",
         type=Path,
-        help="optional legacy BF16 router-input captures from replay_target_moe",
+        help="optional legacy BF16 router-input captures from capture_target_moe",
     )
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--tokens", type=int, nargs="+", default=[4, 8, 32])

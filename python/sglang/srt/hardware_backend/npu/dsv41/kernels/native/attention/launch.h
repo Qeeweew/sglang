@@ -10,11 +10,8 @@ inline constexpr int32_t kWidthCapacity = 512;
 inline constexpr int32_t kSelectedCapacity = 512;
 inline constexpr int32_t kDotRows = 128;
 inline constexpr int32_t kFeaturePanelColumns = 256;
-// arch2201 MMAD uses 16x16 output fractals. Its fewer-than-ten-fractal
-// fence is also explicit in the fixed arch22 QLI Cube implementation.
-inline constexpr int32_t kMatrixFractalRows = 16;
+inline constexpr int32_t kMatrixFractalRows = arch2201::kMmadFractal;
 inline constexpr int32_t kMatrixFractalElements = kMatrixFractalRows * kMatrixFractalRows;
-inline constexpr int32_t kUnfencedMmadFractals = 10;
 inline constexpr int32_t kSmallQueryTileRows = 2 * kMatrixFractalRows;
 inline constexpr int32_t kSparseWindowCapacity = kDotRows;
 inline constexpr int32_t kSparseRowCapacity = kSparseWindowCapacity + kSelectedCapacity;

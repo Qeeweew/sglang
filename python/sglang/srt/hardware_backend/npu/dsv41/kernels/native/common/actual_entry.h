@@ -9,9 +9,9 @@ namespace native_jit {
 // keeps a repeated warm call free of map traversal/string construction. Keys
 // contain scalar geometry, finite storage/dataflow policy and prepared worker budget;
 // addresses, payloads and live lengths are excluded.
-template <size_t Dimensions> class ActualEntries {
+template <class Geometry> class KernelCache {
   public:
-    using Key = std::array<uint64_t, Dimensions>;
+    using Key = Geometry;
 
   private:
     std::map<Key, std::unique_ptr<Kernel>> entries_;
@@ -30,4 +30,6 @@ template <size_t Dimensions> class ActualEntries {
         return *last_;
     }
 };
+
+template <size_t Dimensions> using ActualEntries = KernelCache<std::array<uint64_t, Dimensions>>;
 } // namespace native_jit
