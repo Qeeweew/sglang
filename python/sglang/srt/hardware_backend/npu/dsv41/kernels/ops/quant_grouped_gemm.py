@@ -228,7 +228,7 @@ class MXFP4LocalExperts:
             )
         self.activation_op = activation_op
 
-    def bind(
+    def bind_projections(
         self,
         x,
         routing,
@@ -240,7 +240,7 @@ class MXFP4LocalExperts:
         mean_expert_rows=None,
         tiling_rows=None,
     ):
-        """Bind two GEMMs and one activation to caller-owned stable buffers."""
+        """Bind the two GEMMs independently of the pointwise schedule."""
         hints = {} if tiling_rows is None else {"tiling_rows": tiling_rows}
         gate = self.gate_up.bind(
             x,
@@ -251,8 +251,6 @@ class MXFP4LocalExperts:
             mean_expert_rows=mean_expert_rows,
             **hints,
         )
-        rows = routing[1:2]
-        activate = self.activation_op.bind(gate_up, out=activation, rows=rows)
         down = self.down.bind(
             activation,
             *self.down_weight,
@@ -263,13 +261,20 @@ class MXFP4LocalExperts:
             **hints,
         )
 
+        return gate, down
+
+    def bind(self, x, routing, *, gate_up, activation, out, **bounds):
+        gate, down = self.bind_projections(
+            x, routing, gate_up=gate_up, activation=activation, out=out, **bounds
+        )
+        activate = self.activation_op.bind(gate_up, out=activation, rows=routing[1:2])
+
         def invoke():
             gate()
             activate()
             down()
             return out
 
-        invoke.projections = (gate, down)
         return invoke
 
     def __call__(

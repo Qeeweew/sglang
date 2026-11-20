@@ -39,9 +39,9 @@ class PeerCommunicator : public torch::CustomClassHolder {
                     "expected global token route IDs [DP*rows,topk<=16]");
         check(inverse, at::kInt, device(), {ids.numel()});
         check(weights, at::kFloat, device(), ids.sizes());
-        check(values, at::kHalf, device());
+        check(values, values.scalar_type() == at::kBFloat16 ? at::kBFloat16 : at::kHalf, device());
         TORCH_CHECK(values.dim() == 2 && values.size(1) == 5120 && values.size(0) <= ids.numel(),
-                    "invalid FP16 routed values");
+                    "invalid routed values");
         return ids.size(1);
     }
     c10_npu::NPUStream stream() const {
@@ -193,7 +193,7 @@ class PeerCommunicator : public torch::CustomClassHolder {
         track(shared, current);
         launch_peer_moe(current.stream(), values.data_ptr(), inverse.data_ptr(), ids.data_ptr(),
                         weights.data_ptr(), ptr(shared), output.data_ptr(), local_,
-                        table_.data_ptr(), rank_, n, topk, false, true, attention_tp_);
+                        table_.data_ptr(), rank_, n, topk, false, true, attention_tp_, values.scalar_type() == at::kBFloat16);
     }
     void post(const at::Tensor &input, const at::Tensor &residual, const at::Tensor &pre,
               const at::Tensor &post_mix, const at::Tensor &comb, const OptionalTensor &weight,
@@ -237,7 +237,7 @@ class PeerCommunicator : public torch::CustomClassHolder {
                         post_mix.data_ptr(), comb.data_ptr(), ptr(weight), updated.data_ptr(),
                         ptr(normalized), local_, table_.data_ptr(), ptr(inverse), ptr(ids),
                         ptr(weights), ptr(shared), rank_, n, topk, world_, bool(weight),
-                        attention_tp_);
+                        attention_tp_, world_ == 8 && input.scalar_type() == at::kBFloat16);
     }
     void disconnect() {
         if (!local_)

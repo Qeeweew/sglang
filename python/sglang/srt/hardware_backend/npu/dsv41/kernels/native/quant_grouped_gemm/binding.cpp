@@ -1,11 +1,10 @@
 #include "torch.h"
 #include "tiling.h"
 #include <common/grouped_metadata.h>
+#include <common/l2_bypass.h>
 #include "launch.h"
 #include "jit.h"
 #include "workspace.h"
-
-extern "C" int rtGetL2CacheOffset(uint32_t device, uint64_t *offset);
 
 namespace native_host {
 namespace {
@@ -96,17 +95,6 @@ int64_t gemm_cores(int64_t device) {
                     core_count(device) == kVectorLanesPerCube * cores,
                 "native quantized GEMM requires Ascend 910B mixed cores");
     return validated_devices.emplace(device, cores).first->second;
-}
-uint64_t l2_bypass_alias(int device) {
-    thread_local std::unordered_map<int, uint64_t> aliases;
-    auto found = aliases.find(device);
-    if (found == aliases.end()) {
-        uint64_t alias = 0;
-        const auto status = rtGetL2CacheOffset(device, &alias);
-        TORCH_CHECK(status == 0 && alias, "910B L2 bypass alias unavailable: ", status);
-        found = aliases.emplace(device, alias).first;
-    }
-    return found->second;
 }
 void run(const at::Tensor &x, const at::Tensor &packed, const at::Tensor &scales,
          const at::Tensor &routing, const at::Tensor &out,

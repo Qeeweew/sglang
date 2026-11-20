@@ -47,6 +47,19 @@ def row_buffer(role, device, stream, width, dtype=torch.bfloat16):
     return RowBuffer(device, width, dtype)
 
 
+def adapt_shared_before_gather(original):
+    if not enabled():
+        return original
+
+    @wraps(original)
+    def before_gather(mlp):
+        from .joint_experts import can_join
+
+        return original(mlp) and not can_join(mlp)
+
+    return before_gather
+
+
 def adapt_run(original):
     if not enabled():
         return original
@@ -55,8 +68,11 @@ def adapt_run(original):
     def run(layer, hidden_states, forward_batch, **kwargs):
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
         from sglang.srt.models import deepseek_v4
-        from sglang.srt.models.deepseek_common import moe_transport as transport
+        from sglang.srt.models.deepseek_common.moe_transport import (
+            shared_expert_runs_locally,
+        )
         from sglang.srt.runtime_context import get_parallel
+        from .joint_experts import can_join
 
         if (
             layer.config.model_type != "deepseek_v41"
@@ -66,20 +82,23 @@ def adapt_run(original):
         token = _in_moe.set(True)
         try:
             if (
-                _use_moe_sequence_parallel(get_parallel(), forward_batch)
-                and get_moe_a2a_backend().is_none()
-                and (not deepseek_v4.is_cp_active(forward_batch))
-                and (
-                    getattr(layer.mlp, "shared_experts", None) is None
-                    or (
-                        transport.SHARED_EXPERT_LOCAL
-                        and getattr(layer.mlp, "_shared_expert_tp1", False)
-                    )
-                )
+                get_moe_a2a_backend().is_none()
+                and not deepseek_v4.is_cp_active(forward_batch)
+                and moe_sequence_parallel_enabled(get_parallel())
             ):
-                return _run_sequence_parallel(
-                    layer, hidden_states, forward_batch, **kwargs
-                )
+                joint = can_join(layer.mlp)
+                if _use_moe_sequence_parallel(
+                    get_parallel(), forward_batch, joint
+                ) and (
+                    joint
+                    or getattr(layer.mlp, "shared_experts", None) is None
+                    or shared_expert_runs_locally(layer.mlp)
+                ):
+                    return _run_sequence_parallel(
+                        layer, hidden_states, forward_batch, joint=joint, **kwargs
+                    )
+                if joint:
+                    return _run_dp_joint(layer, hidden_states, forward_batch, **kwargs)
             return original(layer, hidden_states, forward_batch, **kwargs)
         finally:
             _in_moe.reset(token)
@@ -122,16 +141,100 @@ def moe_sequence_parallel_enabled(parallel):
     )
 
 
-def _use_moe_sequence_parallel(parallel, batch):
+def _use_moe_sequence_parallel(parallel, batch, joint):
+    from sglang.srt.environ import envs
+
     from .peer_collectives import enabled as peer_enabled
 
     return (
-        moe_sequence_parallel_enabled(parallel)
-        # Preserve the existing DP8 MoeRowTransport baseline when opted out.
-        and (parallel.attn_tp_size == 2 or peer_enabled())
-        and batch.dp_padding_mode is not None
+        batch.dp_padding_mode is not None
         and batch.dp_padding_mode.is_max_len()
+        and (
+            parallel.attn_tp_size == 2
+            or peer_enabled()
+            or (joint and envs.SGLANG_DP_USE_REDUCE_SCATTER.get())
+        )
     )
+
+
+def _joint_dp_rows(mlp, gathered, batch, rows, input_ids, input_ids_global):
+    from sglang.srt.layers.dp_attention import dp_slot_in, get_dp_global_num_tokens
+
+    counts = get_dp_global_num_tokens()
+    slot = dp_slot_in(counts)
+    if counts[slot] != rows or sum(counts) != gathered.shape[0]:
+        raise ValueError("joint MoE owner rows disagree with the DP gather layout")
+    if not gathered.shape[0]:
+        return gathered, None
+    first = sum(counts[:slot])
+    return mlp(
+        gathered,
+        batch,
+        input_ids=input_ids,
+        input_ids_global=input_ids_global,
+        skip_shared_experts=True,
+        joint_shared_slice=slice(first, first + rows),
+    )
+
+
+def _run_dp_joint(
+    layer,
+    local,
+    batch,
+    *,
+    input_ids=None,
+    input_ids_global=None,
+    return_moe_output=False,
+):
+    """Use the DP transport's published row layout, including unequal and idle DPs."""
+    from sglang.srt.layers.moe.utils import post_experts_all_reduce
+    from sglang.srt.models.deepseek_common.moe_transport import MoeRowTransport
+
+    transport = MoeRowTransport(layer.mlp, local, batch, input_ids, input_ids_global)
+    with transport.scope():
+        routed, shared = _joint_dp_rows(
+            layer.mlp,
+            transport.input,
+            batch,
+            local.shape[0],
+            transport.input_ids,
+            transport.input_ids_global,
+        )
+        if not routed.shape[0]:
+            return torch.empty_like(local)
+        if not transport.mlp_reduce_scatter and layer.mlp.reduce_results:
+            routed = post_experts_all_reduce(routed)
+    output = transport.return_output(routed)
+    return output + shared if shared is not None else output
+
+
+def adapt_tbo_moe(original):
+    if not enabled():
+        return original
+
+    @wraps(original)
+    def run(layer, state):
+        from sglang.srt.runtime_context import get_forward
+
+        from .joint_experts import can_join
+
+        if not can_join(layer.mlp):
+            return original(layer, state)
+        if state.pop("shared_local") is not None:
+            raise RuntimeError("shared target expert ran before the TBO gather")
+        batch = state.forward_batch
+        ids = batch._tbo_global_input_ids
+        with get_forward().scoped(mlp_reduce_scatter=True):
+            state.global_expert_out, state.shared_local = _joint_dp_rows(
+                layer.mlp,
+                state.pop("global_hidden"),
+                batch,
+                batch.tbo_padded_len,
+                ids,
+                ids,
+            )
+
+    return run
 
 
 def _workspace(role, x, rows):
@@ -147,6 +250,7 @@ def _run_sequence_parallel(
     input_ids=None,
     input_ids_global=None,
     return_moe_output=False,
+    joint=False,
 ):
     from sglang.srt.layers.dp_attention import _DpGatheredBufferWrapper as geometry
     from sglang.srt.runtime_context import get_forward, get_parallel
@@ -171,7 +275,7 @@ def _run_sequence_parallel(
     padded_rows = shard_rows * tp
     start = parallel.attn_tp_rank * shard_rows
     owned_rows = max(0, min(shard_rows, rows - start))
-    shard = local.narrow(0, min(start, rows), owned_rows)
+    shard = local if tp == 1 else local.narrow(0, min(start, rows), owned_rows)
     shard_input = shard
     if owned_rows != shard_rows and peer is None:
         shard_input = _workspace("moe_sp_padded_input", local, shard_rows)
@@ -179,7 +283,11 @@ def _run_sequence_parallel(
             shard_input[:owned_rows].copy_(shard)
         shard_input[owned_rows:].zero_()
     shared = None
-    if owned_rows and getattr(layer.mlp, "shared_experts", None) is not None:
+    if (
+        not joint
+        and owned_rows
+        and getattr(layer.mlp, "shared_experts", None) is not None
+    ):
         shared = layer.mlp._forward_shared_experts(shard)
 
     # Rank order is DP0/TP0, DP0/TP1, DP1/TP0, ...; concatenating
@@ -202,6 +310,10 @@ def _run_sequence_parallel(
     with get_forward().scoped(
         mlp_reduce_scatter=True, npu_defer_route_combine=peer is not None
     ):
+        joint_args = {}
+        if joint:
+            owner = parallel.attn_dp_rank * rows + min(start, rows)
+            joint_args["joint_shared_slice"] = slice(owner, owner + owned_rows)
         partial = layer.mlp(
             gathered,
             batch,
@@ -209,7 +321,10 @@ def _run_sequence_parallel(
             input_ids_global=input_ids_global,
             skip_shared_experts=True,
             return_moe_output=False,
+            **joint_args,
         )
+        if joint:
+            partial, shared = partial
     if peer is not None:
         return peer.finish(partial, shared, rows)
     if padded_rows != rows:
@@ -219,17 +334,20 @@ def _run_sequence_parallel(
         padded_partial[:, :rows].copy_(partial.view(parallel.attn_dp_size, rows, -1))
         padded_partial[:, rows:].zero_()
         partial = padded_partial.view(-1, local.shape[1])
-    shard_output = _workspace("moe_sp_shard", local, shard_rows)
+    shard_output = (
+        torch.empty_like(local)
+        if tp == 1
+        else _workspace("moe_sp_shard", local, shard_rows)
+    )
     parallel.tp_group.reduce_scatter_tensor(shard_output, partial)
     if shared is not None:
         # EP8 already completed the expert sum. Add the replicated shared
         # expert exactly once on its token shard, before restoring TP copies.
         shard_output[:owned_rows].add_(shared)
+    if tp == 1:
+        return shard_output
     output = torch.empty(
         (padded_rows, local.shape[1]), dtype=local.dtype, device=local.device
     )
-    if tp == 1:
-        output.copy_(shard_output)
-    else:
-        parallel.attn_tp_group.all_gather_into_tensor(output, shard_output)
+    parallel.attn_tp_group.all_gather_into_tensor(output, shard_output)
     return output[:rows]

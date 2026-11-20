@@ -108,7 +108,11 @@ __aicore__ inline void publish_partial(const View &v, GM_ADDR input, GM_ADDR inv
                 asc_copy_gm2ub(
                     raw, reinterpret_cast<__gm__ half *>(input) + uint64_t(slot) * H + col, T * 2);
                 s::loaded();
+#if PEER_ROUTED_BF16
+                asc_bfloat162float(fp, reinterpret_cast<__ubuf__ bfloat16_t *>(raw), T);
+#else
                 asc_half2float(fp, raw, T);
+#endif
                 pipe_barrier(PIPE_V);
                 asc_mul_scalar(fp, fp, weight, T);
                 pipe_barrier(PIPE_V);

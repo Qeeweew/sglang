@@ -58,6 +58,10 @@
       "backend": "jit"
     },
     {
+      "name": "mxfp4_a8",
+      "backend": "jit"
+    },
+    {
       "name": "page_metadata",
       "backend": "jit"
     },

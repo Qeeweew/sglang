@@ -29,29 +29,35 @@ def live_dp_counts(device, ranks):
 
 
 @cache
-def _expert_projections(experts, hidden, width, device):
+def _expert_projections(experts, hidden, width, device, a8=False, g32=False):
     from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import NativeGroupedGemm
 
+    projection = NativeGroupedGemm
+    if a8:
+        from .kernels.ops.mxfp4_a8 import A8GroupedGemm
+
+        projection = A8GroupedGemm
     result = []
-    for k, n in ((hidden, 2 * width), (width, hidden)):
+    for down, (k, n) in enumerate(((hidden, 2 * width), (width, hidden))):
         result.append(
-            NativeGroupedGemm(
+            projection(
                 k,
                 n,
                 experts=experts,
                 device=torch.device("npu", device),
+                **({"g32": True, "interleaved": bool(down)} if g32 else {}),
             )
         )
     return tuple(result)
 
 
 @cache
-def activation(width):
+def activation(width, *, prefix=True):
     from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.elementwise import (
         PackedClippedSwiGLU,
     )
 
-    return PackedClippedSwiGLU(dimension=width, dtype="f16", prefix=True)
+    return PackedClippedSwiGLU(dimension=width, dtype="f16", prefix=prefix)
 
 
 class ExpertScratch:
@@ -66,8 +72,9 @@ class ExpertScratch:
     budget keeps the high-water capacity and does not invalidate bindings.
     """
 
-    def __init__(self, device, hidden, width):
+    def __init__(self, device, hidden, width, dtype=torch.float16):
         self.device, self.hidden, self.width = device, hidden, width
+        self.dtype = dtype
         self.capacity, self.slot_capacity, self.buffers, self.retired = 0, 0, None, []
         self.bindings, self.graph_bindings, self.retired_bindings = {}, {}, []
         self.captured = False
@@ -102,7 +109,7 @@ class ExpertScratch:
             h, i = capacity * self.hidden, capacity * self.width
             start = max(h, i)
             storage = torch.empty(
-                (start + 2 * i,), dtype=torch.float16, device=self.device
+                (start + 2 * i,), dtype=self.dtype, device=self.device
             )
             sorted_x = storage[:h].view(capacity, self.hidden)
             gate_up = storage[start : start + 2 * i].view(capacity, 2 * self.width)
@@ -119,8 +126,8 @@ class ExpertScratch:
 
 
 @cache
-def expert_scratch(device, stream, hidden, width):
-    return ExpertScratch(device, hidden, width)
+def expert_scratch(device, stream, hidden, width, dtype=torch.float16):
+    return ExpertScratch(device, hidden, width, dtype)
 
 
 def compact_prefill(batch):
@@ -148,6 +155,14 @@ def weight_packer(k, n, device):
 class ResidentMXFP4Method(FusedMoEMethodBase):
     fuse_routed_scaling_factor_in_topk = True
 
+    def __init__(self, *, a8=False, g32=False, is_draft=False):
+        self.a8, self.g32 = a8 or g32, g32
+        self.is_draft = is_draft
+
+    def _weights(self, name):
+        fields = ("packed", "scales", "channel") if self.a8 else ("packed", "scales")
+        return tuple(getattr(self.layer, f"{name}_{field}") for field in fields)
+
     def create_weights(
         self,
         layer,
@@ -167,6 +182,10 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
             intermediate_size_per_partition,
         )
         self.global_i = attrs["moe_intermediate_size"]
+        if self.g32 and (self.i % 256 or self.h % 256):
+            raise ValueError(
+                "G32 TP partitions must preserve H32 interleave panels of 256"
+            )
         self.rank, self.tp = layer.moe_tp_rank, layer.moe_tp_size
         self.ep = layer.moe_ep_size
         self.first_expert = layer._expert_storage_rank * self.e
@@ -181,17 +200,31 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
         self.pending, self.pending_expert = {}, None
         # Only compressed final payloads persist. The loader consumes one raw
         # expert at a time and never retains an unpacked weight tensor.
-        for name, shape, dtype in (
-            ("gate_up_packed", (self.e, self.h * 2 * self.i // 8), torch.int32),
-            ("gate_up_scales", (self.e, self.h * 2 * self.i // 32), torch.uint8),
-            ("down_packed", (self.e, self.h * self.i // 8), torch.int32),
-            ("down_scales", (self.e, self.h * self.i // 32), torch.uint8),
+        for name, depth, width in (
+            ("gate_up", self.h, 2 * self.i),
+            ("down", self.i, self.h),
         ):
-            layer.register_buffer(
-                name,
-                torch.empty(shape, dtype=dtype, device=self.device),
-                persistent=False,
+            if self.a8 and not (256 <= depth <= 8192 and width % 64 == 0):
+                raise ValueError("unsupported 910B A8 expert geometry")
+            elements = depth * width
+            fields = (
+                (
+                    ("packed", elements // 2, torch.uint8),
+                    ("scales", elements // 64, torch.uint8),
+                    ("channel", width, torch.float32),
+                )
+                if self.a8
+                else (
+                    ("packed", elements // 8, torch.int32),
+                    ("scales", elements // 32, torch.uint8),
+                )
             )
+            for field, size, dtype in fields:
+                layer.register_buffer(
+                    f"{name}_{field}",
+                    torch.empty((self.e, size), dtype=dtype, device=self.device),
+                    persistent=False,
+                )
         for name in (
             "w13_weight",
             "w13_weight_scale_inv",
@@ -204,7 +237,6 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
             param.weight_loader = self.weight_loader
             layer.register_parameter(name, param)
         self.layer = layer
-        _expert_projections(self.e, self.h, self.i, torch.npu.current_device())
 
     def create_moe_runner(self, layer, moe_runner_config):
         if (
@@ -249,16 +281,22 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
             if projection < 2
             else (self.h, self.global_i // (32 if scale else 2))
         )
+        if scale and self.g32:
+            expected = (expected[0], expected[1] // 2 + 4)
         if tuple(raw.shape) != expected:
             raise ValueError(
                 f"MXFP4 {shard_id} source shape {tuple(raw.shape)} != {expected}"
             )
         lo, hi = self.rank * self.i, (self.rank + 1) * self.i
-        shard = (
-            raw[lo:hi]
-            if projection < 2
-            else raw[:, lo // (32 if scale else 2) : hi // (32 if scale else 2)]
-        )
+        if projection < 2:
+            shard = raw[lo:hi]
+        elif self.tp == 1:
+            shard = raw
+        elif scale and self.g32:
+            shard = torch.cat((raw[:, lo // 64 : hi // 64], raw[:, -4:]), dim=1)
+        else:
+            divisor = 32 if scale else 2
+            shard = raw[:, lo // divisor : hi // divisor]
         self.pending_expert = expert_id
         self.pending[slot] = shard.contiguous()
         if len(self.pending) == 6:
@@ -269,44 +307,54 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
                     (c, s),
                     self.h,
                     2 * self.i,
-                    (self.layer.gate_up_packed, self.layer.gate_up_scales),
+                    self._weights("gate_up"),
                 ),
                 (
                     (self.pending[4], self.pending[5]),
                     self.i,
                     self.h,
-                    (self.layer.down_packed, self.layer.down_scales),
+                    self._weights("down"),
                 ),
             ):
-                converter = weight_packer(
-                    k,
-                    n,
-                    self.device,
-                )
-                converter.load_cpu(
-                    *pair, packed=target[0][expert_id], s2=target[1][expert_id]
-                )
+                if self.a8:
+                    from .kernels.ops.mxfp4_a8 import pack_expert, pack_g32
+
+                    pack = pack_g32 if self.g32 else pack_expert
+                    for buffer, value in zip(target, pack(*pair), strict=True):
+                        buffer[expert_id].copy_(value)
+                else:
+                    weight_packer(k, n, self.device).load_cpu(
+                        *pair, packed=target[0][expert_id], s2=target[1][expert_id]
+                    )
             self.loaded[expert_id] = [True] * 6
             self.pending.clear()
             self.pending_expert = None
         return True
 
-    def process_weights_after_loading(self, layer):
-        from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import MXFP4LocalExperts
-
-        if self.pending or not all(all(parts) for parts in self.loaded):
-            raise RuntimeError("incomplete resident MXFP4 expert weights")
+    def bind_local_experts(self, gate_up_weight, down_weight):
         up, down = _expert_projections(
-            self.e, self.h, self.i, torch.npu.current_device()
+            self.e, self.h, self.i, torch.npu.current_device(), self.a8, self.g32
         )
-        self.local_experts = MXFP4LocalExperts(
+        if self.g32:
+            from .joint_experts import G32Projections
+
+            return G32Projections(up, down, gate_up_weight, down_weight)
+        from .kernels.ops import MXFP4LocalExperts
+
+        return MXFP4LocalExperts(
             up,
             down,
-            (layer.gate_up_packed, layer.gate_up_scales),
-            (layer.down_packed, layer.down_scales),
+            gate_up_weight,
+            down_weight,
             limit=self.limit,
             activation_op=activation(self.i),
         )
+
+    def process_weights_after_loading(self, layer):
+        if self.pending or not all(all(parts) for parts in self.loaded):
+            raise RuntimeError("incomplete resident expert weights")
+        weights = self._weights("gate_up"), self._weights("down")
+        self.local_experts = self.bind_local_experts(*weights)
         logger.debug(
             "Resident Ascend C MXFP4 layer %s: rank %d/%d, %d experts, H%d/J%d, %.3f GiB compressed NPU weights (%s scales)",
             layer.layer_id,
@@ -315,25 +363,17 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
             self.e,
             self.h,
             self.i,
-            sum(
-                getattr(layer, n).numel() * getattr(layer, n).element_size()
-                for n in (
-                    "gate_up_packed",
-                    "gate_up_scales",
-                    "down_packed",
-                    "down_scales",
-                )
-            )
+            sum(buffer.nbytes for projection in weights for buffer in projection)
             / 2**30,
-            "uint8 preprocessed FP16",
+            "per-token A8, signed K32 factors"
+            if self.a8
+            else "uint8 preprocessed FP16",
         )
 
     def apply(self, layer, dispatch_output):
         raise RuntimeError("resident MXFP4 uses the V4.1 native routing entry")
 
-    def routed(self, x, routing, *, compact=False):
-        if x.shape[0] == 0:
-            return torch.empty_like(x)
+    def routed_storage(self, x, routing, compact, dtype):
         from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.moe_routes import (
             MoERoutes,
         )
@@ -346,7 +386,11 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
         capturing = torch.npu.is_current_stream_capturing()
         compact = compact and self.ep > 1 and not capturing
         arena = expert_scratch(
-            x.device, torch.npu.current_stream(x.device).npu_stream, self.h, self.i
+            x.device,
+            torch.npu.current_stream(x.device).npu_stream,
+            self.h,
+            self.i,
+            dtype,
         )
         # kB is a proven upper bound even for a completely skewed EP rank.
         # Reuse an already sufficient arena, or spend a bounded amount for a
@@ -355,19 +399,39 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
         rows = int(routing.metadata[1].item()) if compact and not fits_bound else slots
         if not 0 <= rows <= slots:
             raise ValueError("invalid compact local expert row count")
-        sorted_x, inverse, gate_up, activated, values = arena.get(rows, slots=slots)
+        return arena, arena.get(rows, slots=slots)
+
+    def prepare_routed(self, x, routing, compact, *, shared_input=None, first=0):
+        arena, (sorted_x, inverse, gate_up, activated, values) = self.routed_storage(
+            x, routing, compact, torch.float16
+        )
+        rows, slots = sorted_x.shape[0], routing.ids.numel()
+        if rows or (shared_input is not None and shared_input.shape[0]):
+            self.routes.gather(
+                x,
+                routing,
+                out=sorted_x,
+                inverse=inverse,
+                shared=shared_input,
+                first=first,
+            )
         if not rows:
-            return self.routes.combine(values, inverse, routing)
+            return inverse, gate_up, activated, values, None
         bound = min(x.shape[0], rows)
         mean = slots / (self.e * self.ep)
-        self.routes.gather(x, routing, out=sorted_x, inverse=inverse)
         # Compaction changes capacity, not the established global-budget tiling
         # policy. Local means can cross a BM threshold at each layer and cause
         # substantially more weight decoding on the hot experts.
-        key = (routing.metadata.data_ptr(), rows, bound, mean)
+        projections_only = shared_input is not None
+        key = (routing.metadata.data_ptr(), rows, bound, mean, slots, projections_only)
         previous_key, invoke = arena.bindings.get(self.local_experts, (None, None))
         if previous_key != key:
-            invoke = self.local_experts.bind(
+            bind = (
+                self.local_experts.bind_projections
+                if projections_only
+                else self.local_experts.bind
+            )
+            invoke = bind(
                 sorted_x,
                 routing.metadata,
                 gate_up=gate_up,
@@ -383,7 +447,17 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
             arena.bindings[self.local_experts] = (key, invoke)
         if torch.npu.is_current_stream_capturing():
             arena.graph_bindings[self.local_experts, key] = invoke
-        invoke()
+        return inverse, gate_up, activated, values, invoke
+
+    def routed(self, x, routing, *, compact=False):
+        if x.shape[0] == 0:
+            return torch.empty_like(x)
+        inverse, _, _, values, invoke = self.prepare_routed(x, routing, compact)
+        if invoke is not None:
+            invoke()
+        return self.finish_routed(values, inverse, routing)
+
+    def finish_routed(self, values, inverse, routing):
         from sglang.srt.runtime_context import get_forward
 
         if get_forward().npu_defer_route_combine:
@@ -408,6 +482,7 @@ def adapt_forward(original):
         skip_shared_experts=False,
         return_moe_output=False,
         leave_output_sum=False,
+        joint_shared_slice=None,
     ):
         from sglang.srt.layers.moe.utils import post_experts_all_reduce
         from sglang.srt.models.deepseek_v2 import MoEOutput
@@ -475,24 +550,45 @@ def adapt_forward(original):
             image_mask=image_mask,
             **dp_args,
         )
-        routed = method.routed(
-            hidden_states, routing, compact=compact_prefill(forward_batch)
-        )
+        from .joint_experts import can_join, run_joint_experts
         from .peer_collectives import RoutedOutput
 
+        compact = compact_prefill(forward_batch)
+        joint_local = (
+            not skip_shared_experts and can_join(self) and hidden_states.shape[0] > 0
+        )
+        if hidden_states.shape[0] and (
+            method.g32 or joint_local or joint_shared_slice is not None
+        ):
+            owned = slice(None) if joint_local else slice(0, 0)
+            routed, shared = run_joint_experts(
+                method,
+                getattr(self, "shared_experts", None),
+                hidden_states,
+                routing,
+                joint_shared_slice if joint_shared_slice is not None else owned,
+                compact,
+            )
+            if joint_shared_slice is not None:
+                return routed, shared
+        else:
+            routed = method.routed(hidden_states, routing, compact=compact)
+            shared = None
         if isinstance(routed, RoutedOutput):
             if not skip_shared_experts or return_moe_output or leave_output_sum:
                 raise ValueError(
                     "deferred native route combine requires the SP return boundary"
                 )
             return routed
-        shared = (
-            self._forward_shared_experts(hidden_states, gemm_output_zero_allocator)
-            if not skip_shared_experts
+        if (
+            not joint_local
+            and not skip_shared_experts
             and hasattr(self, "shared_experts")
             and hidden_states.shape[0]
-            else None
-        )
+        ):
+            shared = self._forward_shared_experts(
+                hidden_states, gemm_output_zero_allocator
+            )
         if return_moe_output or leave_output_sum:
             return MoEOutput(
                 routed,

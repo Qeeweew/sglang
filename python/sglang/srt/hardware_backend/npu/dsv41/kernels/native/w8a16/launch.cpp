@@ -4,10 +4,10 @@
 
 namespace {
 native_jit::Kernel &entry(const w8a16::Arguments &a) {
-    using Entries = native_jit::ActualEntries<8>;
+    using Entries = native_jit::ActualEntries<9>;
     static thread_local Entries entries;
     const Entries::Key key{uint64_t(a.k), uint64_t(a.n), uint64_t(a.batches), uint64_t(a.bf16),
-                           uint64_t(a.bm), uint64_t(a.bn), uint64_t(a.bk), uint64_t(a.workers)};
+                           uint64_t(a.bm), uint64_t(a.bn), uint64_t(a.bk), uint64_t(a.workers), a.output_bf16};
     return entries.get(key, [&] {
         std::string tag = "w8a16";
         for (auto value : key) tag += "_" + std::to_string(value);
@@ -16,6 +16,7 @@ native_jit::Kernel &entry(const w8a16::Arguments &a) {
             flags.push_back(std::string("-DW8A16_") + name + "=" + std::to_string(value));
         };
         field("K", a.k); field("N", a.n); field("BATCHES", a.batches); field("BF16", a.bf16);
+        field("OUTPUT_BF16", a.output_bf16);
         field("BM", a.bm); field("BN", a.bn); field("BK", a.bk); field("WORKERS", a.workers);
         return std::make_unique<native_jit::Kernel>(tag.c_str(), "w8a16/w8a16.asc",
                                                     std::move(flags), a.workers);
@@ -48,9 +49,10 @@ void w8a16_quantize_launch(void *stream, const w8a16::QuantizeSources &sources, 
 }
 
 TORCH_LIBRARY_FRAGMENT(dsv41, m) {
-    m.def("precompile_w8a16(int k, int n, int batches, bool bf16, int bm, int bn, int bk, int workers=0) -> ()",
+    m.def("precompile_w8a16(int k, int n, int batches, bool bf16, int bm, int bn, int bk, int workers=0, "
+          "bool? output_bf16=None) -> ()",
           [](int64_t k, int64_t n, int64_t batches, bool bf16, int64_t bm, int64_t bn,
-             int64_t bk, int64_t workers) {
+             int64_t bk, int64_t workers, std::optional<bool> output_bf16) {
               TORCH_CHECK_VALUE(k > 0 && k <= UINT16_MAX && k % w8a16::kGroup == 0 &&
                                     n > 0 && n <= INT32_MAX && n % 128 == 0 && batches > 0 &&
                                     batches * k <= UINT16_MAX && uint64_t(batches) * n <= UINT32_MAX / 2 &&
@@ -64,6 +66,8 @@ TORCH_LIBRARY_FRAGMENT(dsv41, m) {
               TORCH_CHECK_VALUE(workers > 0 && workers <= available, "invalid W8A16 worker budget");
               w8a16::Arguments a{};
               a.k = k; a.n = n; a.batches = batches; a.bf16 = bf16;
+              a.output_bf16 = output_bf16.value_or(bf16);
+              TORCH_CHECK_VALUE(!bf16 || a.output_bf16, "unsupported BF16 to FP16 W8A16");
               a.bm = bm; a.bn = bn; a.bk = bk; a.workers = workers;
               entry(a).prepare();
           });

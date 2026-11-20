@@ -137,6 +137,13 @@ def adapt_get_config(original_get_config):
                 )
             setattr(config, _MARKER, True)
             config._dsv41_is_draft = model_config.is_draft_model
+            text = getattr(
+                model_config.hf_config, "text_config", model_config.hf_config
+            )
+            fmt = getattr(text, "dsv41_target_moe_format", None)
+            if fmt not in (None, "quarot_h32_int4_g32_v1"):
+                raise ValueError(f"unrecognized target MoE format: {fmt}")
+            config._dsv41_g32 = bool(fmt) and not config._dsv41_is_draft
         return config
 
     return get_config
@@ -154,18 +161,29 @@ def adapt_get_method(original_get_method):
             return original_get_method(config, layer, prefix)
 
         if isinstance(layer, LinearBase):
-            from sglang.srt.hardware_backend.npu.dsv41.linear import W8A16LinearMethod
+            from sglang.srt.hardware_backend.npu.dsv41.linear import (
+                SharedW8A8Method,
+                W8A16LinearMethod,
+            )
 
+            if getattr(config, "_dsv41_g32", False) and ".shared_experts." in prefix:
+                return SharedW8A8Method(interleaved=prefix.endswith(".down_proj"))
             return W8A16LinearMethod()
         if enabled():
             from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
             if isinstance(layer, FusedMoE):
+                from sglang.srt.environ import envs
                 from sglang.srt.hardware_backend.npu.dsv41.moe import (
                     ResidentMXFP4Method,
                 )
 
-                return ResidentMXFP4Method()
+                return ResidentMXFP4Method(
+                    is_draft=config._dsv41_is_draft,
+                    g32=getattr(config, "_dsv41_g32", False),
+                    a8=envs.SGLANG_OPT_DSV41_NPU_TARGET_MOE_A8.get()
+                    and not config._dsv41_is_draft,
+                )
         return original_get_method(config, layer, prefix)
 
     return get_method

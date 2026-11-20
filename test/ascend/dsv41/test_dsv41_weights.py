@@ -7,6 +7,7 @@ NPU: set SGLANG_DSV41_TEST_NPU=1 SGLANG_DSV41_910B=1 and a physical device mappi
 import importlib.util
 import json
 import os
+import runpy
 from pathlib import Path
 import unittest
 import tempfile
@@ -33,6 +34,40 @@ class StreamingWeightsTest(unittest.TestCase):
         self.scale = torch.tensor(
             [[126, 127, 128], [123, 124, 125]], dtype=torch.uint8
         ).view(torch.float8_e8m0fnu)
+
+    def test_g32_fold_uses_tensor_names_not_shard_layout(self):
+        from safetensors.torch import load_file, save_file
+
+        exporter = runpy.run_path(
+            str(
+                Path(__file__).resolve().parents[3]
+                / "examples/ascend/deepseek_v41/export_quarot_g32.py"
+            )
+        )
+        weights = torch.arange(1, 33, dtype=torch.bfloat16)
+        target_norm = "layers.1.ffn_norm.weight"
+        target_gate = "layers.1.ffn.gate.weight"
+        draft_norm = "mtp.0.ffn_norm.weight"
+        draft_gate = "mtp.0.ffn.gate.weight"
+        signs = torch.from_numpy(exporter["SIGNS"]).to(weights.dtype)
+        with tempfile.TemporaryDirectory() as temp:
+            source, output = (Path(temp) / name for name in ("source", "output"))
+            save_file(
+                {
+                    key: weights.clone()
+                    for key in (target_norm, target_gate, draft_norm, draft_gate)
+                },
+                str(source),
+            )
+            exporter["shard"]((source, output, None, 1))
+            actual = load_file(str(output))
+            for key, expected in (
+                (target_norm, weights * signs / 4),
+                (target_gate, weights * signs * 4),
+                (draft_norm, weights),
+                (draft_gate, weights),
+            ):
+                torch.testing.assert_close(actual[key], expected, rtol=0, atol=0)
 
     def test_pair_order_and_interleaved_passthrough(self):
         for reverse in (False, True):
@@ -156,6 +191,80 @@ class StreamingWeightsTest(unittest.TestCase):
     "requires the CANN Python runtime for SGLang imports",
 )
 class LinearPolicyTest(unittest.TestCase):
+    def test_g32_checkpoint_selects_only_target_experts(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.npu.dsv41.dense_weights import (
+            adapt_get_config,
+            adapt_get_method,
+        )
+        from sglang.srt.hardware_backend.npu.dsv41.linear import (
+            SharedW8A8Method,
+            W8A16LinearMethod,
+        )
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+        def quant_config(*args):
+            return Fp8Config(
+                True, "dynamic", weight_block_size=[32, 32], scale_fmt="ue8m0"
+            )
+
+        hf = SimpleNamespace(
+            model_type="deepseek_v41", dsv41_target_moe_format="quarot_h32_int4_g32_v1"
+        )
+        with (
+            patch.dict(os.environ, SGLANG_DSV41_910B="1"),
+            envs.SGLANG_OPT_DSV41_NPU_TARGET_MOE_A8.override(False),
+        ):
+            resolve = adapt_get_config(quant_config)
+            method = adapt_get_method(lambda *args: None)
+            for draft in (False, True):
+                cfg = resolve(
+                    SimpleNamespace(
+                        hf_config=hf, dtype=torch.bfloat16, is_draft_model=draft
+                    ),
+                    None,
+                )
+                linear = LinearBase.__new__(LinearBase)
+                for name in ("gate_up_proj", "down_proj"):
+                    shared = method(
+                        cfg, linear, f"model.layers.0.mlp.shared_experts.{name}"
+                    )
+                    self.assertIsInstance(
+                        shared, W8A16LinearMethod if draft else SharedW8A8Method
+                    )
+                self.assertIsInstance(
+                    method(cfg, linear, "model.layers.0.self_attn.wq_a"),
+                    W8A16LinearMethod,
+                )
+                resident = method(cfg, FusedMoE.__new__(FusedMoE), "experts")
+                self.assertEqual((resident.a8, resident.g32), (not draft, not draft))
+
+    def test_a8_is_opt_in_and_target_only(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.npu.dsv41.dense_weights import adapt_get_method
+        from sglang.srt.hardware_backend.npu.dsv41.moe import ResidentMXFP4Method
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        with patch.dict(os.environ, SGLANG_DSV41_910B="1"):
+            method = adapt_get_method(lambda *args: None)
+            layer = FusedMoE.__new__(FusedMoE)
+            for flag in (False, True):
+                with envs.SGLANG_OPT_DSV41_NPU_TARGET_MOE_A8.override(flag):
+                    for draft in (False, True):
+                        config = SimpleNamespace(
+                            _dsv41_bf16_dense=True, _dsv41_is_draft=draft
+                        )
+                        resident = method(config, layer, "experts")
+                        self.assertIsInstance(resident, ResidentMXFP4Method)
+                        self.assertEqual(resident.a8, flag and not draft)
+                    self.assertIsNone(method(SimpleNamespace(), layer, "experts"))
+
     def test_w8a16_covers_dense_shared_and_draft_linears(self):
         from sglang.srt.hardware_backend.npu.dsv41.dense_weights import adapt_get_method
         from sglang.srt.hardware_backend.npu.dsv41.linear import W8A16LinearMethod
@@ -175,7 +284,9 @@ class LinearPolicyTest(unittest.TestCase):
                 "stages.0.main_proj",
                 "stages.0.self_attn.wo_a",
             ):
-                self.assertIsInstance(get_method(config, layer, prefix), W8A16LinearMethod)
+                self.assertIsInstance(
+                    get_method(config, layer, prefix), W8A16LinearMethod
+                )
 
 
 @unittest.skipUnless(

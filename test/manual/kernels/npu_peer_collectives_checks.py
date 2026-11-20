@@ -167,10 +167,12 @@ def validate_ep8(comm2, device, rank, stress, attention_tp=2):
         else:
             raise AssertionError("aliased EP8 tensors were accepted")
     route_fixtures = []
-    for rows in [1, 5, 6, 24, 48 if tp == 1 else 96]:
+    for rows, values_dtype in [
+        (n, torch.float16) for n in (1, 5, 6, 24, 48 if tp == 1 else 96)
+    ] + [(1, torch.bfloat16), (5, torch.bfloat16)]:
         topk, total = 6, dp * rows
         generator = torch.Generator().manual_seed(500 + rank)
-        values = torch.randn((total * topk, 5120), generator=generator).half()
+        values = torch.randn((total * topk, 5120), generator=generator).to(values_dtype)
         inverse = torch.randperm(total * topk, generator=generator).int()
         ids = torch.arange(total * topk).reshape(total, topk).remainder(8)
         ids = torch.where(ids == rank, 0, -1).int()

@@ -25,7 +25,7 @@ def test_loader_pins_one_resolved_version(tmp_path, monkeypatch):
     )
     configure = Mock()
     validate = Mock()
-    ops = SimpleNamespace(abi=lambda: 25, configure_jit=configure)
+    ops = SimpleNamespace(abi=lambda: 28, configure_jit=configure)
     monkeypatch.setattr(native, "_loaded_path", None)
     monkeypatch.setattr(native, "validate_jit_toolchain", validate)
     monkeypatch.setattr(native.torch.ops, "load_library", loads.append)

@@ -486,6 +486,7 @@ class NonCudaDecoderMixin:
         # release (freed on the compute stream, no record_stream deferral).
         state.pop("gather_keepalive")
 
+    @_dsv41_dp_buffers.adapt_tbo_moe
     def op_moe(self, state):
         state.global_expert_out = _tbo_run_moe(
             self, state.pop("global_hidden"), state.forward_batch, state.do_shared_local

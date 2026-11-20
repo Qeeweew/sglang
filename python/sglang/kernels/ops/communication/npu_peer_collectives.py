@@ -30,7 +30,7 @@ def npu_peer_moe_return(
 ):
     """EP8 SUM to owners, shared add once, and optional TP2 restore.
 
-    Input is BF16 ``[DP*rows,5120]``, or deferred FP16 routed values plus
+    Input is BF16 ``[DP*rows,5120]``, or deferred BF16/FP16 routed values plus
     int32 inverse/IDs and FP32 route weights. Output is BF16 ``[rows,5120]``.
     DP8 has no TP restore. Shared input covers the owned local shard.
     Rank-ordered FP32 SUM is BF16-rounded before the optional shared addition.

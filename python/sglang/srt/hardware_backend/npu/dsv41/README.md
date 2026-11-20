@@ -8,8 +8,9 @@ for the Docker build, topology selection, and benchmarks.
 The current target is Ascend 910B3, CANN 9.1, and a Torch/Torch-NPU installation
 with matching ABIs. Native host compilation requires GCC 13+, CMake 3.22+,
 CANN development headers, and libnuma (used for registered Engram memory).
-The checkpoint must have FP8 dense weights with 32x32 E8M0 scales and MXFP4
-routed experts.
+The source checkpoint has FP8 dense weights with 32x32 E8M0 scales and MXFP4
+routed experts. The backend also recognizes the target-only
+[`quarot_h32_int4_g32_v1` export](../../../../../../examples/ascend/deepseek_v41/quarot-g32.md).
 
 ## Layout
 
@@ -81,10 +82,32 @@ and draft bars that advance as tensors are consumed. Normal logs keep model
 and memory summaries; `--log-level debug` also shows per-layer expert storage,
 Engram backing details, and checkpoint read timings.
 
-Target/draft dense and shared expert weights use W8A16 G256. Checkpoint FP8
+With the source checkpoint, target/draft dense and shared expert weights use W8A16 G256. Checkpoint FP8
 weights are converted to INT8 at load time, then repacked with raw FP16
-scales into N16 layout. Forward consumes and returns BF16 without quantizing
-activations. Expert weights stay MXFP4 on device.
+scales into N16 layout. Dense layers and the model boundary stay BF16. For the
+legacy target's TP1 shared expert, EP dispatch and the router still consume
+BF16. After routing, one local gather writes both the owned shared inputs and
+the expert-major routed inputs as FP16. Both gate/up projections output FP16;
+one clipped SwiGLU computes both in FP32 and stores FP16 directly into the two
+down inputs. Shared W8A16 down writes BF16 directly from its FP32 accumulator,
+whereas routed MXFP4 down writes FP16 for FP32 weighted combine. The peer wire
+format is unchanged. Source MXFP4 and G32 target experts use the same EP8
+schedule: transport does not run shared before gather. Fixed-size shards and
+unequal DP segments both pass their owner rows to the joint SwiGLU, and add
+shared only after the routed sum returns. No checkpoint repack is needed
+beyond the existing loader; the draft and MXFP4-A8 modes are unchanged.
+
+To opt into per-token INT8 for both routed target projections, set
+`SGLANG_OPT_DSV41_NPU_TARGET_MOE_A8=1` before startup. Default serving and
+draft/MTP keep the original FP16 expert GEMMs. For the resident layout, see
+[MXFP4 × A8 packing and execution](../../../../../../examples/ascend/deepseek_v41/mxfp4-a8.md).
+
+The G32 checkpoint instead selects signed INT4 × INT8 grouped GEMM for the
+target experts without any environment switch. Both shared and routed target
+projections use fused FP32 block-Hadamard + per-token A8. Shared weights use
+per-output-channel W8 and native Torch-NPU `npu_quant_matmul`. Draft/MTP is
+unmodified. G32 routed weight reads use the same L2 bypass as MXFP4. Routed
+FP16 output uses full FP32 channel and token scales.
 
 W8A16 uses two Vector lanes per Cube. Each lane loads INT8 and FP16 scales,
 then writes the decoded panel to a double-buffered GM workspace. Cube imports
@@ -127,7 +150,7 @@ snapshots under immutable version directories. Keep the whole publication,
 not just the shared library. `DSV41_NATIVE_DIR` chooses a publication;
 `DSV41_JIT_CACHE_DIR` chooses a cache shared by the ranks on the node.
 
-Native ABI 25 requires rebuilding the host publication. CMake builds the host
+Native ABI 28 requires rebuilding the host publication. CMake builds the host
 extension. The router produces grouped GEMM metadata on the device.
 AICore kernels compile through DeepJIT for the model geometries actually bound.
 Prepare and warm them before Graph capture; hot calls and replay do not compile.

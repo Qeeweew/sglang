@@ -12,7 +12,7 @@ struct Arguments {
     uintptr_t input, weight, scales, output, workspace;
     int64_t rows;
     int k, n, batches, bm, bn, bk, workers;
-    bool bf16;
+    bool bf16, output_bf16;
 };
 inline int64_t jobs(int64_t rows, int64_t n, int64_t batches, int64_t bm, int64_t bn) {
     return ((rows + bm - 1) / bm) * (n / bn) * batches;

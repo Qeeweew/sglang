@@ -115,7 +115,9 @@ void launch_gemm(const at::Tensor &x, const at::Tensor &w, const at::Tensor &s,
     const auto [m, k, n, batches, bf16] = problem;
     const auto [bm, bn, bk] = plan;
     const auto device = x.device();
-    check(out, x.scalar_type(), device);
+    TORCH_CHECK_VALUE(out.scalar_type() == x.scalar_type() || out.scalar_type() == at::kBFloat16,
+                      "W8A16 output must match the activation or be BF16");
+    check(out, out.scalar_type(), device);
     TORCH_CHECK_VALUE(out.sizes() == (x.dim() == 3 ? at::IntArrayRef({m, batches, n})
                                                 : at::IntArrayRef({m, n})),
                       "W8A16 output shape differs");
@@ -138,7 +140,8 @@ void launch_gemm(const at::Tensor &x, const at::Tensor &w, const at::Tensor &s,
     track(workspace, stream);
     w8a16::Arguments a{uintptr_t(ptr(x)), uintptr_t(ptr(w)), uintptr_t(ptr(s)),
                        uintptr_t(ptr(out)), uintptr_t(scratch.data()), m,
-                       int(k), int(n), int(batches), int(bm), int(bn), int(bk), int(workers), bf16};
+                       int(k), int(n), int(batches), int(bm), int(bn), int(bk), int(workers), bf16,
+                       out.scalar_type() == at::kBFloat16};
     w8a16_launch(acl_stream, a);
 }
 

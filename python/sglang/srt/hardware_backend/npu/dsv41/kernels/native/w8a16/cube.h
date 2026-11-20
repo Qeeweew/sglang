@@ -3,7 +3,13 @@
 
 namespace w8a16 {
 class CubePipeline {
-    __gm__ Element *input_, *output_, *workspace_;
+    __gm__ Element *input_, *workspace_;
+#if W8A16_OUTPUT_BF16
+    using Output = bfloat16_t;
+#else
+    using Output = half;
+#endif
+    __gm__ Output *output_;
     int previous_rows_ = kRows;
     int initialized_valid_[kSlots] = {-1, -1};
     __aicore__ inline static __cbuf__ Element *activation_l1(int slot) {
@@ -93,7 +99,7 @@ class CubePipeline {
             set_flag(PIPE_M, PIPE_MTE1, ::event_t(kOperandReuseEventBase + operand_slot));
         }
         if (panel + 1 == kPanels) {
-            constexpr auto quant = kBf16 ? QuantMode_t::F322BF16 : QuantMode_t::F322F16;
+            constexpr auto quant = W8A16_OUTPUT_BF16 ? QuantMode_t::F322BF16 : QuantMode_t::F322F16;
             copy_matrix_cc_to_gm(output_ + (tile.row * kBatches + tile.batch) * kLogicalN + tile.column,
                 reinterpret_cast<__cc__ float *>(uint64_t(0)), 0, uint16_t(kColumns), uint16_t(tile.valid),
                 kBatches * kLogicalN, rows, kAccumulatorPublish, quant, 0, false, true);
@@ -102,7 +108,7 @@ class CubePipeline {
   public:
     __aicore__ inline void run(GM_ADDR input, GM_ADDR output, GM_ADDR workspace, int64_t rows) {
         input_ = reinterpret_cast<__gm__ Element *>(input);
-        output_ = reinterpret_cast<__gm__ Element *>(output);
+        output_ = reinterpret_cast<__gm__ Output *>(output);
         workspace_ = reinterpret_cast<__gm__ Element *>(workspace);
         asc_set_l0c_copy_params(1, 0, 0);
         set_flag(PIPE_S, PIPE_FIX, ::event_t(kAccumulatorEvent));

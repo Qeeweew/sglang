@@ -20,6 +20,14 @@ def weight(codes, exponents, k):
     return (values * scales).astype(np.float16)
 
 
+def a8_embedding(decoded, exponents):
+    """Independent truncation oracle on already-decoded checkpoint weights."""
+    exponents = exponents.astype(np.int32)
+    base = np.maximum(exponents.min(1), exponents.max(1) - 3)
+    unit = np.exp2(base - 128)[:, None]
+    return np.trunc(decoded / unit) * unit
+
+
 def grouped(x, weights, ends):
     result = np.zeros((len(x), weights[0].shape[0]), dtype=np.float16)
     begin = 0

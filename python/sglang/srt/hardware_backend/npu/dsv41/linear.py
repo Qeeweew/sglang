@@ -25,6 +25,75 @@ def enabled_for(quant_config):
     return getattr(quant_config, "_dsv41_bf16_dense", False)
 
 
+class SharedW8A8Method(UnquantizedLinearMethod):
+    def __init__(self, interleaved):
+        self.interleaved = interleaved
+
+    def create_weights(
+        self,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **attrs,
+    ):
+        if input_size_per_partition % 256 or (
+            not self.interleaved and any(n % 256 for n in output_partition_sizes)
+        ):
+            raise ValueError("shared W8A8 TP cuts an interleaved H32 panel")
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            torch.int8,
+            **attrs,
+        )
+        scales = torch.nn.Parameter(
+            layer.weight.new_empty(
+                (sum(output_partition_sizes), 1), dtype=torch.float32
+            ),
+            requires_grad=False,
+        )
+        scales.output_dim = 0
+        scales.weight_loader = layer.weight.weight_loader
+        layer.register_parameter("weight_scale_inv", scales)
+
+    def process_weights_after_loading(self, layer):
+        from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+
+        layer.weight.data = npu_format_cast(layer.weight.T.contiguous())
+        layer.weight_scale_inv.data = layer.weight_scale_inv.flatten()
+
+    def apply(self, layer, x, bias=None):
+        from .kernels.ops.mxfp4_a8 import h32_quant
+
+        if x.numel() == 0:
+            return x.new_empty((*x.shape[:-1], layer.weight_scale_inv.numel()))
+        quantized, scale = h32_quant(x.reshape(-1, x.shape[-1]), self.interleaved)
+        out = self.from_quantized(layer, quantized, scale).reshape(*x.shape[:-1], -1)
+        return out if bias is None else out + bias
+
+    @staticmethod
+    def from_quantized(layer, quantized, scale, *, output_dtype=torch.bfloat16):
+        return torch.ops.npu.npu_quant_matmul(
+            quantized,
+            layer.weight,
+            layer.weight_scale_inv,
+            pertoken_scale=scale,
+            output_dtype=output_dtype,
+        )
+
+    def apply_into(self, layer, x, output, bias=None):
+        return output.copy_(self.apply(layer, x, bias))
+
+    def apply_with_addend(self, layer, x, addend, bias=None):
+        return self.apply(layer, x, bias).add_(addend)
+
+
 class W8A16LinearMethod(UnquantizedLinearMethod):
     """Keep SGLang's checkpoint sharding and collectives around the new GEMM."""
 
@@ -120,7 +189,7 @@ class W8A16LinearMethod(UnquantizedLinearMethod):
         self.finalized = True
 
     def _launch(self, layer, x, output):
-        geometry = (x.device, x.dtype, tuple(x.shape))
+        geometry = (x.device, x.dtype, output.dtype, tuple(x.shape))
         prepared = self.plans.get(geometry)
         if prepared is None:
             if torch.npu.is_current_stream_capturing():
@@ -132,10 +201,10 @@ class W8A16LinearMethod(UnquantizedLinearMethod):
         native.w8a16(x, self.weight, layer.w8a16_scale, output, None, *plan)
         return output
 
-    def apply(self, layer, x, bias=None):
+    def apply(self, layer, x, bias=None, *, output_dtype=torch.bfloat16):
         shape = x.shape[:-1] + (self.n,)
         flat = x.reshape(-1, self.k)
-        out = torch.empty(shape, dtype=torch.bfloat16, device=x.device)
+        out = torch.empty(shape, dtype=output_dtype, device=x.device)
         return self.apply_into(layer, flat, out.view(-1, self.n), bias).view(shape)
 
     def apply_into(self, layer, x, output, bias=None):
@@ -198,15 +267,17 @@ def adapt_post_load(original_post_load):
                 continue
             seen.add(storage.data_ptr())
             category = (
-                "routed_mxfp4"
+                "routed_four_bit"
                 if any(
                     (
                         f".experts.{field}" in name
                         for field in (
                             "gate_up_packed",
                             "gate_up_scales",
+                            "gate_up_channel",
                             "down_packed",
                             "down_scales",
+                            "down_channel",
                         )
                     )
                 )
@@ -221,9 +292,9 @@ def adapt_post_load(original_post_load):
 
         if get_parallel().tp_rank == 0:
             logger.info(
-                "DeepSeek-V4.1 resident weights: %.2f GiB (MXFP4 experts %.2f GiB, INT8 dense %.2f GiB).",
+                "DeepSeek-V4.1 resident weights: %.2f GiB (four-bit experts %.2f GiB, INT8 dense/shared %.2f GiB).",
                 sum(totals.values()) / 2**30,
-                totals["routed_mxfp4"] / 2**30,
+                totals["routed_four_bit"] / 2**30,
                 totals["dense_int8"] / 2**30,
             )
         logger.debug(
