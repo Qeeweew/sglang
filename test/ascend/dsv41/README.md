@@ -26,7 +26,7 @@ export ASCEND_RT_VISIBLE_DEVICES=7 ASCEND_DEVICE_ID=0 TASK_QUEUE_ENABLE=0
 export DSV41_NATIVE_DIR="$PWD/build/dsv41"
 export DSV41_JIT_CACHE_DIR="$PWD/build/dsv41-jit"
 "$DSV41_PYTHON" -m dsv41.kernels.operators.test_router --library-dir "$DSV41_NATIVE_DIR"
-"$DSV41_PYTHON" -m dsv41.kernels.operators.test_ced --library-dir "$DSV41_NATIVE_DIR"
+"$DSV41_PYTHON" -m dsv41.kernels.operators.test_row_copy --library-dir "$DSV41_NATIVE_DIR"
 "$DSV41_PYTHON" -m dsv41.kernels.operators.test_w8a16 \
   --physical 7 --output build/checks/w8a16
 "$DSV41_PYTHON" -m dsv41.kernels.operators.test_route_bucket \
@@ -36,7 +36,8 @@ export DSV41_JIT_CACHE_DIR="$PWD/build/dsv41-jit"
 "$DSV41_PYTHON" -m dsv41.kernels.integration.test_local_bucket_moe \
   --physical 7 --output build/checks/local-bucket-moe.json
 SGLANG_DSV41_TEST_NPU=1 "$DSV41_PYTHON" -m pytest -q \
-  test/ascend/dsv41/test_dsv41_w8a16.py
+  test/ascend/dsv41/test_dsv41_w8a16.py test/ascend/dsv41/test_ced_tail_source.py
+"$DSV41_PYTHON" -m dsv41.kernels.operators.test_verify_window
 ```
 
 Other numerical scripts live in `kernels/operators`. Run them as modules and

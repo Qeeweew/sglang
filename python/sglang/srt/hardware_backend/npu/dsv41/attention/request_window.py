@@ -1,18 +1,19 @@
-"""Request-private BF16 SWA through the existing paged attention ABI.
+"""Request-private BF16 SWA and provisional rows for target verify.
 
-The paged workspace stages accepted history and the current queries before
-attention. Both buffers are allocated before Graph capture.
+Target verify reads accepted history directly from the ring.
+Prefill and ordinary decode use the paged workspace.
 """
 
 from types import SimpleNamespace
 
 import torch
 
+from ..kernels.ops.row_copy import gather_rows, scatter_rows
+
 
 class BF16RequestWindow:
     def __init__(
         self,
-        pool_factory,
         *,
         num_slots,
         layers,
@@ -20,15 +21,13 @@ class BF16RequestWindow:
         capacity,
         workspace_rows=None,
     ):
-        from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import CED
+        from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import PositionQuant
 
         self.page_size = page_size
         self.capacity = ((capacity + page_size - 1) // page_size) * page_size
-        self.num_slots = num_slots
-        self.rows = num_slots * self.capacity
         self.device = torch.device("npu", torch.npu.current_device())
         self.ring = torch.zeros(
-            (layers, self.rows + page_size, 512),
+            (layers, num_slots * self.capacity + page_size, 512),
             dtype=torch.bfloat16,
             device=self.device,
         )
@@ -52,7 +51,10 @@ class BF16RequestWindow:
                 )
             ],
         )
-        self.movement = CED(device=self.device)
+        self.position = PositionQuant(device=self.device)
+        self.layer_offsets = (
+            torch.arange(layers, device=self.device).view(-1, 1, 1) * self.ring.shape[1]
+        )
         self.valid_starts = {}
         self.plan = None
         self.prepared = None
@@ -69,11 +71,11 @@ class BF16RequestWindow:
         self.plan = plan
         self.prepared = None
 
-    def prepare(self, meta, *, width=None, counts=None, floors=None):
+    def prepare(self, meta, *, counts=None, floors=None):
         """Build a page table for just history + queries, using absolute positions.
 
-        Eager uses host-known variable lengths. Decode/verify use a fixed page
-        stride and device positions; all tensor addresses belong to the bucket.
+        Eager uses host-known variable lengths. Decode uses a fixed page stride
+        and device positions; all tensor addresses belong to the bucket.
         """
         b, n, p = meta.batch, meta.rows, self.page_size
         if not hasattr(meta, "ring_plan"):
@@ -84,9 +86,7 @@ class BF16RequestWindow:
             meta.ring_plan = SimpleNamespace(
                 history_src=empty(b * 128, torch.int32),
                 history_dst=empty(b * 128, torch.int32),
-                ring_dst=empty(n, torch.int32),
                 commit_dst=empty(n, torch.int32),
-                group=empty(n, torch.int64),
                 positions=empty(n, torch.int64),
             )
         plan = meta.ring_plan
@@ -115,13 +115,13 @@ class BF16RequestWindow:
                 v.to(self.device) for v in (first, bases, group, pos)
             ]
         else:
-            # At most two history pages and two query pages for a six-row verify.
-            stride = (128 + (p - 1) + width + p - 1) // p
+            # A decode row can follow 128 history rows starting inside a page.
+            stride = (128 + p - 1) // p + 1
             required = (1 + b * stride) * p
             first = ((meta.starts - 128).clamp_min(0) // p) * p
             bases = 1 + torch.arange(b, device=self.device) * stride
-            group = torch.arange(b, device=self.device).repeat_interleave(width)
-            pos = meta.starts[group] + torch.arange(width, device=self.device).repeat(b)
+            group = torch.arange(b, device=self.device)
+            pos = meta.starts
         if required > self.workspace.size:
             raise ValueError(
                 f"SWA workspace needs {required} rows, has {self.workspace.size}"
@@ -149,31 +149,32 @@ class BF16RequestWindow:
         plan.history_src.copy_(torch.where(valid, src, -1).flatten().int())
         # Invalid early history can fall before this request's workspace region.
         plan.history_dst.copy_(torch.where(valid, dst, -1).flatten().int())
-        plan.ring_dst.copy_(
-            torch.where(
-                live, req[group] * self.capacity + pos % self.capacity, -1
-            ).int()
-        )
-        plan.group.copy_(group)
         plan.positions.copy_(pos)
         # Never submit duplicate ring destinations from a long prefill.
         last = meta.lengths[group].long() - self.capacity
-        plan.commit_dst.copy_(torch.where(pos >= last, plan.ring_dst, -1).int())
-        if width and width > 1 and not hasattr(plan, "pending"):
-            plan.pending = torch.empty(
-                (self.ring.shape[0], n, 512),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
+        dst = req[group] * self.capacity + pos % self.capacity
+        plan.commit_dst.copy_(torch.where(live & (pos >= last), dst, -1).int())
         self.activate(plan)
         return plan
+
+    def init_verify(self, meta, width):
+        """Keep provisional rows at fixed addresses across verify and accept replay."""
+        meta.swa_pending = self.ring.new_empty((self.ring.shape[0], meta.rows, 512))
+        meta.verify_lanes = torch.arange(width, device=self.device)
+
+    def verify_inputs(self, meta, layer):
+        return self.ring_views[layer], (
+            meta.verify_requests,
+            meta.swa_pending[layer],
+            self.capacity,
+        )
 
     def buffer(self, layer):
         if self.plan is None:
             raise RuntimeError("request SWA metadata was not prepared")
         if self.prepared != layer:
-            history = self.movement.gather(self.ring[layer], self.plan.history_src)
-            self.movement.scatter(
+            history = gather_rows(self.ring[layer], self.plan.history_src)
+            scatter_rows(
                 history,
                 self.plan.history_dst,
                 out=self.workspace.kv_buffer[0].view(-1, 512),
@@ -186,21 +187,23 @@ class BF16RequestWindow:
         dst = self.plan.commit_dst
         rows = getattr(self.plan, "commit_rows", None)
         if rows is not None and rows.numel() < values.shape[0]:
-            values = self.movement.gather(values, rows)
-            dst = self.movement.gather(dst, rows)
-        self.movement.scatter(values, dst, out=self.ring[layer])
+            values = gather_rows(values, rows)
+            dst = gather_rows(dst, rows)
+        scatter_rows(values, dst, self.ring[layer])
 
     def commit_verify(self, meta):
-        plan = meta.ring_plan
-        accepted = meta.verify_commit_lens[plan.group]
-        keep = plan.positions < meta.starts[plan.group] + accepted
-        dst = torch.where(keep & (accepted > 0), plan.ring_dst, -1)
-        offsets = (
-            torch.arange(self.ring.shape[0], device=self.device) * self.ring.shape[1]
-        )
-        dst = torch.where(dst[None, :] >= 0, dst[None, :] + offsets[:, None], -1)
-        self.movement.scatter(
-            plan.pending.view(-1, 512), dst.flatten().int(), out=self.ring.view(-1, 512)
+        requests = meta.verify_requests[:, None]
+        keep = (requests > 0) & (meta.verify_lanes < meta.verify_commit_lens[:, None])
+        positions = meta.starts[:, None] + meta.verify_lanes
+        dst = torch.add(positions % self.capacity, requests, alpha=self.capacity)
+        ring = self.ring.view(-1, 512)
+        # Scatter skips negative slots. Mask once per request so rejected rows
+        # stay negative even after adding the last layer's offset.
+        dst = self.layer_offsets + torch.where(keep, dst, -ring.shape[0])
+        self.position.scatter_bf16(
+            meta.swa_pending.view(-1, 512),
+            dst.flatten(),
+            ring,
         )
 
 
@@ -212,7 +215,6 @@ class BF16RequestWindowMemory:
             raise ValueError("910B request windows require BF16 on NPU")
         self.spec = spec
         self.view = BF16RequestWindow(
-            None,
             num_slots=spec.num_slots,
             layers=spec.layers,
             page_size=spec.page_size,

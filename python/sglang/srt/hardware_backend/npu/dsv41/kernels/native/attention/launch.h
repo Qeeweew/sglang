@@ -22,11 +22,13 @@ struct Config {
     int32_t capacity, ratio, mode, cores, tile_rows, coordinate_shift, page_shift;
     bool window_ring, coordinate32, coordinate_elements32;
     float scale;
+    int32_t verify_ring_capacity = 0;
 };
 struct Sources {
     uintptr_t q, kv, compressed, indices, table, compressed_table;
     uintptr_t cu, lengths, compressed_lengths, residual, window, sinks, out, workspace;
     int32_t tokens = 0, batch = 0;
+    uintptr_t verify_requests = 0, verify_pending = 0;
 };
 struct Arguments {
     Sources sources;

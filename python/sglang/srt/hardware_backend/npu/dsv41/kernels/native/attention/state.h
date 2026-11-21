@@ -16,6 +16,7 @@ inline constexpr int32_t kCompressedColumns = ATTENTION_COMPRESSED_COLUMNS;
 inline constexpr int32_t kPageRows = ATTENTION_PAGE_ROWS, kWindowRows = ATTENTION_WINDOW_ROWS;
 inline constexpr int32_t kSelectedRows = ATTENTION_SELECTED_ROWS, kRatio = ATTENTION_RATIO;
 inline constexpr int32_t kWorkerBudget = ATTENTION_WORKER_BUDGET;
+inline constexpr int32_t kVerifyRingCapacity = ATTENTION_VERIFY_RING_CAPACITY;
 inline constexpr bool kWindowRing = ATTENTION_WINDOW_RING;
 inline constexpr bool kCoordinate32 = ATTENTION_COORDINATE32,
                       kCoordinateElements32 = ATTENTION_COORDINATE_ELEMENTS32;
@@ -159,6 +160,9 @@ class RequestCursor {
                 visible = min(visible, requested);
             first = right - visible;
         }
+        if constexpr (kVerifyRingCapacity)
+            if (gm_pointer<int64_t>(s.verify_requests)[batch_] == 0)
+                visible = 0;
         return {batch_, count, offset, right, visible, first};
     }
 };

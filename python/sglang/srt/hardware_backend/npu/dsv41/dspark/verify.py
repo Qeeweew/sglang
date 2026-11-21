@@ -13,7 +13,6 @@ from functools import wraps
 from types import SimpleNamespace
 
 import torch
-from sglang.srt.hardware_backend.npu.dsv41.attention.projections import gather_rope
 
 from ..policy import enabled
 
@@ -40,6 +39,8 @@ def _metadata(self, fb, in_capture=False):
             batch, dtype=torch.int32, device=self.device
         )
         meta.verify_requests = torch.empty(batch, dtype=torch.int64, device=self.device)
+        if meta.verify_window is not None:
+            meta.verify_window.init_verify(meta, width)
         meta.verify_generation = 0
         meta.verify_committed_generation = -1
     meta.verify_generation += 1
@@ -94,9 +95,6 @@ def _metadata_in_graph(self, fb):
     meta.starts.copy_(prefix)
     meta.compressed_table.copy_(pages)
     if self.request_window is None:
-        # Private request windows populate both outputs below. Translating the
-        # full context table first would read the paged-SWA mapping only to
-        # overwrite it, even though target attention never consumes it.
         swa_pages = (
             self.pool.translate_loc_from_full_to_swa(full_pages.long()) // 128
         ).int()
@@ -106,9 +104,6 @@ def _metadata_in_graph(self, fb):
     for ratio in (1, 2):
         meta.cmp_lengths[ratio].copy_(total // ratio)
         meta.residual[ratio].copy_(total % ratio)
-    if self.request_window is not None:
-        meta.ring_window = self.request_window
-        self.request_window.prepare(meta, width=width)
 
 
 def _record(self, layer, source):
@@ -144,80 +139,39 @@ def _record(self, layer, source):
     return records[layer.layer_id]
 
 
-def _sources(self, *, layer, x, q_lora, positions, forward_batch):
-    meta, ratio = self.forward_metadata, layer.compress_ratio
-    if layer.compressor is not None:
-        source = self._source(layer)
-        record = _record(self, layer, source)
-        # Copy only to a bucket-owned shadow. Rejected drafts never become the
-        # next call's pending partner, including replayed all-reject verifies.
-        record.shadow.state.pending.copy_(source.state.pending)
-        record.shadow.state.committed_lengths.copy_(source.state.committed_lengths)
-        record.shadow.state.committed_lengths[meta.requests.long()] = meta.starts
-        kv, scores = layer.compressor.project(x)
-        record.kv.copy_(kv)
-        if scores is not None:
-            record.scores.copy_(scores)
-        prepared = record.shadow.prepare(
-            record.kv,
-            record.scores,
-            meta.cu[: meta.batch + 1],
-            meta.requests,
-            out=record.latent,
-            pooled=record.pooled,
-            positions=record.positions,
-            rope_positions=record.rope,
-            starts=record.starts,
-        )
-        # Every tensor in this object has a stable bucket-owned address. It is
-        # safe to retain across Graph replay and an intervening eager verify.
-        record.provisional = replace(prepared, owner=source)
-        slots = torch.where(
-            (prepared.positions >= 0) & meta.verify_token_mask,
-            meta.full_slots // ratio,
-            -1,
-        ).long()
-        trig = gather_rope(layer.freqs_cis, prepared.rope_positions)
-        if layer.indexer is not None and layer.indexer.owns_k:
-            index = layer.indexer
-            key = index.k_norm(index.wk(prepared.latent))
-            codes, scale = self.position.quantize_key(
-                key.contiguous(), cos=trig.cos, sin=trig.sin
-            )
-            pool = self.pool.index_pools[ratio]
-            local = self.pool.layer_mapping[layer.layer_id].compress_layer_id
-            self.position.scatter_index(
-                codes,
-                scale,
-                slots,
-                pool.index_k_buffer[local].view(-1, 128),
-                pool.index_scale_buffer[local].view(-1),
-            )
-        values = self.position.rope(prepared.latent, trig.cos, trig.sin)
-        self.position.scatter_bf16(
-            values, slots, self.pool.get_key_buffer(layer.layer_id).squeeze(2)
-        )
-    if layer.indexer is not None:
-        index = layer.indexer
-        query, _ = index.wq_b(q_lora)
-        query = query.view(-1, 32, 128).contiguous()
-        trig = gather_rope(layer.freqs_cis, positions.long())
-        codes, qscale = self.position.quantize_query(query, cos=trig.cos, sin=trig.sin)
-        weight, _ = index.weights_proj(x)
-        weight = (weight.float() * index.head_weight_scale).half().contiguous()
-        pool = self.pool.index_pools[ratio]
-        local = self.pool.layer_mapping[layer.layer_id].compress_layer_id
-        plan = meta.plans[layer.layer_id]
-        indices, _ = plan.run(
-            codes,
-            pool.index_k_buffer[local].view(-1, 128 // ratio, 128),
-            weight,
-            qscale,
-            pool.index_scale_buffer[local].view(-1, 128 // ratio),
-            candidates=meta.candidates if plan.mode == 2 else None,
-        )
-        meta.indices[ratio].fill_(-1)
-        meta.indices[ratio][: meta.rows, 0].copy_(indices)
+def write_provisional_source_kv(self, layer, x):
+    meta = self.forward_metadata
+    source = self._source(layer)
+    record = _record(self, layer, source)
+    # Copy only to a bucket-owned shadow. Rejected drafts never become the
+    # next call's pending partner, including replayed all-reject verifies.
+    record.shadow.state.pending.copy_(source.state.pending)
+    record.shadow.state.committed_lengths.copy_(source.state.committed_lengths)
+    record.shadow.state.committed_lengths[meta.requests.long()] = meta.starts
+    kv, scores = layer.compressor.project(x)
+    record.kv.copy_(kv)
+    if scores is not None:
+        record.scores.copy_(scores)
+    prepared = record.shadow.prepare(
+        record.kv,
+        record.scores,
+        meta.cu[: meta.batch + 1],
+        meta.requests,
+        out=record.latent,
+        pooled=record.pooled,
+        positions=record.positions,
+        rope_positions=record.rope,
+        starts=record.starts,
+    )
+    # Every tensor in this object has a stable bucket-owned address. It is
+    # safe to retain across Graph replay and an intervening eager verify.
+    record.provisional = replace(prepared, owner=source)
+    slots = torch.where(
+        (prepared.positions >= 0) & meta.verify_token_mask,
+        meta.full_slots // layer.compress_ratio,
+        -1,
+    ).long()
+    self.store_compressed_kv(layer, prepared.latent, prepared.rope_positions, slots)
 
 
 def _commit_sources(meta):
@@ -231,8 +185,8 @@ def _commit_sources(meta):
             rope_positions=record.committed_rope,
             status=record.status,
         )
-    if hasattr(meta, "ring_window"):
-        meta.ring_window.commit_verify(meta)
+    if meta.verify_window is not None:
+        meta.verify_window.commit_verify(meta)
 
 
 def _commit_graph(meta, device):
@@ -282,7 +236,7 @@ def _commit(self, commit_lens, req_pool_indices=None, *, folded=False):
         raise ValueError(
             "commit_lens must count 0..6 verified inputs, never the sampled bonus"
         )
-    if not folded and meta.verify_sources:
+    if not folded and (meta.verify_sources or meta.verify_window is not None):
         graph = _commit_graph(meta, self.device)
         accepted = meta.verify_commit_lens
         accepted.zero_()
@@ -327,30 +281,3 @@ def adapt_metadata_in_graph(original_in_graph):
         return original_in_graph(self, fb)
 
     return metadata_in_graph
-
-
-def adapt_sources(original_sources):
-    if not enabled():
-        return original_sources
-
-    @wraps(original_sources)
-    def sources(self, *, layer, x, q_lora, positions, forward_batch):
-        if forward_batch.forward_mode.is_target_verify():
-            return _sources(
-                self,
-                layer=layer,
-                x=x,
-                q_lora=q_lora,
-                positions=positions,
-                forward_batch=forward_batch,
-            )
-        return original_sources(
-            self,
-            layer=layer,
-            x=x,
-            q_lora=q_lora,
-            positions=positions,
-            forward_batch=forward_batch,
-        )
-
-    return sources

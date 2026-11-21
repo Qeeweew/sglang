@@ -70,6 +70,8 @@ class _NativeAttention:
         window,
         sinks,
         out,
+        *,
+        verify_ring=None,
     ):
         if q.ndim != 3 or q.device.type != "npu":
             raise ValueError("requires BF16 Q[T,H,D] on NPU")
@@ -147,6 +149,7 @@ class _NativeAttention:
             self.ring,
             self.window_rows,
             self.cores,
+            verify_ring,
         )
         native.prepare_attention(*args)
         launch = native.attention
@@ -173,6 +176,7 @@ class WindowAttention:
         window_lengths,
         *,
         out,
+        verify_ring=None,
     ):
         if q.shape[0] == 0:
             self.kernel.empty(q, out)
@@ -199,6 +203,7 @@ class WindowAttention:
             window_lengths,
             sinks,
             out,
+            verify_ring=verify_ring,
         )
 
     def __call__(
@@ -212,10 +217,19 @@ class WindowAttention:
         window_lengths,
         *,
         out=None,
+        verify_ring=None,
     ):
         out = q.new_empty(q.shape) if out is None else out
         self.bind(
-            q, kv, block_table, cu_seqlens_q, lengths, sinks, window_lengths, out=out
+            q,
+            kv,
+            block_table,
+            cu_seqlens_q,
+            lengths,
+            sinks,
+            window_lengths,
+            out=out,
+            verify_ring=verify_ring,
         )()
         return out
 
@@ -265,6 +279,7 @@ class SparseAttention:
         sinks,
         *,
         out,
+        verify_ring=None,
     ):
         if q.shape[0] == 0:
             self.kernel.empty(q, out)
@@ -296,6 +311,7 @@ class SparseAttention:
             window_lengths,
             sinks,
             out,
+            verify_ring=verify_ring,
         )
 
     def __call__(
@@ -314,6 +330,7 @@ class SparseAttention:
         sinks,
         *,
         out=None,
+        verify_ring=None,
     ):
         out = q.new_empty(q.shape) if out is None else out
         self.bind(
@@ -330,6 +347,7 @@ class SparseAttention:
             window_lengths,
             sinks,
             out=out,
+            verify_ring=verify_ring,
         )()
         return out
 

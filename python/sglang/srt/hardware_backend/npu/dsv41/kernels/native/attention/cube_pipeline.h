@@ -39,6 +39,14 @@ class CubePipeline {
         return reinterpret_cast<__cc__ float *>(
             uint64_t(plane * kTileRows * kDotRows * sizeof(float)));
     }
+    __aicore__ __attribute__((always_inline)) void copy_kv_rows(
+        __cbuf__ BF16 *dst, __gm__ BF16 *source, int32_t destination, int32_t feature,
+        int32_t rows) {
+        const uint16_t features = min(kFeaturePanelColumns, kWidth - feature);
+        asc_copy_gm2l1_nd2nz(dst + destination * (kDmaBytes / sizeof(BF16)),
+                             source + feature, 1, uint16_t(rows), features, 0,
+                             uint16_t(kWidth), kDotRows, 1, 0);
+    }
     __aicore__ __attribute__((always_inline)) void load_paged(__cbuf__ BF16 *dst,
                                                               const RequestMetadata &m,
                                                               int32_t tile, int32_t feature,
@@ -54,17 +62,14 @@ class CubePipeline {
             return;
         auto table = gm_pointer<int32_t>(sources_.table);
         auto kv = gm_pointer<BF16>(sources_.kv);
-        const uint16_t features = min(kFeaturePanelColumns, kWidth - feature);
         int32_t logical_page = kPageShift >= 0 ? position >> kPageShift : position / kPageRows;
         int32_t page_offset = position - logical_page * kPageRows;
         for (;;) {
             const int32_t page =
                 table[int64_t(m.batch) * kPageColumns + min(logical_page, kPageColumns - 1)];
             const int32_t chunk = min(count, min(kPageRows - page_offset, kDotRows - destination));
-            asc_copy_gm2l1_nd2nz(
-                (dst + (destination * (kDmaBytes / sizeof(BF16)))),
-                (kv + ((int64_t(page) * kPageRows + page_offset) * kWidth + feature)), 1,
-                uint16_t(chunk), features, 0, uint16_t(kWidth), kDotRows, 1, 0);
+            copy_kv_rows(dst, kv + (int64_t(page) * kPageRows + page_offset) * kWidth,
+                         destination, feature, chunk);
             // The final transfer has no successor address to prepare. Across
             // later chunks, advance the bounded page cursor instead of
             // repeating the initial shift/division for every DMA.
@@ -77,6 +82,32 @@ class CubePipeline {
                 page_offset = 0;
             }
             destination = (destination + chunk) % kDotRows;
+        }
+    }
+    __aicore__ __attribute__((always_inline)) void load_verify_window(
+        __cbuf__ BF16 *dst, const RequestMetadata &m, int32_t feature) {
+        if (!m.visible)
+            return;
+        const int32_t query_begin = gm_pointer<int32_t>(sources_.cu)[m.batch];
+        const int32_t prefix = m.right - m.offset - 1;
+        const int64_t request = gm_pointer<int64_t>(sources_.verify_requests)[m.batch];
+        int32_t position = m.first;
+        // Preserve the paged kernel's rotated L1 order for single-request
+        // sparse attention. The source can wrap independently in the ring.
+        while (position < m.right) {
+            const int32_t destination = kWindowRing ? position % kDotRows : position - m.first;
+            const bool pending = position >= prefix;
+            const int32_t offset = position % kVerifyRingCapacity;
+            const int32_t available = pending ? m.right - position
+                                               : min(prefix - position, kVerifyRingCapacity - offset);
+            const int32_t rows = min(available, kDotRows - destination);
+            auto source = pending
+                              ? gm_pointer<BF16>(sources_.verify_pending) +
+                                    int64_t(query_begin + position - prefix) * kWidth
+                              : gm_pointer<BF16>(sources_.kv) +
+                                    (request * kVerifyRingCapacity + offset) * kWidth;
+            copy_kv_rows(dst, source, destination, feature, rows);
+            position += rows;
         }
     }
     __aicore__ __attribute__((always_inline)) __cbuf__ BF16 *
@@ -92,10 +123,16 @@ class CubePipeline {
                     dst, (workspace_.gathered(task) + ((tile - 1) * kDotRows * kWidth + feature)),
                     1, kDotRows, uint16_t(min(kFeaturePanelColumns, kWidth - feature)), 0,
                     uint16_t(kWidth), kDotRows, 1, 0);
-            } else
+            } else if constexpr (kVerifyRingCapacity) {
+                load_verify_window(dst, m, feature);
+            } else {
                 load_paged(dst, m, tile, feature, kWindowRing, new_rows);
-        } else
+            }
+        } else if constexpr (kVerifyRingCapacity) {
+            load_verify_window(dst, m, feature);
+        } else {
             load_paged(dst, m, tile, feature, false, new_rows);
+        }
         return dst;
     }
     __aicore__ inline void load_left(__ca__ BF16 *dst, __cbuf__ BF16 *src, int32_t depth) {

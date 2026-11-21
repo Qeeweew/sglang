@@ -30,7 +30,7 @@
       "backend": "jit"
     },
     {
-      "name": "ced",
+      "name": "row_copy",
       "backend": "jit"
     },
     {

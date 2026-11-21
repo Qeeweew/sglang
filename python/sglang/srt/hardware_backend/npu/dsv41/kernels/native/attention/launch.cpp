@@ -5,7 +5,7 @@
 #include <cmath>
 namespace {
 using attention::Config;
-using Entries = native_jit::ActualEntries<15>;
+using Entries = native_jit::ActualEntries<16>;
 native_jit::Kernel &entry(const Config &c) {
     static thread_local Entries entries;
     const bool sparse = c.mode == int32_t(attention::Mode::Sparse);
@@ -24,7 +24,8 @@ native_jit::Kernel &entry(const Config &c) {
         uint64_t(c.cores),
         sparse && c.window_ring,
         sparse && c.coordinate32,
-        sparse && c.coordinate_elements32};
+        sparse && c.coordinate_elements32,
+        uint64_t(c.verify_ring_capacity)};
     return entries.get(key, [&] {
         static constexpr const char *names[]{"MODE",
                                              "TILE_ROWS",
@@ -40,7 +41,8 @@ native_jit::Kernel &entry(const Config &c) {
                                              "WORKER_BUDGET",
                                              "WINDOW_RING",
                                              "COORDINATE32",
-                                             "COORDINATE_ELEMENTS32"};
+                                             "COORDINATE_ELEMENTS32",
+                                             "VERIFY_RING_CAPACITY"};
         std::vector<std::string> flags{"--cce-auto-sync=off"};
         for (size_t i = 0; i < key.size(); ++i)
             flags.emplace_back(std::string("-DATTENTION_") + names[i] + "=" +
@@ -61,7 +63,7 @@ extern "C" void dsv41_attention_launch(void *stream, const attention::Arguments 
     auto s = args.sources;
     s.tokens = c.tokens;
     s.batch = c.batch;
-    if (c.mode == int32_t(attention::Mode::Sparse))
+    if (c.mode == int32_t(attention::Mode::Sparse) || c.verify_ring_capacity)
         entry(c).launch_persistent(stream, c.tokens, s);
     else
         entry(c).launch_persistent(

@@ -268,7 +268,11 @@ def adapt_prepare(original_prepare):
             )
         if x.dtype != torch.bfloat16:
             raise ValueError("V4.1/910B attention input must be BF16")
-        q_lora, kv = _normalized_qkv(self, x)
+        source = attn_backend.forward_metadata.tail_source
+        if source is not None and self.layer_id == source.layer_id:
+            q_lora, kv = source.q_lora, None
+        else:
+            q_lora, kv = _normalized_qkv(self, x)
         q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if self.q_head_norm:
@@ -277,11 +281,16 @@ def adapt_prepare(original_prepare):
             forward_batch, positions, q.dtype, inverse=False
         )
         Dsv4NpuRoPE.apply_rotary_mul_inplace(
-            q, kv.unsqueeze(1), cos, sin, qk_nope_dim=self.qk_nope_head_dim
+            q,
+            None if kv is None else kv.unsqueeze(1),
+            cos,
+            sin,
+            qk_nope_dim=self.qk_nope_head_dim,
         )
-        attn_backend.store_cache(
-            layer_id=self.layer_id, swa_k=kv, forward_batch=forward_batch
-        )
+        if kv is not None:
+            attn_backend.store_cache(
+                layer_id=self.layer_id, swa_k=kv, forward_batch=forward_batch
+            )
         if q_out is not None:
             if q_out.dtype != torch.bfloat16:
                 raise ValueError("V4.1/910B Q storage must be BF16")

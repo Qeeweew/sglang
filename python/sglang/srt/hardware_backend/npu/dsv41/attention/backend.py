@@ -8,16 +8,26 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import torch
 from sglang.srt.hardware_backend.npu.dsv41.dspark import verify as _dsv41_verify
 from sglang.srt.hardware_backend.npu.dsv41.attention.projections import (
+    _normalized_qkv,
     cached_rope,
     gather_rope,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
 logger = logging.getLogger(__name__)
+
+
+class _TailSource(NamedTuple):
+    layer_id: int
+    cache: torch.Tensor
+    table: torch.Tensor
+    window: torch.Tensor
+    q_lora: torch.Tensor
 
 
 class DSV41AttentionBackend(AttentionBackend):
@@ -84,7 +94,6 @@ class DSV41AttentionBackend(AttentionBackend):
         from sglang.srt.hardware_backend.npu.dsv41.prefill.replay import ced_enabled
 
         self.ced_enabled = ced_enabled()
-        self.ced = None
         self._tail_saved = None
         self._ced_pending = None
         self.invalid_requests = set()
@@ -93,11 +102,9 @@ class DSV41AttentionBackend(AttentionBackend):
                 ced_tail_window,
                 validate_ced_config,
             )
-            from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import CED
 
             self.ced_cut = validate_ced_config(self.config)
             self.ced_window = ced_tail_window(self.config)
-            self.ced = CED(device=self.device)
 
     def clear_request_state(self, request):
         self.request_prefixes.pop(request, None)
@@ -182,6 +189,8 @@ class DSV41AttentionBackend(AttentionBackend):
             qli_plans={},
             candidates=None,
             late_layer_tail=None,
+            verify_window=self.request_window if decode == "verify" else None,
+            tail_source=None,
         )
         # QLI and attention use the same exact request and query extents.
         cu = torch.tensor([0] * batch + [rows], dtype=torch.int32, device="cpu")
@@ -495,7 +504,7 @@ class DSV41AttentionBackend(AttentionBackend):
             meta.cmp_lengths[ratio].copy_(total // ratio)
             meta.residual[ratio].copy_(total % ratio)
         if self.request_window is not None:
-            self.request_window.prepare(meta, width=1)
+            self.request_window.prepare(meta)
 
     def _init_tail_metadata(self, fb, full, cu, counts, lengths):
         from sglang.srt.hardware_backend.npu.dsv41.prefill.replay import TailRows
@@ -519,13 +528,20 @@ class DSV41AttentionBackend(AttentionBackend):
             n > 0 and length > cutoff
             for n, length, cutoff in zip(counts, lengths, cutoffs)
         )
-        row_map = torch.cat(
+        row_map_cpu = torch.cat(
             [
-                torch.arange(int(cu[i + 1]) - n, int(cu[i + 1]), dtype=torch.int32)
+                torch.arange(
+                    int(cu[i + 1]) - n, int(cu[i + 1]), dtype=torch.int32, device="cpu"
+                )
                 for i, n in enumerate(tail_counts)
             ]
-        ).to(self.device)
-        rows = sum(tail_counts)
+        )
+        rows = row_map_cpu.numel()
+        # Request suffixes are ordered and disjoint. The endpoints identify
+        # a single contiguous range without reading any device metadata.
+        start = int(row_map_cpu[0]) if rows else 0
+        contiguous = rows > 0 and int(row_map_cpu[-1]) - start + 1 == rows
+        row_map = row_map_cpu.to(self.device)
         tail = self._bucket(full.batch, rows, "tail")
         tail_cu = (
             torch.tensor([0] + tail_counts, dtype=torch.int32, device="cpu")
@@ -533,7 +549,7 @@ class DSV41AttentionBackend(AttentionBackend):
             .int()
         )
         tail.cu.copy_(tail_cu)
-        for name in ("lengths", "table", "compressed_table"):
+        for name in ("lengths", "compressed_table"):
             target = getattr(tail, name)
             target.copy_(getattr(full, name))
         tail.requests.copy_(full.requests)
@@ -541,34 +557,23 @@ class DSV41AttentionBackend(AttentionBackend):
         tail.accepted.masked_fill_(full.accepted == 0, 0)
         tail.starts.copy_(lengths.long() - torch.tensor(tail_counts, device="cpu"))
         tail.starts.masked_fill_(full.accepted == 0, 0)
-        self.ced.gather(full.full_slots, row_map, out=tail.full_slots)
-        self.ced.gather(full.swa_slots, row_map, out=tail.swa_slots)
         for r in (1, 2):
             tail.cmp_lengths[r].copy_(full.cmp_lengths[r])
             tail.residual[r].copy_(full.residual[r])
-        tail.window.zero_()
-        floor_lengths = torch.cat(
-            [
-                # A whole extend retains the preceding chunk's valid SWA KV.
-                # A truncated extend must mask its uncomputed local prefix.
-                torch.zeros(n, dtype=torch.int32, device="cpu")
-                if n == count
-                else torch.arange(1, n + 1, dtype=torch.int32, device="cpu")
-                for n, count in zip(tail_counts, counts)
-            ]
-        )
-        tail.window[:rows, 0].copy_(floor_lengths)
-        tail.late_layer_tail = TailRows(
+        selection = TailRows(
             token_indices=row_map.long(),
-            positions=self.ced.gather(fb.positions.long().contiguous(), row_map),
+            positions=fb.positions.new_empty((rows,), dtype=torch.int64),
             extend_seq_lens=torch.tensor(
                 tail_counts[: fb.batch_size], dtype=torch.int32, device=self.device
             ),
             extend_seq_lens_cpu=tail_counts[: fb.batch_size],
             swa_out_cache_loc=tail.swa_slots,
             row_map=row_map,
-            movement=self.ced,
+            contiguous_start=start if contiguous else None,
         )
+        selection.rows(fb.positions.long(), out=selection.positions)
+        selection.rows(full.full_slots, out=tail.full_slots)
+        tail.late_layer_tail = selection
         tail.fb_scalars = {
             name: value.new_tensor(rows)
             for name in ("num_token_non_padded", "global_num_token_non_padded")
@@ -594,29 +599,35 @@ class DSV41AttentionBackend(AttentionBackend):
             )
             self.request_window.activate(full.ring_plan)
             return
-        # No device readback in the layer loop or the completion hooks.
-        keep = torch.cat(
+        tail.table.copy_(full.table)
+        selection.rows(full.swa_slots, out=tail.swa_slots)
+        floor_lengths = torch.cat(
             [
-                # All retained rows were computed. The extra rollback rows
-                # can complete the window at a preceding page boundary.
-                torch.arange(int(cu[i + 1]) - n, int(cu[i + 1]), device="cpu")
-                for i, n in enumerate(tail_counts)
+                # A whole extend retains the preceding chunk's valid SWA KV.
+                # A truncated extend must mask its uncomputed local prefix.
+                torch.zeros(n, dtype=torch.int32, device="cpu")
+                if n == count
+                else torch.arange(1, n + 1, dtype=torch.int32, device="cpu")
+                for n, count in zip(tail_counts, counts)
             ]
         )
-        self._ced_pending = (full.full_slots.cpu()[keep], full.swa_slots.cpu()[keep])
+        tail.window[:, 0].copy_(floor_lengths)
+        # No device readback in the layer loop or the completion hooks.
+        self._ced_pending = (
+            full.full_slots.cpu()[row_map_cpu],
+            full.swa_slots.cpu()[row_map_cpu],
+        )
 
     def enter_late_layer_tail(self, fb):
         if self._tail_saved is not None or self.tail_forward_metadata is None:
             raise RuntimeError("invalid CED full/tail metadata transition")
         full, tail = self.forward_metadata, self.tail_forward_metadata
         rows = tail.late_layer_tail
-        for r in (1, 2):
-            tail.indices[r].fill_(-1)
-            self.ced.gather(
-                full.indices[r], rows.row_map, out=tail.indices[r][: tail.rows]
-            )
-        if full.candidates is not None:
-            self.ced.gather(full.candidates, rows.row_map, out=tail.candidates)
+        if tail.tail_source is None and not getattr(fb, "_dsv41_ced_skip_all", False):
+            for r in (1, 2):
+                rows.rows(full.indices[r], out=tail.indices[r])
+            if full.candidates is not None:
+                rows.rows(full.candidates, out=tail.candidates)
         # Preserve the exact original objects, including optional scalar tensors.
         updates = {
             "input_ids": rows.rows(fb.input_ids),
@@ -644,9 +655,9 @@ class DSV41AttentionBackend(AttentionBackend):
             narrowed = {}
             for key, (_, trig, _) in memo.items():
                 selected = RopeTables(
-                    self.ced.gather(trig.cos, rows.row_map),
-                    self.ced.gather(trig.sin, rows.row_map),
-                    self.ced.gather(trig.valid, rows.row_map),
+                    rows.rows(trig.cos),
+                    rows.rows(trig.sin),
+                    rows.rows(trig.valid),
                     None,
                 )
                 narrowed[key] = (rows.positions, selected, expanded_rope(selected))
@@ -666,6 +677,8 @@ class DSV41AttentionBackend(AttentionBackend):
         self.restore_late_layer_tail(fb)
 
     def restore_late_layer_tail(self, fb):
+        if self.tail_forward_metadata is not None:
+            self.tail_forward_metadata.tail_source = None
         if self._tail_saved is not None:
             self.forward_metadata, fields = self._tail_saved
             for name, value in fields.items():
@@ -689,18 +702,18 @@ class DSV41AttentionBackend(AttentionBackend):
         return self.forward_metadata.swa_slots
 
     def store_cache(self, *, layer_id, swa_k, forward_batch):
+        meta = self.forward_metadata
+        if meta.verify_window is not None:
+            local = self.pool._swa_local_layer_id(layer_id)
+            meta.swa_pending[local].copy_(swa_k.view(-1, 512))
+            return
         self.position.scatter_bf16(
             swa_k.contiguous(),
-            self.forward_metadata.swa_slots,
+            meta.swa_slots,
             self.pool.get_swa_buffer(layer_id).squeeze(2),
         )
         if self.request_window is not None:
-            if forward_batch.forward_mode.is_target_verify():
-                self.forward_metadata.ring_plan.pending[layer_id].copy_(
-                    swa_k.view(-1, 512)
-                )
-            else:
-                self.request_window.commit(layer_id, swa_k)
+            self.request_window.commit(layer_id, swa_k)
 
     def _source(self, layer):
         from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import (
@@ -719,61 +732,106 @@ class DSV41AttentionBackend(AttentionBackend):
             )
         return self.sources[layer.layer_id]
 
-    @_dsv41_verify.adapt_sources
+    def _write_source_cache(self, layer, x):
+        meta, r = self.forward_metadata, layer.compress_ratio
+        source = self._source(layer)
+        # The scheduler owns the committed prefix; warmup/capture do not
+        # advance it. A Radix hit restores an even, 128-aligned prefix;
+        # its complete C1/C2 rows are already retained with FULL pages and
+        # no pending-pair payload is needed. Subsequent odd chunk/decode
+        # boundaries use this request's committed pending pair.
+        selected = getattr(meta, "source_rows", None)
+        source_x = x if selected is None else x.index_select(0, selected)
+        starts = meta.starts if selected is None else meta.source_starts
+        cu = meta.cu if selected is None else meta.source_cu
+        accepted = meta.accepted if selected is None else meta.source_counts
+        full_slots = meta.full_slots if selected is None else meta.source_slots
+        source.state.committed_lengths[meta.requests.long()] = starts
+        kv, scores = layer.compressor.project(source_x)
+        prepared = source.prepare(
+            kv.contiguous(),
+            None if scores is None else scores.contiguous(),
+            cu[: meta.batch + 1],
+            meta.requests,
+        )
+        completion, rope_positions, _status = source.commit(prepared, accepted)
+        slots = torch.where(completion >= 0, full_slots // r, -1).long()
+        self.store_compressed_kv(layer, prepared.latent, rope_positions, slots)
+
+    def store_compressed_kv(self, layer, latent, rope_positions, slots):
+        trig = gather_rope(layer.freqs_cis, rope_positions)
+        if layer.indexer is not None and layer.indexer.owns_k:
+            index = layer.indexer
+            key = index.k_norm(index.wk(latent))
+            codes, scale = self.position.quantize_key(
+                key.contiguous(), cos=trig.cos, sin=trig.sin
+            )
+            pool = self.pool.index_pools[layer.compress_ratio]
+            local = self.pool.layer_mapping[layer.layer_id].compress_layer_id
+            self.position.scatter_index(
+                codes,
+                scale,
+                slots,
+                pool.index_k_buffer[local].view(-1, 128),
+                pool.index_scale_buffer[local].view(-1),
+            )
+        values = self.position.rope(latent, trig.cos, trig.sin)
+        self.position.scatter_bf16(
+            values, slots, self.pool.get_key_buffer(layer.layer_id).squeeze(2)
+        )
+
+    def write_tail_source_kv(self, *, layer, x, positions, forward_batch):
+        """Publish this source's KV before narrowing its attention/Indexer queries."""
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+
+        full, tail = self.forward_metadata, self.tail_forward_metadata
+        self._write_source_cache(layer, x)
+        q_lora, kv = _normalized_qkv(layer, x)
+        cos, sin = layer._get_npu_rope_position_cache(
+            forward_batch, positions, kv.dtype, inverse=False
+        )
+        Dsv4NpuRoPE.apply_rotary_mul_inplace(
+            kv.unsqueeze(1), None, cos, sin, qk_nope_dim=layer.qk_nope_head_dim
+        )
+        self.store_cache(layer_id=layer.layer_id, swa_k=kv, forward_batch=forward_batch)
+        if getattr(forward_batch, "_dsv41_ced_skip_all", False):
+            return
+        # The source was computed across the entire chunk. Its compact queries
+        # still see the full history, with the original page bases and SWA floors.
+        # The next layer can reuse the workspace once this attention has run.
+        cache = self.pool.get_swa_buffer(layer.layer_id)
+        window = full.window
+        if tail.rows != full.rows:
+            rows = tail.late_layer_tail
+            window = rows.rows(window)
+            q_lora = rows.rows(q_lora)
+        tail.tail_source = _TailSource(
+            layer.layer_id, cache, full.table, window, q_lora
+        )
+
     def forward_low_ratio_sources(self, *, layer, x, q_lora, positions, forward_batch):
         meta, r = self.forward_metadata, layer.compress_ratio
-        if meta.late_layer_tail is not None and layer.compressor is not None:
-            raise RuntimeError(
-                "CED late queries cannot advance source compressor state"
-            )
+        verify = forward_batch.forward_mode.is_target_verify()
+        source = meta.tail_source
         if layer.compressor is not None:
-            source = self._source(layer)
-            # The scheduler owns the committed prefix; warmup/capture do not
-            # advance it. A Radix hit restores an even, 128-aligned prefix;
-            # its complete C1/C2 rows are already retained with FULL pages and
-            # no pending-pair payload is needed. Subsequent odd chunk/decode
-            # boundaries use this request's committed pending pair.
-            selected = getattr(meta, "source_rows", None)
-            source_x = x if selected is None else x.index_select(0, selected)
-            starts = meta.starts if selected is None else meta.source_starts
-            cu = meta.cu if selected is None else meta.source_cu
-            accepted = meta.accepted if selected is None else meta.source_counts
-            full_slots = meta.full_slots if selected is None else meta.source_slots
-            source.state.committed_lengths[meta.requests.long()] = starts
-            kv, scores = layer.compressor.project(source_x)
-            prepared = source.prepare(
-                kv.contiguous(),
-                None if scores is None else scores.contiguous(),
-                cu[: meta.batch + 1],
-                meta.requests,
-            )
-            completion, rope_positions, _status = source.commit(prepared, accepted)
-            slots = torch.where(completion >= 0, full_slots // r, -1).long()
-            trig = gather_rope(layer.freqs_cis, rope_positions)
-            if layer.indexer is not None and layer.indexer.owns_k:
-                index = layer.indexer
-                key = index.k_norm(index.wk(prepared.latent))
-                codes, scale = self.position.quantize_key(
-                    key.contiguous(), cos=trig.cos, sin=trig.sin
+            if verify:
+                _dsv41_verify.write_provisional_source_kv(self, layer, x)
+            elif meta.late_layer_tail is None:
+                self._write_source_cache(layer, x)
+            elif source is None or layer.layer_id != source.layer_id:
+                raise RuntimeError(
+                    "CED late queries cannot advance source compressor state"
                 )
-                pool = self.pool.index_pools[r]
-                local = self.pool.layer_mapping[layer.layer_id].compress_layer_id
-                self.position.scatter_index(
-                    codes,
-                    scale,
-                    slots,
-                    pool.index_k_buffer[local].view(-1, 128),
-                    pool.index_scale_buffer[local].view(-1),
-                )
-            values = self.position.rope(prepared.latent, trig.cos, trig.sin)
-            self.position.scatter_bf16(
-                values, slots, self.pool.get_key_buffer(layer.layer_id).squeeze(2)
-            )
         if layer.indexer is not None:
             index = layer.indexer
             q, _ = index.wq_b(q_lora)
             q = q.view(-1, 32, 128).contiguous()
-            trig = cached_rope(layer.freqs_cis, positions.long(), forward_batch)
+            pos = positions.long()
+            trig = (
+                gather_rope(layer.freqs_cis, pos)
+                if verify
+                else cached_rope(layer.freqs_cis, pos, forward_batch)
+            )
             codes, qscale = self.position.quantize_query(q, cos=trig.cos, sin=trig.sin)
             weight, _ = index.weights_proj(x)
             weight = (weight.float() * index.head_weight_scale).half().contiguous()
@@ -799,33 +857,36 @@ class DSV41AttentionBackend(AttentionBackend):
             raise ValueError("attention Q rows must match the runtime metadata")
         if q.shape[1:] != (self.local_heads, 512):
             raise ValueError("attention Q must contain exactly the local TP heads")
-        query = q
-        cache = self.pool.get_swa_buffer(layer.layer_id)
-        sinks = attn_sink.contiguous()
-        if compress_ratio == 0:
-            out = m.swa(
-                query,
-                cache,
-                m.table,
-                m.cu,
-                m.lengths,
-                sinks,
-                m.window,
+        table, window = m.table, m.window
+        verify_ring = None
+        source = m.tail_source
+        if source is not None and layer.layer_id == source.layer_id:
+            cache, table, window = source.cache, source.table, source.window
+            m.tail_source = None
+        elif m.verify_window is not None:
+            cache, verify_ring = m.verify_window.verify_inputs(
+                m, self.pool._swa_local_layer_id(layer.layer_id)
             )
         else:
-            r = compress_ratio
-            out = m.sparse[r](
-                query,
-                cache,
-                self.pool.get_key_buffer(layer.layer_id),
-                m.indices[r],
-                m.table,
-                m.compressed_table,
-                m.cu,
-                m.lengths,
-                m.cmp_lengths[r],
-                m.residual[r],
-                m.window,
-                sinks,
+            cache = self.pool.get_swa_buffer(layer.layer_id)
+        sinks = attn_sink.contiguous()
+        if compress_ratio == 0:
+            return m.swa(
+                q, cache, table, m.cu, m.lengths, sinks, window, verify_ring=verify_ring
             )
-        return out
+        r = compress_ratio
+        return m.sparse[r](
+            q,
+            cache,
+            self.pool.get_key_buffer(layer.layer_id),
+            m.indices[r],
+            table,
+            m.compressed_table,
+            m.cu,
+            m.lengths,
+            m.cmp_lengths[r],
+            m.residual[r],
+            window,
+            sinks,
+            verify_ring=verify_ring,
+        )

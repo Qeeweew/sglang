@@ -376,9 +376,11 @@ def test_radix_init_preserves_current_typed_slots(monkeypatch, page_size):
     )
 
 
-def test_native_tail_preserves_current_output_contract(monkeypatch):
+@pytest.mark.parametrize("contiguous_start", [None, 2])
+def test_native_tail_preserves_current_output_contract(monkeypatch, contiguous_start):
     from dataclasses import fields
 
+    from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import row_copy
     from sglang.srt.hardware_backend.npu.dsv41.prefill.replay import TailRows
     from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
     from sglang.srt.models.deepseek_v4 import (
@@ -387,6 +389,10 @@ def test_native_tail_preserves_current_output_contract(monkeypatch):
     )
 
     assert set(LateLayerTail.__struct_fields__) <= {f.name for f in fields(TailRows)}
+    if contiguous_start is None:
+        monkeypatch.setattr(
+            row_copy, "gather_rows", lambda x, rows, *, out=None: x[rows.long()]
+        )
     selected = torch.tensor([2, 3])
     tail = TailRows(
         token_indices=selected,
@@ -395,8 +401,18 @@ def test_native_tail_preserves_current_output_contract(monkeypatch):
         extend_seq_lens_cpu=[2],
         swa_out_cache_loc=selected,
         row_map=selected.int(),
-        movement=SimpleNamespace(gather=lambda x, rows: x[rows.long()]),
+        contiguous_start=contiguous_start,
     )
+    if contiguous_start is not None:
+        source = torch.arange(16).view(4, 4).T
+        compact = tail.rows(source)
+        assert compact.is_contiguous()
+        torch.testing.assert_close(compact, source[2:4])
+        compact.zero_()
+        assert tail.rows(source, out=compact) is compact
+        torch.testing.assert_close(
+            compact, torch.tensor([[2, 6, 10, 14], [3, 7, 11, 15]])
+        )
     monkeypatch.setattr(
         LogitsMetadata, "from_forward_batch", lambda batch: SimpleNamespace()
     )

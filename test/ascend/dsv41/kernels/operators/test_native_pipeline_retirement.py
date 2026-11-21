@@ -14,10 +14,13 @@ from pathlib import Path
 
 import torch
 import torch_npu  # noqa: F401
-from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.ced import CED
 from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.fp8_weight import FP8Weight
 from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.moe_routes import MoERoutes
 from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.router import RoutingPlan
+from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.row_copy import (
+    gather_rows,
+    scatter_rows,
+)
 from sglang.srt.hardware_backend.npu.dsv41.kernels.runtime.health import health_snapshot
 from dsv41.kernels.references.fp8_weight import reference as fp8_reference
 
@@ -28,7 +31,7 @@ def guarded(shape, dtype):
     return storage[32:-32].view(shape), storage
 
 
-def make_generation(ced, routes, fp8, rows, width, generation):
+def make_generation(routes, fp8, rows, width, generation):
     generator = torch.Generator().manual_seed(71209 + generation)
     source = torch.randn(rows, width, generator=generator).bfloat16()
     device_source = source.npu()
@@ -52,9 +55,9 @@ def make_generation(ced, routes, fp8, rows, width, generation):
         torch.zeros(rows, topk, dtype=torch.int32, device="npu"),
         weights.npu(),
         torch.tensor([slots], dtype=torch.int32, device="npu"),
-        torch.tensor([0, slots], dtype=torch.int64, device="npu"),
-        torch.arange(slots, dtype=torch.int64, device="npu"),
-        torch.tensor([1, slots, 0, 1, 0, 0, slots, 0], dtype=torch.int64, device="npu"),
+        torch.tensor([0, slots], dtype=torch.int32, device="npu"),
+        torch.arange(slots, dtype=torch.int32, device="npu"),
+        torch.tensor([1, slots, 0, 1, 0, 0, slots, 0], dtype=torch.int32, device="npu"),
     )
     values, inverse = routes.gather(device_source, routing)
     combined, combine_guard = guarded((rows, width), torch.bfloat16)
@@ -76,8 +79,8 @@ def make_generation(ced, routes, fp8, rows, width, generation):
     expected_decoded = fp8_reference(codes, scales)
 
     def invoke():
-        ced.gather(device_source, device_mapping, out=gathered)
-        ced.scatter(device_updates, device_mapping, scattered)
+        gather_rows(device_source, device_mapping, out=gathered)
+        scatter_rows(device_updates, device_mapping, scattered)
         routes.gather(device_source, routing, out=values, inverse=inverse)
         routes.combine(values, inverse, routing, out=combined)
         fp8.convert(device_codes, device_scales, out=decoded)
@@ -111,14 +114,11 @@ def main():
     torch.set_num_threads(1)
     torch.npu.set_device(0)
     os.environ["DSV41_NATIVE_DIR"] = str(args.library_dir.resolve())
-    ced = CED(library_dir=args.library_dir)
     routes = MoERoutes()
     fp8 = FP8Weight(args.library_dir / "libdsv41_kernels.so")
     records = []
     for rows, width in ((6, 257), (33, 513), (6, 5120)):
-        generations = [
-            make_generation(ced, routes, fp8, rows, width, i) for i in range(20)
-        ]
+        generations = [make_generation(routes, fp8, rows, width, i) for i in range(20)]
 
         def invoke_batch():
             for invoke, _ in generations:

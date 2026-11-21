@@ -28,6 +28,18 @@ def ced_enabled():
         return False
 
 
+def can_split_tail_source(config):
+    """The compact source must regenerate every index its consumers inherit."""
+    last = max(config.kv_source_layer_ids)
+    return (
+        config.compress_ratios[last] == 1
+        and last in config.index_source_layer_ids
+        and config.candidate_source_layer_id == last
+        and last not in config.engram_layer_ids
+        and getattr(config, "num_hash_layers", 0) <= last
+    )
+
+
 def validate_ced_config(config):
     sources = list(config.kv_source_layer_ids)
     depth = config.num_hidden_layers
@@ -49,7 +61,7 @@ def validate_ced_config(config):
     captures = getattr(config, "dspark_target_layer_ids", ())
     if any(i < cut or i >= depth for i in captures):
         raise ValueError("910B CED DSpark capture layers must follow the KV cut")
-    return cut
+    return cut - 1 if can_split_tail_source(config) else cut
 
 
 def ced_tail_window(config):
@@ -207,7 +219,7 @@ def merged_prefill(batch, runner):
 
 @dataclass(frozen=True)
 class TailRows:
-    """The upstream LateLayerTail interface, using the qualified CED row mover."""
+    """The upstream LateLayerTail interface for the 910B backend."""
 
     token_indices: torch.Tensor
     positions: torch.Tensor
@@ -215,8 +227,7 @@ class TailRows:
     extend_seq_lens_cpu: list[int]
     swa_out_cache_loc: torch.Tensor
     row_map: torch.Tensor
-    movement: object
-    contiguous_start: object = None
+    contiguous_start: int | None = None
     pad_rows: int = 0
     cp_metadata: object = None
     local_lens_cpu: list[int] | None = None
@@ -226,10 +237,23 @@ class TailRows:
     scatter_indices: object = None
     real_rows_count: object = None
 
-    def rows(self, tensor):
+    def rows(self, tensor, *, out=None):
         if tensor is None:
             return None
-        return self.movement.gather(tensor.contiguous(), self.row_map)
+        if (
+            self.contiguous_start is not None
+            and self.contiguous_start + self.row_map.numel() <= tensor.shape[0]
+        ):
+            selected = tensor.narrow(0, self.contiguous_start, self.row_map.numel())
+            # The compact HcState must not retain the full prefill allocation.
+            return (
+                selected.clone(memory_format=torch.contiguous_format)
+                if out is None
+                else out.copy_(selected)
+            )
+        from ..kernels.ops.row_copy import gather_rows
+
+        return gather_rows(tensor.contiguous(), self.row_map, out=out)
 
     real_rows = rows
 
@@ -366,8 +390,17 @@ def adapt_scatter_tail(original_scatter):
     def scatter_tail(tail, rows, num_tokens, zero=False):
         if not isinstance(tail, TailRows):
             return original_scatter(tail, rows, num_tokens, zero=zero)
+        from ..kernels.ops.row_copy import scatter_rows
+
         output = rows.new_zeros((num_tokens, *rows.shape[1:]))
-        return tail.movement.scatter(rows.contiguous(), tail.row_map, out=output)
+        if (
+            tail.contiguous_start is not None
+            and rows.shape[0] == tail.row_map.numel()
+            and tail.contiguous_start + rows.shape[0] <= num_tokens
+        ):
+            output.narrow(0, tail.contiguous_start, rows.shape[0]).copy_(rows)
+            return output
+        return scatter_rows(rows.contiguous(), tail.row_map, output)
 
     return scatter_tail
 

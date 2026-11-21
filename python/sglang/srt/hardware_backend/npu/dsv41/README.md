@@ -136,7 +136,21 @@ with streamed weights but can increase HBM reads when weights would otherwise
 be reused from L2 across M tiles or calls.
 
 Large eager prefill batches compact scratch to the local EP routing count.
-Bounded replay uses the model's approximate SWA recovery.
+Bounded replay uses the model's approximate SWA recovery. In the 1017 layout,
+layer 20 writes compressed KV and index keys for the uncached suffix and
+builds SWA KV for the whole extend, including encoder replay rows. Its Indexer
+queries, attention and MoE run on the decoder replay tail. Those queries use
+the source's full SWA history and the original per-request window floors.
+The backend identifies contiguous tails from the scheduler's CPU lengths and
+copies the slice so the compact rows can outlive the full prefill allocation.
+Disjoint tails and masked SWA history use the shared `row_copy` kernels. Gather
+fills invalid rows. Scatter skips invalid indices and writes repeated
+destinations in source order.
+
+With request-private SWA enabled, DSpark target verification reads accepted
+history from each layer's ring and the current six provisional rows from the
+verify bucket. Accept commits only the selected prefix to the ring. The standard
+910B serve profile enables both optimizations with the native build in `build/dsv41`.
 
 ## Native operator library
 
@@ -149,8 +163,9 @@ the `.asc` entry runs the device pipeline.
 | Computation | Native components |
 | --- | --- |
 | Dense and expert projections | `projection`, `w8a16`, `quant_grouped_gemm` (MXFP4 weights × FP16), `int4_g32_a8` (signed G32 weights × INT8) |
+| Indexed row gather and scatter | `row_copy` |
 | Format conversion | `fp8_weight`, `mxfp4_weight`, `h32_quant` (H32 transform and token quantization for both shared and routed projections) |
-| Attention, KV and index selection | `attention`, `qli`, `position_quant`, `compressor`, `page_metadata`, `ced` |
+| Attention, KV and index selection | `attention`, `qli`, `position_quant`, `compressor`, `page_metadata` |
 | Routing, activation and model-specific operations | `router`, `moe_routes`, `elementwise`, `mhc`, `engram`, `engram_ops` |
 | Speculative decoding and communication | `dspark_schedule`, `dspark_markov`, `peer_all_reduce` |
 
@@ -169,8 +184,9 @@ snapshots under immutable version directories. Keep the whole publication,
 not just the shared library. `DSV41_NATIVE_DIR` chooses a publication;
 `DSV41_JIT_CACHE_DIR` chooses a cache shared by the ranks on the node.
 
-Native ABI 29 requires rebuilding the host publication. CMake builds the host
-extension. The router produces grouped GEMM metadata on the device.
+Native ABI 31 exposes indexed row gather and scatter. Attention accepts a
+verify ring argument. CMake builds the host extension. The router produces
+grouped GEMM metadata on the device.
 AICore kernels compile through DeepJIT for the model geometries actually bound.
 Prepare and warm them before Graph capture; hot calls and replay do not compile.
 Warm eager prefill and encoder replay geometries as well before measuring

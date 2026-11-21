@@ -9,7 +9,7 @@ MTP/DSpark retains its original weights and quantization. Attention, Engram
 and the residual stream retain their original basis. Target conversion reads
 weights only; evaluation prompts never participate in fitting.
 
-### Joint shared/routed execution (native ABI 29)
+### Joint shared/routed execution
 
 With EP8 sequence-parallel dispatch, the first collective still gathers BF16
 tokens. Each receiving rank quantizes the gathered token matrix **once**.

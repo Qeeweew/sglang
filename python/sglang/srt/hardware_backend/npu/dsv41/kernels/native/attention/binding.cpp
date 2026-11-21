@@ -3,6 +3,7 @@
 #include "jit.h"
 #include "workspace.h"
 #include <cmath>
+#include <tuple>
 
 namespace native_host {
 attention::Config attention_geometry(int64_t tokens, int64_t heads, int64_t batch, int64_t columns,
@@ -82,6 +83,9 @@ int64_t workspace(int64_t tokens, int64_t heads, int64_t batch, int64_t columns,
         tokens, heads, batch, columns, compressed_columns, capacity, ratio, mode,
         selected_cores(device, cores), ring, width, page_rows, window_rows, selected_rows));
 }
+using VerifyRing = std::tuple<at::Tensor, at::Tensor, int64_t>;
+
+template <bool Prepare>
 void run(const at::Tensor &q, const at::Tensor &kv, const std::optional<at::Tensor> &compressed,
          const std::optional<at::Tensor> &indices, const at::Tensor &table,
          const std::optional<at::Tensor> &compressed_table, const at::Tensor &cu,
@@ -89,7 +93,7 @@ void run(const at::Tensor &q, const at::Tensor &kv, const std::optional<at::Tens
          const std::optional<at::Tensor> &residual, const std::optional<at::Tensor> &window,
          const at::Tensor &sinks, const at::Tensor &out, const std::optional<at::Tensor> &workspace,
          int64_t capacity, int64_t ratio, int64_t mode, bool ring, int64_t window_rows,
-         int64_t cores) {
+         int64_t cores, const std::optional<VerifyRing> &verify_ring) {
     const auto device = q.device();
     TORCH_CHECK_VALUE(q.dim() == 3 && table.dim() == 2 && table.size(0) > 0 && table.size(1) > 0 &&
                           kv.dim() == 4 && kv.size(0) > 0 && kv.size(2) == 1,
@@ -125,32 +129,57 @@ void run(const at::Tensor &q, const at::Tensor &kv, const std::optional<at::Tens
             c.coordinate_shift > 0 && compressed->size(0) <= INT32_MAX / c.compressed_page_rows;
         c.coordinate_elements32 = compressed->numel() <= INT32_MAX;
     }
+    std::optional<at::Tensor> verify_requests, verify_pending;
+    if (verify_ring) {
+        const auto &[requests, pending, ring_capacity] = *verify_ring;
+        TORCH_CHECK_VALUE(mode != int32_t(attention::Mode::Draft) && window_rows <= 128 &&
+                              ring_capacity >= window_rows && ring_capacity <= INT32_MAX &&
+                              ring_capacity % c.page_rows == 0 &&
+                              kv.size(0) >= ring_capacity / c.page_rows,
+                          "verify ring requires bounded causal attention and complete ring pages");
+        check(requests, at::kLong, device, {c.batch});
+        check(pending, at::kBFloat16, device, {c.tokens, c.width});
+        verify_requests = requests;
+        verify_pending = pending;
+        c.verify_ring_capacity = int32_t(ring_capacity);
+    }
     const auto bytes = attention::workspace_bytes(c);
     if (workspace) {
         check(*workspace, at::kByte, device);
         TORCH_CHECK_VALUE(workspace->numel() >= bytes, "attention workspace too small");
     }
     disjoint({out, workspace}, {q, kv, compressed, indices, table, compressed_table, cu, lengths,
-                              compressed_lengths, residual, window, sinks});
+                              compressed_lengths, residual, window, sinks, verify_requests, verify_pending});
     if (!c.tokens)
         return;
-    auto stream = c10_npu::getCurrentNPUStream(device.index());
-    const auto acl_stream = stream.stream();
-    const LaunchWorkspace scratch(workspace, bytes, acl_stream);
-    for (const auto &t : {q, kv, table, cu, lengths, sinks, out})
-        record(t, stream);
-    track(workspace, stream);
-    for (const auto &t :
-         {compressed, indices, compressed_table, compressed_lengths, residual, window})
-        track(t, stream);
-    attention::Arguments a{{uintptr_t(ptr(q)), uintptr_t(ptr(kv)), uintptr_t(ptr(compressed)),
-                            uintptr_t(ptr(indices)), uintptr_t(ptr(table)),
-                            uintptr_t(ptr(compressed_table)), uintptr_t(ptr(cu)),
-                            uintptr_t(ptr(lengths)), uintptr_t(ptr(compressed_lengths)),
-                            uintptr_t(ptr(residual)), uintptr_t(ptr(window)), uintptr_t(ptr(sinks)),
-                            uintptr_t(ptr(out)), uintptr_t(scratch.data())},
-                           c};
-    dsv41_attention_launch(acl_stream, a);
+    auto launch = [&] {
+        auto stream = c10_npu::getCurrentNPUStream(device.index());
+        const auto acl_stream = stream.stream();
+        const LaunchWorkspace scratch(workspace, bytes, acl_stream);
+        for (const auto &t : {q, kv, table, cu, lengths, sinks, out})
+            record(t, stream);
+        track(workspace, stream);
+        for (const auto &t :
+             {compressed, indices, compressed_table, compressed_lengths, residual, window,
+              verify_requests, verify_pending})
+            track(t, stream);
+        attention::Arguments a{{uintptr_t(ptr(q)), uintptr_t(ptr(kv)), uintptr_t(ptr(compressed)),
+                                uintptr_t(ptr(indices)), uintptr_t(ptr(table)),
+                                uintptr_t(ptr(compressed_table)), uintptr_t(ptr(cu)),
+                                uintptr_t(ptr(lengths)), uintptr_t(ptr(compressed_lengths)),
+                                uintptr_t(ptr(residual)), uintptr_t(ptr(window)), uintptr_t(ptr(sinks)),
+                                uintptr_t(ptr(out)), uintptr_t(scratch.data())},
+                               c};
+        a.sources.verify_requests = uintptr_t(ptr(verify_requests));
+        a.sources.verify_pending = uintptr_t(ptr(verify_pending));
+        dsv41_attention_launch(acl_stream, a);
+    };
+    if constexpr (Prepare) {
+        native_jit::PrepareOnlyScope scope;
+        launch();
+    } else {
+        launch();
+    }
 }
 
 } // namespace
@@ -161,26 +190,13 @@ TORCH_LIBRARY_FRAGMENT(dsv41, m) {
           "page_rows=128, "
           "int window_rows=128, int selected_rows=512, int cores=0) -> int",
           &workspace);
-    const auto schema = "(Tensor q, Tensor kv, Tensor? compressed, Tensor? indices, Tensor table, "
-                        "Tensor? compressed_table, Tensor cu, Tensor lengths, Tensor? "
-                        "compressed_lengths, Tensor? residual, "
-                        "Tensor? window, Tensor sinks, Tensor(a!) out, Tensor(b!)? workspace, int "
-                        "capacity, int ratio, "
-                        "int mode, bool ring, int window_rows=128, int cores=0) -> ()";
-    m.def((std::string("attention") + schema).c_str(), &run);
-    m.def((std::string("prepare_attention") + schema).c_str(),
-          [](const at::Tensor &q, const at::Tensor &kv, const std::optional<at::Tensor> &compressed,
-             const std::optional<at::Tensor> &indices, const at::Tensor &table,
-             const std::optional<at::Tensor> &compressed_table, const at::Tensor &cu,
-             const at::Tensor &lengths, const std::optional<at::Tensor> &compressed_lengths,
-             const std::optional<at::Tensor> &residual, const std::optional<at::Tensor> &window,
-             const at::Tensor &sinks, const at::Tensor &out, const std::optional<at::Tensor> &scratch,
-             int64_t capacity, int64_t ratio, int64_t mode, bool ring, int64_t window_rows,
-             int64_t cores) {
-              native_jit::PrepareOnlyScope scope;
-              run(q, kv, compressed, indices, table, compressed_table, cu, lengths,
-                  compressed_lengths, residual, window, sinks, out, scratch, capacity, ratio, mode,
-                  ring, window_rows, cores);
-          });
+    const std::string schema =
+        "(Tensor q, Tensor kv, Tensor? compressed, Tensor? indices, Tensor table, "
+        "Tensor? compressed_table, Tensor cu, Tensor lengths, Tensor? compressed_lengths, "
+        "Tensor? residual, Tensor? window, Tensor sinks, Tensor(a!) out, Tensor(b!)? workspace, "
+        "int capacity, int ratio, int mode, bool ring, int window_rows=128, int cores=0, "
+        "(Tensor, Tensor, int)? verify_ring=None) -> ()";
+    m.def(("attention" + schema).c_str(), &run<false>);
+    m.def(("prepare_attention" + schema).c_str(), &run<true>);
 }
 } // namespace native_host

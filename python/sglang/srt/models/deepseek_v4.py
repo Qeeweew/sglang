@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from sglang.srt.hardware_backend.npu.dsv41 import dense_weights as _dsv41_weights
 from sglang.srt.hardware_backend.npu.dsv41 import linear as _dsv41_w8a16
-from sglang.srt.hardware_backend.npu.dsv41.attention import projections as _dsv41_projection
+from sglang.srt.hardware_backend.npu.dsv41.attention import (
+    projections as _dsv41_projection,
+)
 from sglang.srt.hardware_backend.npu.dsv41 import mhc as _dsv41_mhc
 from sglang.srt.hardware_backend.npu.dsv41.prefill import replay as _dsv41_prefill
 
@@ -4036,7 +4038,10 @@ class DeepseekV4Model(nn.Module):
                 "decoder SWA bounded replay needs kv_source_layer_ids"
             )
             last_source = max(config.kv_source_layer_ids)
-            self.tail_writes_source_kv = not (_is_npu and _dsv41_prefill.enabled())
+            self.tail_writes_source_kv = not (_is_npu and _dsv41_prefill.enabled()) or (
+                config.model_type == "deepseek_v41"
+                and _dsv41_prefill.can_split_tail_source(config)
+            )
             self.late_layer_start = (
                 last_source if self.tail_writes_source_kv else last_source + 1
             )
@@ -4262,6 +4267,7 @@ class DeepseekV4Model(nn.Module):
                             positions=positions,
                             forward_batch=forward_batch,
                         )
+                    del source_x
                 # Decode reaches back at most SWA_WINDOW positions.
                 if tail_in_graph:
                     # Eager break: re-run at replay so the backend swaps onto the
