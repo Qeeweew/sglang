@@ -24,7 +24,7 @@ void launch(void *stream, int depth, int width, int workers, const Inputs &input
     entry(depth, width, workers, bf16).launch_persistent(stream, workers, inputs);
 }
 TORCH_LIBRARY_FRAGMENT(dsv41, m) {
-    m.def("precompile_int4_g32_a8(int depth, int width, bool bf16=False) -> ()",
+    m.def("precompile_int4_g32_a8(int depth, int width, bool bf16=True) -> ()",
           [](int64_t depth, int64_t width, bool bf16) {
               TORCH_CHECK_VALUE(valid_geometry(depth, width), "unsupported INT4 G32 geometry");
               const int workers = native_host::core_count(c10_npu::current_device(), true);

@@ -17,13 +17,13 @@ The local shared expert takes its owner slice, and route gather copies the
 same INT8 codes and FP32 token scales into expert order. Router precision,
 checkpoint layout, on-device weight storage and MTP are unchanged.
 
-Shared W8A8 and routed G32 gate/up are separate GEMMs returning FP16. A single
+Shared W8A8 and routed G32 gate/up are separate GEMMs returning BF16. A single
 clipped SwiGLU launch reads their two packed inputs directly (no concatenation)
-and writes `[owned shared rows, live routed rows]` as FP16. A **separate** H32
+and writes `[owned shared rows, live routed rows]` as BF16. A **separate** H32
 launch quantizes that prefix, retaining one scale per row. Both operators read
 the live routed count on device, including replay when no local expert fires.
 The down GEMMs take slices of the resulting codes/scales. Routed down returns
-FP16 for weighted combine; shared down writes BF16 directly at the model boundary.
+BF16 for weighted combine. Shared down writes BF16 directly at the model boundary.
 Only routed output is weighted and combined; shared is added once on its owner.
 For both G32 and source MXFP4, the EP8 serving transport leaves shared for
 this joint stage even with unequal DP segments or peer communication disabled.

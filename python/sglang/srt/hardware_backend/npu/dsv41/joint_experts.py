@@ -65,7 +65,7 @@ def fp16_shared_gate(shared, x):
 
 def _g32_gate_up(method, shared, hidden, routing, owned, compact):
     _, (storage, inverse, gate_up, _, values) = method.routed_storage(
-        hidden, routing, compact, torch.float16
+        hidden, routing, compact, torch.bfloat16
     )
     library = method.routes.library
     rows = gate_up.shape[0]

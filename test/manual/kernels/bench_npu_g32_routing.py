@@ -251,7 +251,7 @@ def main():
         "--arms", nargs="+", choices=("g32", "mx"), default=["g32", "mx"]
     )
     parser.add_argument(
-        "--g32-dtype", choices=("float16", "bfloat16"), default="float16"
+        "--g32-dtype", choices=("bfloat16", "float16"), default="bfloat16"
     )
     parser.add_argument(
         "--sustain-seconds",

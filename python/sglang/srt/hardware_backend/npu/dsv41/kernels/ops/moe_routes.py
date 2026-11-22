@@ -1,4 +1,4 @@
-"""BF16 model boundary around FP16 expert-major activations, without FP32 GM."""
+"""Gather MXFP4 expert inputs and combine FP16 or BF16 expert outputs to BF16."""
 
 from __future__ import annotations
 

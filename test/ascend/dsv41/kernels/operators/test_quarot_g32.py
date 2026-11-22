@@ -236,7 +236,7 @@ def test_joint_route_gather_combine():
         )
 
 
-def test_shared_w8a8_fp16_gate_and_bf16_return():
+def test_shared_w8a8_output_dtype():
     from sglang.srt.hardware_backend.npu.dsv41.linear import SharedW8A8Method
     from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
@@ -261,12 +261,72 @@ def test_shared_w8a8_fp16_gate_and_bf16_return():
     run()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph, stream=torch.npu.Stream(), auto_dispatch_capture=True):
-        gate, down = run()
+        fp16, default = run()
     inp.neg_()
     graph.replay()
-    torch.testing.assert_close(gate.cpu(), -reference.half(), rtol=0, atol=0)
-    torch.testing.assert_close(down.cpu(), -reference.bfloat16(), rtol=0, atol=0)
-    assert not torch.equal(gate.cpu(), down.cpu().half())
+    torch.testing.assert_close(fp16.cpu(), -reference.half(), rtol=0, atol=0)
+    torch.testing.assert_close(default.cpu(), -reference.bfloat16(), rtol=0, atol=0)
+    assert not torch.equal(fp16.cpu(), default.cpu().half())
+
+
+def test_joint_g32_bf16_activations():
+    """FP16 intermediates change SwiGLU rounding and overflow finite down outputs."""
+    from sglang.srt.hardware_backend.npu.dsv41.joint_experts import run_joint_experts
+    from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.router import Router
+    from sglang.srt.hardware_backend.npu.dsv41.moe import ResidentMXFP4Method
+    from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+
+    torch.npu.set_device(0)
+    width = 256
+
+    def weights(channel):
+        # Both experts use all-one integer weights with unit G32 factors.
+        n = channel.numel()
+        codes = torch.full((n, width // 2), 0x11, dtype=torch.uint8)
+        factors = torch.full((n, width // 64), 0x88, dtype=torch.uint8)
+        metadata = torch.cat((factors, channel.view(torch.uint8).view(n, 4)), dim=1)
+        routed = tuple(t[None].npu() for t in int4_g32_a8.pack_g32(codes, metadata))
+        shared = SimpleNamespace(
+            weight=npu_format_cast(torch.ones(width, n, dtype=torch.int8).npu()),
+            weight_scale_inv=channel.npu(),
+        )
+        return routed, shared
+
+    gate_scale = 1.003 / width
+    down_scale = torch.tensor([1.0, 1024.0]).repeat(width // 2)
+    gate, shared_gate = weights(torch.full((2 * width,), gate_scale))
+    down, shared_down = weights(down_scale)
+    method = ResidentMXFP4Method(g32=True)
+    method.h = method.i = width
+    method.e = method.ep = 1
+    method.limit = 10.0
+    method.local_experts = method.bind_local_experts(gate, down)
+    shared = SimpleNamespace(gate_up_proj=shared_gate, down_proj=shared_down)
+    hidden = torch.ones(1, width, dtype=torch.bfloat16, device="npu")
+    ids = torch.zeros((1, 1), dtype=torch.int32, device="npu")
+    plan = Router().bucket(ids, torch.ones_like(ids, dtype=torch.float32), 0, 1)
+
+    def run():
+        return run_joint_experts(method, shared, hidden, plan, slice(None), False)
+
+    def check(outputs, sign):
+        # For a constant row the sum after each unnormalized H32 is width * input.
+        z = torch.tensor(sign * width * gate_scale).bfloat16().float()
+        mid = (torch.nn.functional.silu(z) * z).bfloat16().float()
+        expected = (width * mid * down_scale).bfloat16().unsqueeze(0)
+        for output in outputs:
+            torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+
+    stream = torch.npu.Stream()
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        check(run(), 1)
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, stream=stream, auto_dispatch_capture=True):
+            outputs = run()
+        hidden.neg_()
+        graph.replay()
+        check(outputs, -1)
 
 
 @pytest.mark.parametrize("shared_rows,capacity", [(0, 7), (3, 0), (1, 6), (3, 150)])

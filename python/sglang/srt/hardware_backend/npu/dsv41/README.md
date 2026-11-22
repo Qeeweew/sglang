@@ -101,8 +101,9 @@ The G32 checkpoint instead selects signed INT4 × INT8 grouped GEMM for the
 target experts without any environment switch. Both shared and routed target
 projections use fused FP32 block-Hadamard + per-token A8. Shared weights use
 per-output-channel W8 and native Torch-NPU `npu_quant_matmul`. Draft/MTP is
-unmodified. G32 routed weight reads use the same L2 bypass as MXFP4. Routed
-FP16 output uses full FP32 channel and token scales.
+unmodified. G32 routed weight reads use the same L2 bypass as MXFP4. Both
+gate/up projections, the SwiGLU output and both down projections use BF16.
+The routed GEMMs apply FP32 channel and token scales before rounding to BF16.
 
 W8A16 uses two Vector lanes per Cube. Each lane loads INT8 and FP16 scales,
 then writes the decoded panel to a double-buffered GM workspace. Cube imports
