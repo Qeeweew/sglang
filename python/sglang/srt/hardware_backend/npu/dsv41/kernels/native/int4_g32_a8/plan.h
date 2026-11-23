@@ -45,7 +45,7 @@ constexpr int64_t scratch_bytes(int depth, int width, int workers) {
            (panel_depth(depth, columns) + tile_rows(depth, width) * sizeof(int32_t));
 }
 struct Inputs {
-    uintptr_t activation, codes, factors, channel, token, routing, output, scratch;
+    uintptr_t activation, codes, factors, channel, token, routing, output, scratch, bypass_alias;
     int experts;
 };
 void launch(void *stream, int depth, int width, int workers, const Inputs &inputs, bool bf16);

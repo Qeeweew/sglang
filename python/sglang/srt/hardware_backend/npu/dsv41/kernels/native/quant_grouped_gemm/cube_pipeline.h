@@ -173,7 +173,7 @@ template <class P> class CubePipeline {
         output_ = reinterpret_cast<__gm__ half *>(output);
         workspace_ = reinterpret_cast<__gm__ half *>(workspace);
         const int core = GetBlockIdx();
-        grouped_gemm::Schedule<P::Rows, P::Columns> schedule(routing, experts, Shape::panels, Shape::n);
+        grouped_gemm::Schedule<P::Rows, P::Columns> schedule(routing, experts, Shape::panels, Shape::n, core, cores);
         Tile next{}, current{};
         if (schedule.next(core, next)) {
             // Empty actors own no flags or local buffers to retire.

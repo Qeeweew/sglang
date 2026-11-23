@@ -57,11 +57,11 @@ void run(const at::Tensor &activation, const at::Tensor &codes, const at::Tensor
         record(tensor, stream);
     }
     const auto alias = l2_bypass_alias(device.index());
-    const auto streaming_codes = uintptr_t(ptr(codes)) + alias;
     const Inputs inputs{
-        uintptr_t(ptr(activation)), streaming_codes,         uintptr_t(ptr(factors)),
+        uintptr_t(ptr(activation)), uintptr_t(ptr(codes)),   uintptr_t(ptr(factors)),
         uintptr_t(ptr(channel)),    uintptr_t(ptr(token)),   uintptr_t(ptr(routing)),
-        uintptr_t(ptr(output)),     uintptr_t(ptr(scratch)), int(experts)};
+        uintptr_t(ptr(output)),     uintptr_t(ptr(scratch)), uintptr_t(alias),
+        int(experts)};
     if (prepare) {
         native_jit::PrepareOnlyScope scope;
         launch(stream.stream(), depth, width, workers, inputs, bf16);

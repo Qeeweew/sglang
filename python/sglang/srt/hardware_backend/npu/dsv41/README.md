@@ -104,6 +104,8 @@ per-output-channel W8 and native Torch-NPU `npu_quant_matmul`. Draft/MTP is
 unmodified. G32 routed weight reads use the same L2 bypass as MXFP4. Both
 gate/up projections, the SwiGLU output and both down projections use BF16.
 The routed GEMMs apply FP32 channel and token scales before rounding to BF16.
+In deep prefill (>= 3 M-tiles per active expert), G32 routed weight reads stay
+cached in L2 for cross-M-tile reuse and large prefill outputs bypass L2.
 
 W8A16 uses two Vector lanes per Cube. Each lane loads INT8 and FP16 scales,
 then writes the decoded panel to a double-buffered GM workspace. Cube imports
@@ -171,7 +173,10 @@ the `.asc` entry runs the device pipeline.
 | Speculative decoding and communication | `dspark_schedule`, `dspark_markov`, `peer_all_reduce` |
 
 `common/grouped_schedule.h` maps compact route records to the same sequence of
-tiles on the Cube and both Vector lanes for either expert weight format.
+tiles on the Cube and both Vector lanes for either expert weight format, using
+wave-rotated contiguous N-tile chunks in prefill when `Ntiles` is a multiple of
+the worker count to avoid cold-activation L2 stampedes and preserve L1
+activation reuse.
 `common/cube.h` owns the 910B short-MMAD barrier and the 16-bit L1 operand
 imports. `common/device.h` supplies typed UB byte offsets and immediate
 same-core event handoffs. Each pipeline assigns its own event IDs and owns its

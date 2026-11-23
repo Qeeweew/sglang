@@ -149,7 +149,7 @@ template <class P> class DecodePipeline {
                                int experts, int cores) {
         packed_ = packed; scales_ = scales; workspace_ = reinterpret_cast<__gm__ half *>(workspace);
         const int core = GetBlockIdx() / kVectorLanesPerCube, lane = GetSubBlockIdx();
-        grouped_gemm::Schedule<P::Rows, P::Columns> schedule(routing, experts, Shape::panels, Shape::n);
+        grouped_gemm::Schedule<P::Rows, P::Columns> schedule(routing, experts, Shape::panels, Shape::n, core, cores);
         Tile tile{};
         if (!schedule.next(core, tile)) return;
         initialize();

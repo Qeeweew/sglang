@@ -56,27 +56,15 @@ int64_t select(const std::vector<Geometry> &gs, int64_t rows, double mean, int64
             return index(Storage::kPrefillTileRows);
         return index(Storage::kDecodeTileRows);
     }
-    const auto active =
-        std::max(1.0, std::min(double(rows), std::ceil(rows / std::max(1.0, mean))));
-    auto work = [&](const Geometry &g) {
-        const auto tiles = active * std::ceil(mean / g[BM]) * (g[N] / g[BN]);
-        // Relative scheduling units carried from matched capacity timings:
-        // one 16^3 Cube tile versus four 32-byte FP16 operand DMA blocks.
-        // These choose a plan; they are not a hardware roofline estimate.
-        constexpr int kCubeUnitElements =
-            Storage::kFractalRows * Storage::kFractalRows * Storage::kFractalRows;
-        constexpr int kCopyUnitBlocks = 4;
-        constexpr int kDmaBytes = 32;
-        constexpr int kCopyUnitElements = kCopyUnitBlocks * kDmaBytes / sizeof(uint16_t);
-        const auto cube = double(g[BM] * g[BN] * g[K]) / kCubeUnitElements;
-        const auto operands = double(g[K] * (g[BM] + g[BN])) / kCopyUnitElements;
-        const auto orientation = active <= cores || 2 * g[K] > g[N] ? g[BM] : g[BN];
-        return std::make_pair(std::ceil(tiles / cores) * std::max(cube, operands), -orientation);
-    };
-    return work(gs[index(Storage::kPrefillTileRows)]) <=
-                   work(gs[index(Storage::kWidePrefillTileRows)])
-               ? index(Storage::kPrefillTileRows)
-               : index(Storage::kWidePrefillTileRows);
+    const auto compact_idx = index(Storage::kPrefillTileRows);
+    const auto wide_idx = index(Storage::kWidePrefillTileRows);
+    const auto &compact = gs[compact_idx];
+    const auto &wide = gs[wide_idx];
+    // Prefer BM=128 when it already fills the same L0C footprint as BM=256:
+    // BM=256/BN=128 doubles ND2NZ activation DMA and saturates AIC MTE2.
+    if (compact[BM] * compact[BN] >= wide[BM] * wide[BN])
+        return compact_idx;
+    return wide_idx;
 }
 int64_t select_config(int64_t k, int64_t n, int64_t rows, double mean, int64_t bound,
                       int64_t cores) {
