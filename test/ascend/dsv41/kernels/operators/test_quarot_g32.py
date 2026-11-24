@@ -307,7 +307,7 @@ def test_joint_g32_bf16_activations():
     plan = Router().bucket(ids, torch.ones_like(ids, dtype=torch.float32), 0, 1)
 
     def run():
-        return run_joint_experts(method, shared, hidden, plan, slice(None), False)
+        return run_joint_experts(method, shared, hidden, plan, slice(None))
 
     def check(outputs, sign):
         # For a constant row the sum after each unnormalized H32 is width * input.

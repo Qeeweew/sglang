@@ -17,7 +17,7 @@ from .policy import enabled
 
 logger = logging.getLogger(__name__)
 
-NO_SYNC_PREFILL_TOKENS = 4096
+NO_SYNC_PREFILL_TOKENS = 8192
 
 
 @cache
@@ -59,33 +59,26 @@ class ExpertScratch:
     Graphs keep their old generation when an eager prefill grows the arena.
     Flat views reuse the dead input for activation and the dead gate/up region
     for down output. Every individual kernel still has disjoint input/output.
-    Inverse indices retain the original route-slot capacity even when expert
-    activations use only this rank's compact rows. A fourfold global route-slot
-    budget decrease releases an eager arena; local routing skew within that
-    budget keeps the high-water capacity and does not invalidate bindings.
+    A fourfold drop in the route-slot budget releases the eager arena. Short
+    windows keep the current forward's budget so the next layer can reuse it.
     """
 
     def __init__(self, device, hidden, width, dtype=torch.float16):
         self.device, self.hidden, self.width = device, hidden, width
         self.dtype = dtype
-        self.capacity, self.slot_capacity, self.buffers, self.retired = 0, 0, None, []
+        self.capacity, self.buffers, self.retired = 0, None, []
         self.bindings, self.graph_bindings, self.retired_bindings = {}, {}, []
         self.captured = False
 
-    def get(self, rows, *, slots=None):
-        slots = rows if slots is None else slots
-        if not 0 <= rows <= slots:
-            raise ValueError("expert rows must fit the original route slot capacity")
+    def get(self, rows, *, reserve=0):
+        if rows < 0:
+            raise ValueError("expert row count must be non-negative")
+        capacity = max(rows, reserve)
         capturing = torch.npu.is_current_stream_capturing()
         shrink = (
-            not capturing and not self.captured and 0 < slots * 4 <= self.slot_capacity
+            not capturing and not self.captured and 0 < capacity * 4 <= self.capacity
         )
-        if (
-            self.buffers is None
-            or rows > self.capacity
-            or slots > self.slot_capacity
-            or shrink
-        ):
+        if self.buffers is None or capacity > self.capacity or shrink:
             if capturing:
                 raise RuntimeError("warm resident expert scratch before Graph capture")
             # Large prefill arenas occupy several GiB. Retire only Graph-owned
@@ -96,9 +89,8 @@ class ExpertScratch:
                 self.retired_bindings.append(self.graph_bindings)
             self.bindings, self.graph_bindings = {}, {}
             self.buffers = None
-            self.capacity = self.slot_capacity = 0
+            self.capacity = 0
             self.captured = False
-            capacity = rows
             h, i = capacity * self.hidden, capacity * self.width
             start = max(h, i)
             storage = torch.empty(
@@ -108,34 +100,16 @@ class ExpertScratch:
             gate_up = storage[start : start + 2 * i].view(capacity, 2 * self.width)
             activated = storage[:i].view(capacity, self.width)
             values = storage[i : i + h].view(capacity, self.hidden)
-            inverse = torch.empty((slots,), dtype=torch.int32, device=self.device)
-            buffers = (sorted_x, inverse, gate_up, activated, values)
-            self.capacity, self.slot_capacity, self.buffers = capacity, slots, buffers
+            inverse = torch.empty((capacity,), dtype=torch.int32, device=self.device)
+            self.capacity = capacity
+            self.buffers = (sorted_x, inverse, gate_up, activated, values)
         self.captured |= capturing
-        return tuple(
-            value[: slots if index == 1 else rows]
-            for index, value in enumerate(self.buffers)
-        )
+        return tuple(value[:rows] for value in self.buffers)
 
 
 @cache
 def expert_scratch(device, stream, hidden, width, dtype=torch.float16):
     return ExpertScratch(device, hidden, width, dtype)
-
-
-def compact_prefill(batch):
-    """Include idle/decode EP peers participating in a global eager prefill."""
-    return (
-        batch is not None
-        and not torch.npu.is_current_stream_capturing()
-        and (
-            batch.is_extend_in_batch
-            or (
-                batch.forward_mode.is_extend_without_speculative()
-                and not batch.forward_mode.is_cuda_graph()
-            )
-        )
-    )
 
 
 @cache
@@ -365,7 +339,7 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
     def apply(self, layer, dispatch_output):
         raise RuntimeError("resident MXFP4 uses the V4.1 native routing entry")
 
-    def routed_storage(self, x, routing, compact, dtype):
+    def routed_storage(self, x, routing, dtype, *, window_budget=0):
         from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.moe_routes import (
             MoERoutes,
         )
@@ -373,10 +347,6 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
         if not hasattr(self, "routes"):
             self.routes = MoERoutes(device=x.device)
         slots = routing.ids.numel()
-        # Only eager prefill opts in: Graph warmup/capture keeps conservative,
-        # stable capacities and never reads a device scalar back to the CPU.
-        capturing = torch.npu.is_current_stream_capturing()
-        compact = compact and self.ep > 1 and not capturing
         arena = expert_scratch(
             x.device,
             torch.npu.current_stream(x.device).npu_stream,
@@ -384,20 +354,17 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
             self.i,
             dtype,
         )
-        # kB is a proven upper bound even for a completely skewed EP rank.
-        # Reuse an already sufficient arena, or spend a bounded amount for a
-        # small global batch. Neither case needs the device's exact local L.
-        fits_bound = x.shape[0] <= NO_SYNC_PREFILL_TOKENS or arena.capacity >= slots
-        rows = int(routing.metadata[1].item()) if compact and not fits_bound else slots
-        if not 0 <= rows <= slots:
-            raise ValueError("invalid compact local expert row count")
-        return arena, arena.get(rows, slots=slots)
+        # Every slot may belong to this EP rank. Kernels read the live local
+        # count on device, while the arena reserves the worst case.
+        return arena, arena.get(slots, reserve=window_budget * routing.ids.shape[1])
 
-    def prepare_routed(self, x, routing, compact, *, shared_input=None, first=0):
+    def prepare_routed(
+        self, x, routing, *, shared_input=None, first=0, window_budget=0
+    ):
         arena, (sorted_x, inverse, gate_up, activated, values) = self.routed_storage(
-            x, routing, compact, torch.float16
+            x, routing, torch.float16, window_budget=window_budget
         )
-        rows, slots = sorted_x.shape[0], routing.ids.numel()
+        rows = sorted_x.shape[0]
         if rows or (shared_input is not None and shared_input.shape[0]):
             self.routes.gather(
                 x,
@@ -409,13 +376,10 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
             )
         if not rows:
             return inverse, gate_up, activated, values, None
-        bound = min(x.shape[0], rows)
-        mean = slots / (self.e * self.ep)
-        # Compaction changes capacity, not the established global-budget tiling
-        # policy. Local means can cross a BM threshold at each layer and cause
-        # substantially more weight decoding on the hot experts.
+        bound = x.shape[0]
+        mean = rows / (self.e * self.ep)
         projections_only = shared_input is not None
-        key = (routing.metadata.data_ptr(), rows, bound, mean, slots, projections_only)
+        key = (routing.metadata.data_ptr(), rows, bound, projections_only)
         previous_key, invoke = arena.bindings.get(self.local_experts, (None, None))
         if previous_key != key:
             bind = (
@@ -431,32 +395,107 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
                 out=values,
                 max_expert_rows=bound,
                 mean_expert_rows=mean,
-                tiling_rows=slots,
+                tiling_rows=rows,
             )
-            # Router metadata can be newly allocated in eager execution. Keep
-            # only this layer's latest binding; captured bindings live with the
-            # arena generation and cannot retain later eager prefills.
+            # Keep only this layer's latest binding. Captured bindings live
+            # with the arena generation.
             arena.bindings[self.local_experts] = (key, invoke)
         if torch.npu.is_current_stream_capturing():
             arena.graph_bindings[self.local_experts, key] = invoke
         return inverse, gate_up, activated, values, invoke
 
-    def routed(self, x, routing, *, compact=False):
+    def routed(self, x, routing, *, out=None, window_budget=0):
         if x.shape[0] == 0:
             return torch.empty_like(x)
-        inverse, _, _, values, invoke = self.prepare_routed(x, routing, compact)
+        inverse, _, _, values, invoke = self.prepare_routed(
+            x, routing, window_budget=window_budget
+        )
         if invoke is not None:
             invoke()
-        return self.finish_routed(values, inverse, routing)
+        return self.finish_routed(values, inverse, routing, out=out)
 
-    def finish_routed(self, values, inverse, routing):
+    def finish_routed(self, values, inverse, routing, *, out=None):
         from sglang.srt.runtime_context import get_forward
 
         if get_forward().npu_defer_route_combine:
             from .peer_collectives import RoutedOutput
 
             return RoutedOutput(values, inverse, routing.ids, routing.weights)
-        return self.routes.combine(values, inverse, routing)
+        return self.routes.combine(values, inverse, routing, out=out)
+
+
+def _run_expert_windows(hidden, run, *, counts, stride, valid, image_mask, owned):
+    from sglang.srt.runtime_context import get_forward
+
+    from .parallel import moe_routed_output
+
+    rows = hidden.shape[0]
+    if rows <= NO_SYNC_PREFILL_TOKENS:
+        return run(hidden, counts, stride, valid, image_mask, owned)
+    if get_forward().npu_defer_route_combine:
+        raise ValueError("windowed MoE requires immediate route combine")
+
+    budget = NO_SYNC_PREFILL_TOKENS
+    split_chunks = counts is not None and stride > budget
+    if split_chunks:
+        chunk_rows = stride
+    else:
+        chunk_rows = rows
+        if counts is not None:
+            budget = (budget // stride) * stride
+
+    routed = moe_routed_output(hidden)
+    shared = None
+    if owned is not None:
+        s0, s1, step = owned.indices(rows)
+        if step != 1:
+            raise ValueError("shared owner rows must be contiguous")
+
+    for chunk in range(0, rows, chunk_rows):
+        chunk_end = min(chunk + chunk_rows, rows)
+        for start in range(chunk, chunk_end, budget):
+            stop = min(start + budget, chunk_end)
+            win_counts, win_stride, win_valid = None, None, None
+            if split_chunks:
+                rank = chunk // stride
+                win_valid = (
+                    (counts[rank : rank + 1] - (start - chunk))
+                    .clamp(0, stop - start)
+                    .to(torch.int32)
+                )
+            elif counts is not None:
+                win_counts, win_stride = (
+                    counts[start // stride : stop // stride],
+                    stride,
+                )
+            elif valid is not None:
+                win_valid = (valid - start).clamp(0, stop - start)
+
+            win_owned = None
+            if owned is not None:
+                first = max(s0, start)
+                end = min(s1, stop)
+                win_owned = (
+                    slice(first - start, end - start) if first < end else slice(0, 0)
+                )
+            _, win_shared = run(
+                hidden[start:stop],
+                win_counts,
+                win_stride,
+                win_valid,
+                image_mask[start:stop] if image_mask is not None else None,
+                win_owned,
+                out=routed[start:stop],
+                window_budget=budget,
+            )
+            if win_shared is not None:
+                if win_shared.shape[0] == s1 - s0:
+                    shared = win_shared
+                else:
+                    if shared is None:
+                        shared = win_shared.new_empty((s1 - s0, hidden.shape[1]))
+                    shared[first - s0 : end - s0].copy_(win_shared)
+    return routed, shared
 
 
 def adapt_forward(original):
@@ -495,13 +534,16 @@ def adapt_forward(original):
         from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import Router
         from sglang.srt.runtime_context import get_parallel
 
+        from .joint_experts import can_join, run_joint_experts
+        from .parallel import moe_routing_metadata
+        from .peer_collectives import RoutedOutput
+
         if self._enable_a2a_moe or self.is_hash:
             raise ValueError(
                 "resident V4.1 TP/EP uses all-gather and partial sums; A2A/hash routing is unsupported"
             )
         if not hasattr(self, "_dsv41_resident_router"):
             self._dsv41_resident_router = Router(device=hidden_states.device)
-        logits = self.gate(hidden_states, gemm_output_zero_allocator).float()
         alternate = getattr(self.gate, "e_score_correction_bias_vl", None)
         image_mask = None
         if alternate is not None and input_ids_global is not None:
@@ -516,8 +558,11 @@ def adapt_forward(original):
             if forward_batch is not None and parallel.attn_dp_size == 1
             else None
         )
-        dp_args = {}
-        if (
+        layout = getattr(forward_batch, "_dsv41_group_moe_rows", None)
+        counts, stride = None, None
+        if layout is not None:
+            counts, stride = layout.counts, layout.stride
+        elif (
             forward_batch is not None
             and parallel.attn_dp_size > 1
             and forward_batch.dp_padding_mode.is_max_len()
@@ -526,46 +571,56 @@ def adapt_forward(original):
 
             counts = live_dp_counts(hidden_states.device, parallel.attn_dp_size)
             stride = _DpGatheredBufferWrapper.get_local_dp_buffer_len()
-            if stride * counts.numel() != hidden_states.shape[0]:
-                raise ValueError(
-                    f"resident TP MoE DP chunks: stride={stride}, ranks={counts.numel()}, rows={hidden_states.shape[0]}"
-                )
-            dp_args = {"dp_counts": counts, "dp_stride": stride}
-        routing = self._dsv41_resident_router.route(
-            logits,
-            self.gate.e_score_correction_bias,
-            factor=self.routed_scaling_factor,
-            first=method.first_expert,
-            experts=method.e,
-            valid_rows=valid.reshape(1) if valid is not None else None,
-            alternate_bias=alternate if image_mask is not None else None,
-            image_mask=image_mask,
-            **dp_args,
-        )
-        from .joint_experts import can_join, run_joint_experts
-        from .peer_collectives import RoutedOutput
-
-        compact = compact_prefill(forward_batch)
-        joint_local = (
-            not skip_shared_experts and can_join(self) and hidden_states.shape[0] > 0
-        )
-        if hidden_states.shape[0] and (
-            method.g32 or joint_local or joint_shared_slice is not None
-        ):
-            owned = slice(None) if joint_local else slice(0, 0)
-            routed, shared = run_joint_experts(
-                method,
-                getattr(self, "shared_experts", None),
-                hidden_states,
-                routing,
-                joint_shared_slice if joint_shared_slice is not None else owned,
-                compact,
+        rows = hidden_states.shape[0]
+        if counts is not None and (not stride or stride * counts.numel() != rows):
+            raise ValueError(
+                f"resident TP MoE DP chunks: stride={stride}, ranks={counts.numel()}, rows={rows}"
             )
-            if joint_shared_slice is not None:
-                return routed, shared
-        else:
-            routed = method.routed(hidden_states, routing, compact=compact)
-            shared = None
+        joint_local = not skip_shared_experts and can_join(self) and rows > 0
+        owned = joint_shared_slice
+        if owned is None:
+            owned = slice(None) if joint_local else slice(0, 0) if method.g32 else None
+        metadata = moe_routing_metadata(hidden_states, method.e)
+
+        def run_window(
+            x, counts, stride, valid, mask, owned, *, out=None, window_budget=0
+        ):
+            routing = self._dsv41_resident_router.route(
+                self.gate(x, gemm_output_zero_allocator).float(),
+                self.gate.e_score_correction_bias,
+                factor=self.routed_scaling_factor,
+                first=method.first_expert,
+                experts=method.e,
+                valid_rows=valid,
+                dp_counts=counts,
+                dp_stride=stride,
+                alternate_bias=alternate if mask is not None else None,
+                image_mask=mask,
+                metadata_out=metadata,
+            )
+            if owned is not None and x.shape[0]:
+                return run_joint_experts(
+                    method,
+                    getattr(self, "shared_experts", None),
+                    x,
+                    routing,
+                    owned,
+                    out=out,
+                    window_budget=window_budget,
+                )
+            return method.routed(x, routing, out=out, window_budget=window_budget), None
+
+        routed, shared = _run_expert_windows(
+            hidden_states,
+            run_window,
+            counts=counts,
+            stride=stride,
+            valid=valid.reshape(1) if valid is not None else None,
+            image_mask=image_mask,
+            owned=owned,
+        )
+        if joint_shared_slice is not None and rows:
+            return routed, shared
         if isinstance(routed, RoutedOutput):
             if not skip_shared_experts or return_moe_output or leave_output_sum:
                 raise ValueError(

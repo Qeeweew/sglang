@@ -13,8 +13,8 @@ from sglang.srt.hardware_backend.npu.dsv41.moe import ExpertScratch
 def test_stage_reuse_preserves_projection_inputs_and_results(hidden, width):
     arena = ExpertScratch(torch.device("cpu"), hidden, width)
     with patch.object(torch.npu, "is_current_stream_capturing", return_value=False):
-        x, inverse, gate_up, activated, values = arena.get(17, slots=102)
-    assert inverse.shape == (102,)
+        x, inverse, gate_up, activated, values = arena.get(17)
+    assert inverse.shape == (17,)
     storages = {t.untyped_storage().data_ptr() for t in (x, gate_up, activated, values)}
     assert len(storages) == 1
     assert x.untyped_storage().nbytes() == 2 * 17 * (max(hidden, width) + 2 * width)
@@ -39,91 +39,18 @@ def test_stage_reuse_preserves_projection_inputs_and_results(hidden, width):
     torch.testing.assert_close(values, expected, rtol=0, atol=0)
 
 
-def test_compact_rows_keep_full_inverse_and_handle_empty_local_rank():
+def test_empty_and_negative_row_requests():
     arena = ExpertScratch(torch.device("cpu"), 8, 4)
     with patch.object(torch.npu, "is_current_stream_capturing", return_value=False):
-        compact = arena.get(3, slots=102)
-        compact[1][101] = 2
-        assert compact[0].shape == (3, 8) and compact[1][101] == 2
-        empty = arena.get(0, slots=102)
-        assert empty[0].shape == (0, 8) and empty[1].shape == (102,)
-        with pytest.raises(ValueError, match="slot"):
-            arena.get(4, slots=3)
-        with pytest.raises(ValueError, match="slot"):
+        empty = arena.get(0, reserve=12)
+        assert empty[0].shape == (0, 8) and empty[1].shape == (0,)
+        assert arena.capacity == 12
+        with pytest.raises(ValueError, match="non-negative"):
             arena.get(-1)
 
 
-def test_local_route_skew_does_not_resize_arena_until_global_budget_shrinks():
-    arena = ExpertScratch(torch.device("cpu"), 8, 4)
-    with patch.object(torch.npu, "is_current_stream_capturing", return_value=False):
-        arena.get(100, slots=800)
-        large = arena.buffers
-        arena.bindings["layer"] = "warm binding"
-        for local_rows in (1, 10, 0, 95):
-            views = arena.get(local_rows, slots=800)
-            assert views[0].shape[0] == local_rows and views[1].shape[0] == 800
-            assert arena.buffers is large
-            assert arena.capacity == 100 and arena.bindings["layer"] == "warm binding"
-        arena.get(12, slots=100)
-    assert (
-        arena.buffers is not large
-        and arena.capacity == 12
-        and arena.slot_capacity == 100
-    )
-    assert not arena.bindings
-
-
-@pytest.mark.parametrize(
-    "budget,capacity,skip",
-    [(5, 0, True), (4, 30, True), (4, 29, False)],
-)
-def test_no_sync_uses_proven_global_bound_or_sufficient_arena(budget, capacity, skip):
-    from types import SimpleNamespace
-    from unittest.mock import MagicMock, Mock
-
-    from sglang.srt.hardware_backend.npu.dsv41 import moe
-
-    method = moe.ResidentMXFP4Method()
-    method.ep, method.first_expert, method.e, method.h, method.i = 8, 0, 48, 8, 4
-    metadata = MagicMock()
-    metadata.__getitem__.return_value.item.return_value = 3
-    plan = SimpleNamespace(
-        ids=torch.zeros((5, 6), dtype=torch.int32), metadata=metadata
-    )
-    method.routes = SimpleNamespace(gather=Mock(), combine=Mock())
-    method.local_experts = Mock()
-    arena = moe.ExpertScratch(torch.device("cpu"), 8, 4)
-    with (
-        patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
-        patch.object(
-            torch.npu, "current_stream", return_value=SimpleNamespace(npu_stream=1)
-        ),
-        patch.object(moe, "expert_scratch", return_value=arena),
-        patch.object(moe, "NO_SYNC_PREFILL_TOKENS", budget),
-    ):
-        if capacity:
-            arena.get(capacity, slots=30)
-        method.routed(torch.empty((5, 8), dtype=torch.bfloat16), plan, compact=True)
-    assert metadata.__getitem__.return_value.item.call_count == (0 if skip else 1)
-    assert method.routes.gather.call_args.kwargs["out"].shape[0] == (30 if skip else 3)
-
-
-def test_inverse_growth_preserves_captured_generation():
-    arena = ExpertScratch(torch.device("cpu"), 8, 4)
-    with patch.object(torch.npu, "is_current_stream_capturing", return_value=False):
-        arena.get(8, slots=48)
-    with patch.object(torch.npu, "is_current_stream_capturing", return_value=True):
-        graph = arena.get(8, slots=48)
-        graph[1][-1] = 7
-        with pytest.raises(RuntimeError, match="before Graph capture"):
-            arena.get(8, slots=49)
-    with patch.object(torch.npu, "is_current_stream_capturing", return_value=False):
-        arena.get(8, slots=96)
-    assert len(arena.retired) == 1 and graph[1][-1] == 7
-
-
 @pytest.mark.parametrize("local_rows", [0, 3, 30])
-def test_resident_compaction_uses_local_rows_and_global_inverse(local_rows):
+def test_resident_scratch_keeps_all_slots_for_eager_and_capture(local_rows):
     from types import SimpleNamespace
     from unittest.mock import Mock
 
@@ -136,100 +63,54 @@ def test_resident_compaction_uses_local_rows_and_global_inverse(local_rows):
         metadata=torch.tensor([1, local_rows, 0, 1]),
     )
     method.routes = SimpleNamespace(
-        gather=Mock(),
-        combine=Mock(return_value="combined"),
+        gather=Mock(), combine=Mock(return_value="combined")
     )
     method.local_experts = Mock()
-    invoke = Mock()
-    method.local_experts.bind.return_value = invoke
     arena = moe.ExpertScratch(torch.device("cpu"), 8, 4)
     x = torch.empty((5, 8), dtype=torch.bfloat16)
     with (
-        patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
+        patch.object(
+            torch.npu, "is_current_stream_capturing", return_value=False
+        ) as capture,
         patch.object(
             torch.npu, "current_stream", return_value=SimpleNamespace(npu_stream=1)
         ),
         patch.object(moe, "expert_scratch", return_value=arena),
-        patch.object(moe, "NO_SYNC_PREFILL_TOKENS", 0),
+        patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("read device scalar")
+        ),
     ):
-        assert method.routed(x, plan, compact=True) == "combined"
-    assert arena.capacity == local_rows and arena.slot_capacity == 30
-    if local_rows:
-        assert method.routes.gather.call_args.kwargs["out"].shape == (local_rows, 8)
-        assert method.routes.gather.call_args.kwargs["inverse"].shape == (30,)
-        bounds = method.local_experts.bind.call_args.kwargs
-        assert bounds["max_expert_rows"] == min(5, local_rows)
-        assert bounds["mean_expert_rows"] == 30 / (48 * 8)
-        assert bounds["tiling_rows"] == 30
-        invoke.assert_called_once()
-    else:
-        method.routes.gather.assert_not_called()
-        method.local_experts.bind.assert_not_called()
+        assert method.routed(x, plan) == "combined"
+        capture.return_value = True
+        assert method.routed(x, plan) == "combined"
+    assert arena.capacity == 30
+    gather = method.routes.gather.call_args.kwargs
+    assert gather["out"].shape == (30, 8) and gather["inverse"].shape == (30,)
+    bounds = method.local_experts.bind.call_args.kwargs
+    assert bounds["max_expert_rows"] == 5
+    assert bounds["mean_expert_rows"] == 30 / (48 * 8)
+    assert bounds["tiling_rows"] == 30
+    method.local_experts.bind.assert_called_once()
 
 
-def test_resident_capture_never_reads_compact_count():
-    from types import SimpleNamespace
-    from unittest.mock import Mock
+def test_prefill_budget_survives_short_window_and_releases_for_ced_tail():
+    from sglang.srt.hardware_backend.npu.dsv41.moe import NO_SYNC_PREFILL_TOKENS
 
-    from sglang.srt.hardware_backend.npu.dsv41 import moe
-
-    method = moe.ResidentMXFP4Method()
-    method.ep, method.first_expert, method.e, method.h, method.i = 8, 0, 48, 8, 4
-    plan = SimpleNamespace(
-        ids=torch.zeros((5, 6), dtype=torch.int32), metadata=torch.tensor([1, 3, 0, 1])
-    )
-    method.routes = SimpleNamespace(
-        gather=Mock(),
-        combine=Mock(return_value="combined"),
-    )
-    method.local_experts = Mock()
-    arena = moe.ExpertScratch(torch.device("cpu"), 8, 4)
+    arena = ExpertScratch(torch.device("cpu"), 5120, 2304)
     with patch.object(torch.npu, "is_current_stream_capturing", return_value=False):
-        arena.get(30)
-    with (
-        patch.object(torch.npu, "is_current_stream_capturing", return_value=True),
-        patch.object(
-            torch.npu, "current_stream", return_value=SimpleNamespace(npu_stream=1)
-        ),
-        patch.object(moe, "expert_scratch", return_value=arena),
-        patch.object(
-            torch.Tensor, "item", side_effect=AssertionError("Graph readback")
-        ),
-    ):
-        assert (
-            method.routed(torch.empty((5, 8), dtype=torch.bfloat16), plan, compact=True)
-            == "combined"
-        )
-    assert method.routes.gather.call_args.kwargs["out"].shape == (30, 8)
-    assert arena.captured
-
-
-@pytest.mark.parametrize(
-    "mode,extend_peer,capturing,expected",
-    [
-        ("EXTEND", False, False, True),
-        ("IDLE", True, False, True),
-        ("DECODE", True, False, True),
-        ("DECODE", False, False, False),
-        ("TARGET_VERIFY", False, False, False),
-        ("DRAFT_EXTEND_V2", False, False, False),
-        ("EXTEND", True, True, False),
-        ("DLLM_EXTEND", False, False, False),
-    ],
-)
-def test_compaction_tracks_global_prefill_without_changing_graph_warmup(
-    mode, extend_peer, capturing, expected
-):
-    from types import SimpleNamespace
-
-    from sglang.srt.hardware_backend.npu.dsv41.moe import compact_prefill
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-    batch = SimpleNamespace(
-        forward_mode=ForwardMode[mode], is_extend_in_batch=extend_peer
-    )
-    with patch.object(torch.npu, "is_current_stream_capturing", return_value=capturing):
-        assert compact_prefill(batch) is expected
+        budget = NO_SYNC_PREFILL_TOKENS * 6
+        full = arena.get(budget)
+        assert arena.capacity == 49152
+        size = full[0].untyped_storage().nbytes() + full[1].nbytes
+        assert size / 2**20 == 912.1875
+        pointer = full[0].data_ptr()
+        old = weakref.ref(arena.buffers[0])
+        del full
+        short = arena.get(6, reserve=budget)
+        assert short[0].shape == (6, 5120) and short[0].data_ptr() == pointer
+        del short
+        arena.get(560 * 6)
+        assert arena.capacity == 3360 and old() is None
 
 
 def test_eager_growth_releases_previous_generation_before_allocation():

@@ -63,9 +63,9 @@ def fp16_shared_gate(shared, x):
     return gate.quant_method.apply(gate, x, output_dtype=torch.float16)
 
 
-def _g32_gate_up(method, shared, hidden, routing, owned, compact):
+def _g32_gate_up(method, shared, hidden, routing, owned, window_budget):
     _, (storage, inverse, gate_up, _, values) = method.routed_storage(
-        hidden, routing, compact, torch.bfloat16
+        hidden, routing, torch.bfloat16, window_budget=window_budget
     )
     library = method.routes.library
     rows = gate_up.shape[0]
@@ -113,20 +113,26 @@ def _g32_gate_up(method, shared, hidden, routing, owned, compact):
     return inverse, values, shared_gate, gate_up, mid
 
 
-def run_joint_experts(method, shared, hidden, routing, owned, compact):
+def run_joint_experts(
+    method, shared, hidden, routing, owned, *, out=None, window_budget=0
+):
     first, stop, step = owned.indices(hidden.shape[0])
     if step != 1:
         raise ValueError("shared owner rows must be contiguous")
     shared_rows = max(stop - first, 0)
     if method.g32:
         inverse, values, shared_gate, gate_up, mid = _g32_gate_up(
-            method, shared, hidden, routing, owned, compact
+            method, shared, hidden, routing, owned, window_budget
         )
         shared_mid, routed_mid = mid[:shared_rows], mid[shared_rows:]
     else:
         shared_input = hidden.new_empty((shared_rows, method.h), dtype=torch.float16)
         inverse, gate_up, routed_mid, values, projections = method.prepare_routed(
-            hidden, routing, compact, shared_input=shared_input, first=first
+            hidden,
+            routing,
+            shared_input=shared_input,
+            first=first,
+            window_budget=window_budget,
         )
         shared_gate = (
             fp16_shared_gate(shared, shared_input) if shared_rows else gate_up[:0]
@@ -161,4 +167,4 @@ def run_joint_experts(method, shared, hidden, routing, owned, compact):
             projections[1]()
         if shared_rows:
             shared_out, _ = shared.down_proj(shared_mid)
-    return method.finish_routed(values, inverse, routing), shared_out
+    return method.finish_routed(values, inverse, routing, out=out), shared_out

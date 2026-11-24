@@ -242,6 +242,25 @@ def _workspace(role, x, rows):
     return row_buffer(role, x.device, stream, x.shape[1], x.dtype).get(rows)
 
 
+def moe_routed_output(hidden):
+    if not _in_moe.get():
+        return hidden.new_empty(hidden.shape, dtype=torch.bfloat16)
+    stream = torch.npu.current_stream(hidden.device).npu_stream
+    return row_buffer("moe_routed_out", hidden.device, stream, hidden.shape[1]).get(
+        hidden.shape[0]
+    )
+
+
+def moe_routing_metadata(hidden, experts):
+    if not _in_moe.get():
+        return None
+    stream = torch.npu.current_stream(hidden.device).npu_stream
+    # Each layer consumes its plan on this stream before the next route.
+    return row_buffer(
+        "moe_route_metadata", hidden.device, stream, 4 * (experts + 1), torch.int32
+    ).get(1)[0]
+
+
 def _run_sequence_parallel(
     layer,
     local,
