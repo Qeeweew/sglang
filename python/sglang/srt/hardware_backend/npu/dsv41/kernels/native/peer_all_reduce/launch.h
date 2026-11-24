@@ -3,6 +3,10 @@
 void prepare_peer_all_reduce();
 void launch_peer_all_reduce(void *stream, void *input, void *output, void *local, void *peer,
                             void *table, uint32_t elements);
+void launch_peer_group_gather(void *stream, void *in_a, void *in_b, void *out_a, void *out_b,
+                              void *local, void *peer, uint32_t rank, uint32_t outer,
+                              uint32_t local_rows, uint32_t valid_rows, uint32_t row_bytes_a,
+                              uint32_t row_bytes_b, bool skip_own_output);
 void prepare_peer_moe(uint32_t attention_tp);
 void launch_peer_moe(void *stream, void *input, void *inverse, void *ids, void *weights,
                      void *shared, void *output, void *local, void *table, uint32_t rank,

@@ -156,6 +156,48 @@ class PeerCommunicator : public torch::CustomClassHolder {
                         output.data_ptr(), local_, table_.data_ptr(), rank_, input.size(0), 0, true,
                         false, attention_tp_);
     }
+    void group_gather(const at::Tensor &in_a, const OptionalTensor &in_b, const at::Tensor &out_a,
+                      const OptionalTensor &out_b, int64_t valid_rows, bool skip_own_output) {
+        connected();
+        TORCH_CHECK(world_ == 2 && (in_a.dim() == 2 || in_a.dim() == 3),
+                    "expected TP2 group gather input [rows,D] or [outer,rows,D]");
+        const int64_t local_rows = in_a.size(-2);
+        const int64_t outer = in_a.dim() == 3 ? in_a.size(0) : 1;
+        TORCH_CHECK(outer > 0 && local_rows > 0 && valid_rows >= local_rows &&
+                        valid_rows - local_rows <= local_rows,
+                    "invalid TP2 group gather row counts");
+        TORCH_CHECK(bool(in_b) == bool(out_b), "second input and output must be paired");
+        const auto row_bytes = [&](const at::Tensor &in, const at::Tensor &out) {
+            TORCH_CHECK(in.dim() == in_a.dim() && in.size(-2) == local_rows &&
+                            (in.dim() == 2 || in.size(0) == outer),
+                        "TP2 group gather inputs must share row dimensions");
+            check(in, in.scalar_type(), device());
+            auto shape = in.sizes().vec();
+            shape[in.dim() - 2] = valid_rows;
+            check(out, in.scalar_type(), device(), shape);
+            const int64_t bytes = in.size(-1) * in.element_size();
+            TORCH_CHECK(bytes > 0 && bytes % 32 == 0 &&
+                            reinterpret_cast<uintptr_t>(in.data_ptr()) % 32 == 0 &&
+                            reinterpret_cast<uintptr_t>(out.data_ptr()) % 32 == 0,
+                        "TP2 group gather requires 32-byte aligned rows and addresses");
+            return bytes;
+        };
+        const auto bytes_a = row_bytes(in_a, out_a);
+        const auto bytes_b = in_b ? row_bytes(*in_b, *out_b) : 0;
+        TORCH_CHECK(in_a.nbytes() + (in_b ? in_b->nbytes() : 0) <=
+                        peer_all_reduce::kAllocationBytes - peer_all_reduce::kControlBytes,
+                    "TP2 group gather exceeds staging capacity");
+        disjoint({out_a, out_b}, {in_a, in_b});
+        c10_npu::NPUGuard guard(device());
+        auto current = stream();
+        record(in_a, current);
+        record(out_a, current);
+        track(in_b, current);
+        track(out_b, current);
+        launch_peer_group_gather(current.stream(), ptr(in_a), ptr(in_b), ptr(out_a), ptr(out_b),
+                                 local_, peers_[1 - rank_], rank_, outer, local_rows,
+                                 valid_rows, bytes_a, bytes_b, skip_own_output);
+    }
     void return_sum(const at::Tensor &partial, const OptionalTensor &shared,
                     const at::Tensor &output) {
         connected();
@@ -272,6 +314,7 @@ TORCH_LIBRARY_FRAGMENT(dsv41, m) {
         .def("connect", &PeerCommunicator::connect)
         .def("reduce", &PeerCommunicator::reduce)
         .def("gather", &PeerCommunicator::gather)
+        .def("group_gather", &PeerCommunicator::group_gather)
         .def("return_sum", &PeerCommunicator::return_sum)
         .def("finalize_return", &PeerCommunicator::finalize_return)
         .def("post", &PeerCommunicator::post)

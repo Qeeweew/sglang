@@ -4,19 +4,20 @@
 #include <qli/layout.h>
 #include <algorithm>
 namespace {
-using Entries = native_jit::ActualEntries<13>;
+using Entries = native_jit::ActualEntries<14>;
 using qli::Config;
-native_jit::Kernel &entry(const Config &c, uint32_t score_workers, bool merge) {
+native_jit::Kernel &entry(const Config &c, uint32_t score_workers, bool merge,
+                          bool explicit_positions) {
     static thread_local Entries entries;
     const auto workers = merge ? 2 * score_workers : score_workers;
     const Entries::Key key{c.heads, c.depth, c.topk, c.candidate_mode, c.page_rows,
         c.page_columns, c.key_page_stride, c.scale_page_stride, c.ratio, score_workers,
-        merge, c.query_tile_rows, c.key_splits};
+        merge, c.query_tile_rows, c.key_splits, explicit_positions};
     return entries.get(key, [&] {
         static constexpr const char *names[]{
             "HEADS", "DEPTH", "TOPK", "MODE", "PAGE_ROWS", "PAGE_COLUMNS",
             "KEY_PAGE_STRIDE", "SCALE_PAGE_STRIDE", "RATIO", "SCORE_WORKERS", "MERGE",
-            "QUERY_ROWS", "KEY_SPLITS"};
+            "QUERY_ROWS", "KEY_SPLITS", "EXPLICIT_POSITIONS"};
         std::vector<std::string> flags{"--cce-auto-sync=off"};
         for (size_t i = 0; i < key.size(); ++i)
             flags.emplace_back(std::string("-DQLI_") + names[i] + "=" + std::to_string(key[i]));
@@ -30,24 +31,27 @@ extern "C" void dsv41_qli_launch(void *stream, uint32_t blocks, const qli::Confi
                                  uint8_t *q, uint8_t *k, uint8_t *w, uint8_t *qs, uint8_t *ks,
                                  uint8_t *cu, uint8_t *lengths, uint8_t *residual, uint8_t *pages,
                                  uint8_t *candidates, uint8_t *indices, uint8_t *candidate_out,
-                                 uint8_t *workspace) {
+                                 uint8_t *workspace, uint8_t *positions) {
     const qli::Sources sources{
         uintptr_t(q),        uintptr_t(k),          uintptr_t(w),       uintptr_t(qs),
         uintptr_t(ks),       uintptr_t(cu),         uintptr_t(lengths), uintptr_t(residual),
         uintptr_t(pages),    uintptr_t(candidates), uintptr_t(indices), uintptr_t(candidate_out),
-        uintptr_t(workspace), config->rows, config->batch};
-    entry(*config, blocks, false).launch_persistent(stream, uint64_t(config->rows) * config->key_splits, sources);
+        uintptr_t(workspace), config->rows, config->batch, uintptr_t(positions)};
+    entry(*config, blocks, false, positions != nullptr)
+        .launch_persistent(stream, uint64_t(config->rows) * config->key_splits, sources);
     if (config->key_splits > 1)
-        entry(*config, blocks, true).launch_persistent(stream, config->rows, sources);
+        entry(*config, blocks, true, positions != nullptr)
+            .launch_persistent(stream, config->rows, sources);
 }
 TORCH_LIBRARY_FRAGMENT(dsv41, m) {
     m.def("precompile_qli(int rows, int batch, int heads, int depth, int topk, int mode, int "
           "page_rows, "
           "int page_columns, int key_page_stride, int scale_page_stride, int ratio, "
-          "int score_workers=0, bool merge=False) -> ()",
+          "int score_workers=0, bool merge=False, bool explicit_positions=False) -> ()",
           [](int64_t rows, int64_t batch, int64_t heads, int64_t depth, int64_t topk, int64_t mode,
              int64_t page_rows, int64_t page_columns, int64_t key_page_stride,
-             int64_t scale_page_stride, int64_t ratio, int64_t score_workers, bool merge) {
+             int64_t scale_page_stride, int64_t ratio, int64_t score_workers, bool merge,
+             bool explicit_positions) {
               using namespace qli;
               const auto available = native_host::core_count(c10_npu::current_device(), true);
               TORCH_CHECK(rows > 0 && rows <= UINT32_MAX && batch > 0 && batch <= UINT32_MAX &&
@@ -80,6 +84,6 @@ TORCH_LIBRARY_FRAGMENT(dsv41, m) {
                        plan_key_splits(rows, workers, heads, uint64_t(page_rows) * page_columns)};
               TORCH_CHECK(!merge || c.key_splits > 1,
                           "merge is used only with multiple K partitions");
-              entry(c, workers, merge).prepare();
+              entry(c, workers, merge, explicit_positions).prepare();
           });
 }

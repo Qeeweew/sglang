@@ -12,6 +12,7 @@ import torch
 import torch_npu  # noqa: F401
 from sglang.srt.hardware_backend.npu.dsv41.kernels.paths import native_library_path
 from sglang.srt.hardware_backend.npu.dsv41.kernels.runtime.native import (
+    check_tensor,
     load_library,
     record_inputs,
 )
@@ -34,6 +35,8 @@ class QLIPlan:
     ``pages`` is a CPU INT32 [requests,pages_per_request] logical-to-physical
     page table. ``lengths`` counts *compressed* K tokens; residual is 0..ratio-1.
     Query row j sees floor((length*ratio+residual-q_rows+j+1)/ratio) keys.
+    Optional INT32 positions give the absolute query positions within each
+    request. Valid positions increase within a request; negative rows see no keys.
     candidate_mode is 'off', 'source' (2048 block IDs per row), or 'consumer'.
     Scale and head weight tensors are FP16, with explicit FP16 rounding before FP32 head accumulation.
     Plans are not reentrant: use one plan per concurrently executing stream.
@@ -264,8 +267,11 @@ class QLIPlan:
         candidates=None,
         out=None,
         candidate_out=None,
+        positions=None,
     ):
         """Prepare observed physical K/scale strides without executing the kernel."""
+        if positions is not None:
+            check_tensor(positions, torch.int32, (self.rows,), self.device, "positions")
         output = self.indices if out is None else out
         candidate_output = (
             self.candidate_out if candidate_out is None else candidate_out
@@ -294,9 +300,16 @@ class QLIPlan:
                 self._max_k,
                 self._max_page,
                 self.cores,
+                positions,
             )
             self._prepared_layouts.add(
-                (k.shape[1], self.pages.shape[1], k.stride(0), k_scale.stride(0))
+                (
+                    k.shape[1],
+                    self.pages.shape[1],
+                    k.stride(0),
+                    k_scale.stride(0),
+                    positions is not None,
+                )
             )
         return self
 
@@ -311,6 +324,7 @@ class QLIPlan:
         candidates=None,
         out=None,
         candidate_out=None,
+        positions=None,
     ):
         """Enqueue INT8 QK/ReLU/head-reduction/topk on the current NPU stream.
 
@@ -318,6 +332,8 @@ class QLIPlan:
         Only physical page stride may be padded; q, weights and q_scale are
         contiguous [rows,heads,depth] / [rows,heads]. Returns (indices,candidates_out).
         """
+        if positions is not None:
+            check_tensor(positions, torch.int32, (self.rows,), self.device, "positions")
         output = self.indices if out is None else out
         candidate_output = (
             self.candidate_out if candidate_out is None else candidate_out
@@ -338,7 +354,13 @@ class QLIPlan:
             candidate_output,
             self.workspace,
         )
-        layout = (k.shape[1], self.pages.shape[1], k.stride(0), k_scale.stride(0))
+        layout = (
+            k.shape[1],
+            self.pages.shape[1],
+            k.stride(0),
+            k_scale.stride(0),
+            positions is not None,
+        )
         if self.rows and layout not in self._prepared_layouts:
             self._library.prepare_run_qli(
                 *args,
@@ -348,11 +370,12 @@ class QLIPlan:
                 self._max_k,
                 self._max_page,
                 self.cores,
+                positions,
             )
             self._prepared_layouts.add(layout)
         # Captured tensors must live as long as the Graph; eager stream
         # lifetimes are recorded inside the extension.
-        record_inputs(self, args, stream, attribute="_last_inputs")
+        record_inputs(self, (*args, positions), stream, attribute="_last_inputs")
         if self.rows:
             self._launch(
                 *args,
@@ -362,5 +385,6 @@ class QLIPlan:
                 self._max_k,
                 self._max_page,
                 self.cores,
+                positions,
             )
         return output, candidate_output

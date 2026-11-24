@@ -23,12 +23,14 @@ struct Config {
     bool window_ring, coordinate32, coordinate_elements32;
     float scale;
     int32_t verify_ring_capacity = 0;
+    bool explicit_positions = false;
 };
 struct Sources {
     uintptr_t q, kv, compressed, indices, table, compressed_table;
     uintptr_t cu, lengths, compressed_lengths, residual, window, sinks, out, workspace;
     int32_t tokens = 0, batch = 0;
     uintptr_t verify_requests = 0, verify_pending = 0;
+    uintptr_t positions = 0;
 };
 struct Arguments {
     Sources sources;
@@ -37,6 +39,7 @@ struct Arguments {
 struct DirectSources {
     uintptr_t q, kv, table, cu, lengths, window, sinks, out, workspace;
     int32_t tokens, batch;
+    uintptr_t positions = 0;
 };
 inline int64_t workspace_bytes(const Config &c) {
     const int64_t score_probability_bytes =

@@ -11,7 +11,10 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-from sglang.kernels.ops.communication.npu_peer_collectives import npu_peer_all_reduce
+from sglang.kernels.ops.communication.npu_peer_collectives import (
+    npu_peer_all_reduce,
+    npu_peer_group_gather,
+)
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_buffer,
@@ -19,6 +22,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_resources,
 )
+
+# The TP2 payload starts after the 16-worker IPC control page (layout.h).
+_GROUP_GATHER_CAPACITY = 8 * 1024 * 1024 - (5 * 16 + 3) * 512
 
 
 class PeerCommunicator:
@@ -95,6 +101,64 @@ class PeerAllReduce(PeerCommunicator):
     def all_reduce(self, input):
         output = torch.empty_like(input)
         return npu_peer_all_reduce(input, output, self.handle)
+
+
+class PeerGroupGather(PeerCommunicator):
+    def gather(self, input, rows, *, other, out, other_out, skip_own_output):
+        if out is None:
+            out = input.new_empty((*input.shape[:-2], rows, input.shape[-1]))
+        if other is not None and other_out is None:
+            other_out = other.new_empty((*other.shape[:-2], rows, other.shape[-1]))
+        return npu_peer_group_gather(
+            input,
+            out,
+            self.handle,
+            other=other,
+            other_output=other_out,
+            skip_own_output=skip_own_output,
+        )
+
+
+def try_group_gather(
+    input,
+    rows,
+    group,
+    *,
+    comm_role,
+    other=None,
+    out=None,
+    other_out=None,
+    skip_own_output=False,
+):
+    if (
+        input.device.type != "npu"
+        or group.world_size != 2
+        or not enabled()
+        or get_forward().multi_stream
+        or not input.numel()
+    ):
+        return None
+    tensors = (input,) if other is None else (input, other)
+    # Use the padded geometry on both lanes so an odd tail cannot make them
+    # disagree on whether to use IPC or HCCL.
+    if sum(t.nbytes for t in tensors) > _GROUP_GATHER_CAPACITY or any(
+        not t.is_contiguous() or t.shape[-1] * t.element_size() % 32 for t in tensors
+    ):
+        return None
+
+    key = f"dsv41_peer_group_gather:{id(group.cpu_group)}:{input.device}:{comm_role}"
+    comm = get_buffer(key, lambda: PeerGroupGather(group.cpu_group, input.device))
+    if comm.handle is None:
+        return None
+
+    return comm.gather(
+        input,
+        rows,
+        other=other,
+        out=out,
+        other_out=other_out,
+        skip_own_output=skip_own_output,
+    )
 
 
 def try_all_reduce(input, group):
@@ -186,7 +250,7 @@ class PeerMoE(PeerCommunicator):
         return npu_peer_moe_return(partial, output, self.handle, shared=shared)
 
 
-def moe_communicator(input, group):
+def moe_communicator(input, group, *, attention_tp=None):
     if (
         not enabled()
         or input.device.type != "npu"
@@ -194,11 +258,11 @@ def moe_communicator(input, group):
         or not input.is_contiguous()
         or input.ndim != 2
         or input.shape[1] != 5120
-        or not 0 < input.shape[0] <= 64 * get_parallel().attn_tp_size
-        or get_forward().multi_stream
     ):
         return None
-    tp = get_parallel().attn_tp_size
+    tp = get_parallel().attn_tp_size if attention_tp is None else attention_tp
+    if not 0 < input.shape[0] <= 64 * tp or get_forward().multi_stream:
+        return None
     key = f"dsv41_peer_moe:{id(group.cpu_group)}:{input.device}:tp{tp}"
     comm = get_buffer(key, lambda: PeerMoE(group.cpu_group, input.device, tp))
     return comm if comm.handle is not None else None
@@ -253,7 +317,12 @@ def try_draft_stage(stage, positions, hidden_states, batch, previous_pre):
         not enabled()
         or hidden_states.device.type != "npu"
         or hidden_states.dtype != torch.bfloat16
-        or not 0 < hidden_states.shape[0] <= 64 * get_parallel().attn_tp_size
+    ):
+        return None
+    group_sharded = getattr(batch, "_dsv41_group_moe_rows", None) is not None
+    attention_tp = 1 if group_sharded else get_parallel().attn_tp_size
+    if (
+        not 0 < hidden_states.shape[0] <= 64 * attention_tp
         or not moe_sequence_parallel_enabled(get_parallel())
         or get_forward().multi_stream
     ):
@@ -268,7 +337,7 @@ def try_draft_stage(stage, positions, hidden_states, batch, previous_pre):
     x = mhc.combine(stage.attn_hc, mhc.HcState(hidden_states, previous_pre))
     with (
         stage.self_attn.maybe_use_decode_attn_tp(batch),
-        get_forward().scoped(npu_defer_attn_reduce=True),
+        get_forward().scoped(npu_defer_attn_reduce=not group_sharded),
     ):
         y = stage.self_attn(positions, x, batch)
     pre, post_mix, comb = mhc.mix_stats(stage.attn_hc, hidden_states, None)

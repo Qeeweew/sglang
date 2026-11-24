@@ -27,7 +27,7 @@ from dsv41.kernels.references.dspark import (
     SOURCE,
     load_official,
     ranking_oracle,
-    test_data,
+    test_data as make_test_data,
 )
 
 
@@ -80,7 +80,7 @@ def cases(op, scope, records):
     for b, g in shapes:
         patterns = ("random", "ones", "special", "zeros", "nextafter")
         for pattern in patterns:
-            cpu = test_data(b, g, pattern)
+            cpu = make_test_data(b, g, pattern)
             confidence = cpu.npu()
             configs = [
                 (1, 0, 1e-6),
@@ -181,7 +181,7 @@ def graphs(op, scope, records, shapes=None):
                 managed()
                 op(confidence, budget, survival=scratch, out=output)
             for pattern in ("ones", "special", "zeros", "nextafter", "random"):
-                confidence.copy_(test_data(b, g, pattern))
+                confidence.copy_(make_test_data(b, g, pattern))
                 torch.npu.synchronize()
                 graph.replay()
                 torch.npu.synchronize()

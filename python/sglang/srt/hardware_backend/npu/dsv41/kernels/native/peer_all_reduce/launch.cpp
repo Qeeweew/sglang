@@ -17,13 +17,27 @@ native_jit::Kernel &entry() {
         peer_all_reduce::kWorkers);
     return kernel;
 }
+native_jit::Kernel &group_gather_entry() {
+    static thread_local native_jit::Kernel kernel(
+        "peer_group_gather", "peer_all_reduce/group_gather.asc", {"--cce-auto-sync=off"},
+        peer_all_reduce::kWorkers);
+    return kernel;
+}
 } // namespace
 void prepare_peer_all_reduce() {
     entry().prepare();
+    group_gather_entry().prepare();
 }
 void launch_peer_all_reduce(void *stream, void *input, void *output, void *local, void *peer,
                             void *table, uint32_t elements) {
     launch_peer(entry(), stream, input, output, local, peer, table, elements);
+}
+void launch_peer_group_gather(void *stream, void *in_a, void *in_b, void *out_a, void *out_b,
+                              void *local, void *peer, uint32_t rank, uint32_t outer,
+                              uint32_t local_rows, uint32_t valid_rows, uint32_t row_bytes_a,
+                              uint32_t row_bytes_b, bool skip_own_output) {
+    launch_peer(group_gather_entry(), stream, in_a, in_b, out_a, out_b, local, peer, rank,
+                outer, local_rows, valid_rows, row_bytes_a, row_bytes_b, uint32_t(skip_own_output));
 }
 
 namespace {

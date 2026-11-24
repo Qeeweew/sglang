@@ -38,15 +38,21 @@ __aicore__ inline void aggregate(GM_ADDR local, uint32_t kind, uint64_t epoch) {
         publish(global_signal(local, kind == 2 ? 0 : kind == 3 ? 2 : 1), epoch);
     }
 }
-__aicore__ inline uint64_t begin(GM_ADDR local, GM_ADDR table, uint32_t world) {
+__aicore__ inline uint64_t begin(GM_ADDR local, GM_ADDR table, uint32_t world,
+                                GM_ADDR peer = nullptr) {
     const uint64_t epoch = observe(signal(local, 0, AscendC::GetBlockIdx())) + 1;
     auto peers = reinterpret_cast<__gm__ uint64_t *>(table);
     // Only the leader polls remote free credits. Letting every AIV spin on
     // the same remote cache line floods HCCS and can starve a slower peer's
     // payload DMA. The remaining workers poll one local start credit.
     if (AscendC::GetBlockIdx() == 0) {
-        for (uint32_t rank = 0; rank < world; ++rank)
-            await(global_signal(reinterpret_cast<GM_ADDR>(peers[rank]), 0), epoch - 1);
+        if (peer) {
+            await(global_signal(local, 0), epoch - 1);
+            await(global_signal(peer, 0), epoch - 1);
+        } else {
+            for (uint32_t rank = 0; rank < world; ++rank)
+                await(global_signal(reinterpret_cast<GM_ADDR>(peers[rank]), 0), epoch - 1);
+        }
         for (uint32_t c = 0; c < p::kWorkers; ++c)
             publish(signal(local, 4, c), epoch);
     }

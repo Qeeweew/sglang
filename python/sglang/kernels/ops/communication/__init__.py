@@ -24,7 +24,12 @@ register_kernel(
     )
 )
 
-for _fn in ("npu_peer_moe_gather", "npu_peer_moe_return", "npu_peer_post"):
+for _fn in (
+    "npu_peer_group_gather",
+    "npu_peer_moe_gather",
+    "npu_peer_moe_return",
+    "npu_peer_post",
+):
     register_kernel(
         KernelSpec(
             op=f"communication.{_fn}",

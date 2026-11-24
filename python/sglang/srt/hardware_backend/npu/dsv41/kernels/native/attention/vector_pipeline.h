@@ -22,16 +22,19 @@ class VectorPipeline {
         if (new_request) {
             compressed_batch_ = m.batch;
             compressed_available_ = gm_pointer<int32_t>(sources_.compressed_lengths)[m.batch];
-            compressed_residual_ = gm_pointer<int32_t>(sources_.residual)[m.batch];
+            if constexpr (!kExplicitPositions)
+                compressed_residual_ = gm_pointer<int32_t>(sources_.residual)[m.batch];
             if (vector_coordinates)
                 asc_copy_gm2ub(page_table,
                                (gm_pointer<int32_t>(sources_.compressed_table) +
                                 (int64_t(m.batch) * kCompressedColumns)),
                                uint32_t((kCompressedColumns) * sizeof(int32_t)));
         }
-        const int64_t cutoff = max(int64_t(0), int64_t(compressed_available_) * kRatio +
-                                                   compressed_residual_ - m.count + m.offset + 1) >>
-                               (kRatio - 1);
+        const int64_t cutoff =
+            (kExplicitPositions ? m.position_end
+                                : max(int64_t(0), int64_t(compressed_available_) * kRatio +
+                                                      compressed_residual_ - m.count + m.offset + 1)) >>
+            (kRatio - 1);
         const int32_t limit = min(int64_t(compressed_available_), cutoff),
                       count = min(int32_t(kSelectedRows), limit);
         // For nonnegative IDs, page<columns is equivalent to an element

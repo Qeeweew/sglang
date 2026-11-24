@@ -53,7 +53,7 @@ void run_qli(const at::Tensor &q, const at::Tensor &k, const at::Tensor &w, cons
              const std::optional<at::Tensor> &candidate_out,
              const std::optional<at::Tensor> &workspace,
              int64_t ratio, int64_t mode, int64_t max_q, int64_t max_k, int64_t max_page,
-             int64_t requested) {
+             int64_t requested, const std::optional<at::Tensor> &positions) {
     const auto device = q.device();
     check(q, at::kChar, device);
     TORCH_CHECK_VALUE(q.dim() == 3 && q.size(1) > 0 && q.size(1) <= kHeadCapacity &&
@@ -98,6 +98,8 @@ void run_qli(const at::Tensor &q, const at::Tensor &k, const at::Tensor &w, cons
         check(*candidates, at::kInt, device, {rows, kKeyTileCapacity});
     if (candidate_out)
         check(*candidate_out, at::kInt, device, {rows, kKeyTileCapacity});
+    if (positions)
+        check(*positions, at::kInt, device, {rows});
     c10_npu::NPUGuard guard(device);
     const auto cores = qli_cores(q.get_device(), requested);
     Config tiling{};
@@ -121,7 +123,7 @@ void run_qli(const at::Tensor &q, const at::Tensor &k, const at::Tensor &w, cons
         TORCH_CHECK_VALUE(workspace->numel() >= bytes, "QLI workspace too small");
     }
     disjoint({indices, candidate_out, workspace},
-             {q, k, w, qs, ks, cu, lengths, residual, pages, candidates});
+             {q, k, w, qs, ks, cu, lengths, residual, pages, candidates, positions});
     if (!rows)
         return;
     auto stream = c10_npu::getCurrentNPUStream(q.get_device());
@@ -132,9 +134,10 @@ void run_qli(const at::Tensor &q, const at::Tensor &k, const at::Tensor &w, cons
     track(workspace, stream);
     track(candidates, stream);
     track(candidate_out, stream);
+    track(positions, stream);
     dsv41_qli_launch(acl_stream, u32(cores), &tiling, ptr(q), ptr(k), ptr(w), ptr(qs), ptr(ks),
                      ptr(cu), ptr(lengths), ptr(residual), ptr(pages), ptr(candidates),
-                     ptr(indices), ptr(candidate_out), scratch.data());
+                     ptr(indices), ptr(candidate_out), scratch.data(), ptr(positions));
 }
 void prepare_run_qli(const at::Tensor &q, const at::Tensor &k, const at::Tensor &w,
                      const at::Tensor &qs, const at::Tensor &ks, const at::Tensor &cu,
@@ -143,10 +146,10 @@ void prepare_run_qli(const at::Tensor &q, const at::Tensor &k, const at::Tensor 
                      const std::optional<at::Tensor> &candidate_out,
                      const std::optional<at::Tensor> &scratch,
                      int64_t ratio, int64_t mode, int64_t max_q, int64_t max_k, int64_t max_page,
-                     int64_t requested) {
+                     int64_t requested, const std::optional<at::Tensor> &positions) {
     native_jit::PrepareOnlyScope scope;
     run_qli(q, k, w, qs, ks, cu, lengths, residual, pages, candidates, indices, candidate_out,
-            scratch, ratio, mode, max_q, max_k, max_page, requested);
+            scratch, ratio, mode, max_q, max_k, max_page, requested, positions);
 }
 } // namespace
 TORCH_LIBRARY_FRAGMENT(dsv41, m) {
@@ -160,14 +163,14 @@ TORCH_LIBRARY_FRAGMENT(dsv41, m) {
           "Tensor residual, Tensor pages, Tensor? candidates, Tensor(a!) indices, Tensor(b!)? "
           "candidate_out, "
           "Tensor(c!)? workspace, int ratio, int mode, int max_q, int max_k, int max_page, int "
-          "cores) -> ()",
+          "cores, Tensor? positions=None) -> ()",
           &run_qli);
     m.def("prepare_run_qli(Tensor q, Tensor k, Tensor w, Tensor qs, Tensor ks, Tensor cu, Tensor "
           "lengths, "
           "Tensor residual, Tensor pages, Tensor? candidates, Tensor(a!) indices, Tensor(b!)? "
           "candidate_out, "
           "Tensor(c!)? workspace, int ratio, int mode, int max_q, int max_k, int max_page, int "
-          "cores) -> ()",
+          "cores, Tensor? positions=None) -> ()",
           &prepare_run_qli);
 }
 } // namespace native_host

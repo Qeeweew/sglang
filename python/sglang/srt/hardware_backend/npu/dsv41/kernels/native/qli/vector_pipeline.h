@@ -232,7 +232,7 @@ class VectorPipeline {
                     const uint32_t length = min(uint32_t(kKeyTileCapacity), task.key_end - begin);
                     for (uint32_t local = 0, query = lane_; query < task.queries;
                          query += kVectorActors, ++local) {
-                        const uint32_t valid = task.valid_keys(query);
+                        const uint32_t valid = task.valid_keys(query, args_.positions);
                         const uint32_t count = RankPipeline::sort_count(length);
                         auto scores = ub_ptr<float>(UbLayout::scores);
                         auto float_scales = ub_ptr<float>(UbLayout::float_scales);

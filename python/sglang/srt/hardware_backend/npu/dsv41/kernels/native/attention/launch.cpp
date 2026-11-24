@@ -5,7 +5,7 @@
 #include <cmath>
 namespace {
 using attention::Config;
-using Entries = native_jit::ActualEntries<16>;
+using Entries = native_jit::ActualEntries<17>;
 native_jit::Kernel &entry(const Config &c) {
     static thread_local Entries entries;
     const bool sparse = c.mode == int32_t(attention::Mode::Sparse);
@@ -25,7 +25,8 @@ native_jit::Kernel &entry(const Config &c) {
         sparse && c.window_ring,
         sparse && c.coordinate32,
         sparse && c.coordinate_elements32,
-        uint64_t(c.verify_ring_capacity)};
+        uint64_t(c.verify_ring_capacity),
+        c.explicit_positions};
     return entries.get(key, [&] {
         static constexpr const char *names[]{"MODE",
                                              "TILE_ROWS",
@@ -42,7 +43,8 @@ native_jit::Kernel &entry(const Config &c) {
                                              "WINDOW_RING",
                                              "COORDINATE32",
                                              "COORDINATE_ELEMENTS32",
-                                             "VERIFY_RING_CAPACITY"};
+                                             "VERIFY_RING_CAPACITY",
+                                             "EXPLICIT_POSITIONS"};
         std::vector<std::string> flags{"--cce-auto-sync=off"};
         for (size_t i = 0; i < key.size(); ++i)
             flags.emplace_back(std::string("-DATTENTION_") + names[i] + "=" +
@@ -68,21 +70,25 @@ extern "C" void dsv41_attention_launch(void *stream, const attention::Arguments 
     else
         entry(c).launch_persistent(
             stream, c.tokens, attention::DirectSources{s.q, s.kv, s.table, s.cu, s.lengths, s.window,
-                                                    s.sinks, s.out, s.workspace, c.tokens, c.batch});
+                                                       s.sinks, s.out, s.workspace, c.tokens,
+                                                       c.batch, s.positions});
 }
 TORCH_LIBRARY_FRAGMENT(dsv41, m) {
     m.def("precompile_attention(int tokens, int heads, int width, int batch, int columns, int "
           "page_rows, "
           "int window_rows, int mode=0, int ratio=1, int selected_rows=0, int capacity=0, "
-          "int compressed_columns=0, int compressed_pages=0, int workers=0, bool ring=False) -> ()",
+          "int compressed_columns=0, int compressed_pages=0, int workers=0, bool ring=False, "
+          "bool explicit_positions=False) -> ()",
           [](int64_t tokens, int64_t heads, int64_t width, int64_t batch, int64_t columns,
              int64_t page_rows, int64_t window_rows, int64_t mode, int64_t ratio,
              int64_t selected_rows, int64_t capacity, int64_t compressed_columns,
-             int64_t compressed_pages, int64_t workers, bool ring) {
+             int64_t compressed_pages, int64_t workers, bool ring, bool explicit_positions) {
               const auto available = native_host::core_count(c10_npu::current_device(), true);
               TORCH_CHECK(tokens > 0 && workers >= 0 && workers <= available,
                           "actual nonempty token capacity and worker budget required");
               TORCH_CHECK(mode == 1 || ratio == 1, "direct attention has one KV source ratio");
+              TORCH_CHECK(!explicit_positions || mode != int32_t(attention::Mode::Draft),
+                          "explicit positions require causal paged attention");
               if (mode == 0)
                   capacity = (window_rows + attention::kDotRows - 1) /
                              attention::kDotRows * attention::kDotRows;
@@ -91,7 +97,9 @@ TORCH_LIBRARY_FRAGMENT(dsv41, m) {
               auto c =
                   native_host::attention_geometry(tokens, heads, batch, columns, compressed_columns,
                                             capacity, ratio, mode, workers ? workers : available,
-                                            ring, width, page_rows, window_rows, selected_rows);
+                                            ring && !explicit_positions, width, page_rows,
+                                            window_rows, selected_rows);
+              c.explicit_positions = explicit_positions;
               if (mode == 1) {
                   TORCH_CHECK(compressed_pages > 0, "actual compressed cache pages required");
                   c.coordinate32 = c.coordinate_shift > 0 &&

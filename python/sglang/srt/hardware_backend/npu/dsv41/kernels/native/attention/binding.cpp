@@ -93,7 +93,8 @@ void run(const at::Tensor &q, const at::Tensor &kv, const std::optional<at::Tens
          const std::optional<at::Tensor> &residual, const std::optional<at::Tensor> &window,
          const at::Tensor &sinks, const at::Tensor &out, const std::optional<at::Tensor> &workspace,
          int64_t capacity, int64_t ratio, int64_t mode, bool ring, int64_t window_rows,
-         int64_t cores, const std::optional<VerifyRing> &verify_ring) {
+         int64_t cores, const std::optional<VerifyRing> &verify_ring,
+         const std::optional<at::Tensor> &positions) {
     const auto device = q.device();
     TORCH_CHECK_VALUE(q.dim() == 3 && table.dim() == 2 && table.size(0) > 0 && table.size(1) > 0 &&
                           kv.dim() == 4 && kv.size(0) > 0 && kv.size(2) == 1,
@@ -103,7 +104,7 @@ void run(const at::Tensor &q, const at::Tensor &kv, const std::optional<at::Tens
     auto c = attention_geometry(
         q.size(0), q.size(1), table.size(0), table.size(1),
         compressed_table && compressed_table->dim() == 2 ? compressed_table->size(1) : 0, capacity,
-        ratio, mode, selected_cores(device.index(), cores), ring, q.size(2), kv.size(1),
+        ratio, mode, selected_cores(device.index(), cores), ring && !positions, q.size(2), kv.size(1),
         window_rows, selected_rows);
     check(q, at::kBFloat16, device);
     check(kv, at::kBFloat16, device, {kv.size(0), c.page_rows, 1, c.width});
@@ -115,6 +116,12 @@ void run(const at::Tensor &q, const at::Tensor &kv, const std::optional<at::Tens
     TORCH_CHECK_VALUE(mode == 2 || window, "causal attention requires window lengths");
     if (window)
         check(*window, at::kInt, device, {c.tokens, 1});
+    if (positions) {
+        TORCH_CHECK_VALUE(mode != int32_t(attention::Mode::Draft) && !verify_ring,
+                          "explicit positions require causal paged attention");
+        check(*positions, at::kInt, device, {c.tokens});
+        c.explicit_positions = true;
+    }
     if (mode == 1) {
         TORCH_CHECK_VALUE(compressed && indices && compressed_table && compressed_lengths &&
                               residual && compressed->dim() == 4 && compressed->size(0) > 0,
@@ -149,7 +156,8 @@ void run(const at::Tensor &q, const at::Tensor &kv, const std::optional<at::Tens
         TORCH_CHECK_VALUE(workspace->numel() >= bytes, "attention workspace too small");
     }
     disjoint({out, workspace}, {q, kv, compressed, indices, table, compressed_table, cu, lengths,
-                              compressed_lengths, residual, window, sinks, verify_requests, verify_pending});
+                              compressed_lengths, residual, window, sinks, verify_requests,
+                              verify_pending, positions});
     if (!c.tokens)
         return;
     auto launch = [&] {
@@ -161,7 +169,7 @@ void run(const at::Tensor &q, const at::Tensor &kv, const std::optional<at::Tens
         track(workspace, stream);
         for (const auto &t :
              {compressed, indices, compressed_table, compressed_lengths, residual, window,
-              verify_requests, verify_pending})
+              verify_requests, verify_pending, positions})
             track(t, stream);
         attention::Arguments a{{uintptr_t(ptr(q)), uintptr_t(ptr(kv)), uintptr_t(ptr(compressed)),
                                 uintptr_t(ptr(indices)), uintptr_t(ptr(table)),
@@ -172,6 +180,7 @@ void run(const at::Tensor &q, const at::Tensor &kv, const std::optional<at::Tens
                                c};
         a.sources.verify_requests = uintptr_t(ptr(verify_requests));
         a.sources.verify_pending = uintptr_t(ptr(verify_pending));
+        a.sources.positions = uintptr_t(ptr(positions));
         dsv41_attention_launch(acl_stream, a);
     };
     if constexpr (Prepare) {
@@ -195,7 +204,7 @@ TORCH_LIBRARY_FRAGMENT(dsv41, m) {
         "Tensor? compressed_table, Tensor cu, Tensor lengths, Tensor? compressed_lengths, "
         "Tensor? residual, Tensor? window, Tensor sinks, Tensor(a!) out, Tensor(b!)? workspace, "
         "int capacity, int ratio, int mode, bool ring, int window_rows=128, int cores=0, "
-        "(Tensor, Tensor, int)? verify_ring=None) -> ()";
+        "(Tensor, Tensor, int)? verify_ring=None, Tensor? positions=None) -> ()";
     m.def(("attention" + schema).c_str(), &run<false>);
     m.def(("prepare_attention" + schema).c_str(), &run<true>);
 }

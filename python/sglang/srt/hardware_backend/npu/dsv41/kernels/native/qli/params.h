@@ -13,5 +13,6 @@ struct Sources {
     uintptr_t q, k, weights, q_scale, k_scale, cu, lengths, residual, pages;
     uintptr_t candidates, indices, candidate_out, workspace;
     uint32_t rows, batch;
+    uintptr_t positions = 0;
 };
 } // namespace qli

@@ -37,6 +37,7 @@ inline constexpr int32_t kTileRows = ATTENTION_TILE_ROWS;
 inline constexpr float kScale = ATTENTION_SCALE;
 inline constexpr bool kSparse = kMode == int(Mode::Sparse);
 inline constexpr bool kDraft = kMode == int(Mode::Draft);
+inline constexpr bool kExplicitPositions = ATTENTION_EXPLICIT_POSITIONS;
 inline constexpr uint32_t kDmaBytes = 32;
 // The entry declares MIX_AIC_1_2; this is a task-format ratio, not core count.
 inline constexpr int32_t kVectorActorsPerCube = 2;
@@ -120,6 +121,7 @@ __aicore__ __attribute__((always_inline)) inline uint64_t valid_interval(int32_t
 
 struct RequestMetadata {
     int32_t batch, count, offset, right, visible, first;
+    int64_t position_end;
 };
 class RequestCursor {
     int32_t batch_ = 0, begin_ = 0, end_ = -1, length_ = 0;
@@ -145,7 +147,15 @@ class RequestCursor {
             length_ = gm_pointer<int32_t>(s.lengths)[low];
         }
         const int32_t count = end_ - begin_, offset = token - begin_;
-        int32_t right = max(0, length_ - count + offset + 1);
+        int64_t position_end = 0;
+        int32_t right;
+        if constexpr (kExplicitPositions) {
+            const int64_t position = gm_pointer<int32_t>(s.positions)[token];
+            position_end = length_ > 0 ? max(int64_t(0), position + 1) : 0;
+            right = min(int64_t(max(0, length_)), position_end);
+        } else {
+            right = max(0, length_ - count + offset + 1);
+        }
         int32_t visible = min(int32_t(kWindowRows), right), first = right - visible;
         if constexpr (kDraft) {
             first = max(0, length_ - count - kWindowRows);
@@ -163,7 +173,7 @@ class RequestCursor {
         if constexpr (kVerifyRingCapacity)
             if (gm_pointer<int64_t>(s.verify_requests)[batch_] == 0)
                 visible = 0;
-        return {batch_, count, offset, right, visible, first};
+        return {batch_, count, offset, right, visible, first, position_end};
     }
 };
 

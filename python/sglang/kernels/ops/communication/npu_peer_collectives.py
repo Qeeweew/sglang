@@ -1,4 +1,4 @@
-"""910B BF16 collectives with an explicitly prepared IPC communicator."""
+"""910B collectives with an explicitly prepared IPC communicator."""
 
 
 def npu_peer_all_reduce(input, output, handle):
@@ -23,6 +23,24 @@ def npu_peer_moe_gather(input, output, handle):
     """
     handle.gather(input, output)
     return output
+
+
+def npu_peer_group_gather(
+    input, output, handle, *, other=None, other_output=None, skip_own_output=False
+):
+    """Gather two same-host 910B ranks into contiguous scheduler row order.
+
+    Tensors are ND [local_rows, D] or [outer, local_rows, D], with 32-byte
+    aligned addresses and row widths. Outputs replace local_rows with valid_rows.
+    Rank 0 provides local_rows and rank 1 provides valid_rows - local_rows.
+    The optional second input/output pair can have a different width and dtype.
+    With skip_own_output, only the peer's rows of each output are written.
+    Warm one launch eagerly before capture and serialize uses of the handle.
+    """
+    handle.group_gather(
+        input, other, output, other_output, output.shape[-2], skip_own_output
+    )
+    return output, other_output
 
 
 def npu_peer_moe_return(

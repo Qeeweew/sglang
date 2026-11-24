@@ -45,7 +45,7 @@ class _NativeAttention:
         self.capacity, self.ring = capacity, bool(ring)
         self.window_rows, self.cores = window_rows, cores
 
-    def empty(self, q, out):
+    def empty(self, q, out, positions=None):
         if q.ndim != 3 or q.shape[1] != self.heads or q.device.type != "npu":
             raise ValueError("empty Q must match BF16[0,H,D] on NPU")
         if not 0 < q.shape[2] <= 512 or q.shape[2] % 16:
@@ -54,6 +54,8 @@ class _NativeAttention:
             )
         _tensor(q, torch.bfloat16, q.shape, q.device, "Q")
         _tensor(out, q.dtype, q.shape, q.device, "output")
+        if positions is not None:
+            _tensor(positions, torch.int32, (0,), q.device, "positions")
 
     def bind(
         self,
@@ -72,6 +74,7 @@ class _NativeAttention:
         out,
         *,
         verify_ring=None,
+        positions=None,
     ):
         if q.ndim != 3 or q.device.type != "npu":
             raise ValueError("requires BF16 Q[T,H,D] on NPU")
@@ -96,6 +99,8 @@ class _NativeAttention:
         _tensor(sinks, torch.float32, (self.heads,), device, "sinks")
         if window is not None:
             _tensor(window, torch.int32, (tokens, 1), device, "window lengths")
+        if positions is not None:
+            _tensor(positions, torch.int32, (tokens,), device, "positions")
         columns, selected_rows, capacity = 0, 0, self.capacity
         if self.mode == 1:
             columns, selected_rows = compressed_table.shape[1], indices.shape[-1]
@@ -137,7 +142,7 @@ class _NativeAttention:
             window,
             sinks,
         )
-        require_disjoint((out,), inputs)
+        require_disjoint((out,), (*inputs, positions))
         native = load_library()
         args = (
             *inputs,
@@ -150,6 +155,7 @@ class _NativeAttention:
             self.window_rows,
             self.cores,
             verify_ring,
+            positions,
         )
         native.prepare_attention(*args)
         launch = native.attention
@@ -157,7 +163,11 @@ class _NativeAttention:
 
 
 class WindowAttention:
-    """BF16 causal C0/SWA128, FP32 sink/statistics, shared KV, TND queries."""
+    """BF16 causal C0/SWA128, FP32 sink/statistics, shared KV, TND queries.
+
+    Optional INT32 positions give the absolute position within each request.
+    Negative positions have no visible keys.
+    """
 
     def __init__(self, *, heads=64, window_rows=128, cores=0):
         capacity = (window_rows + 127) // 128 * 128
@@ -177,9 +187,10 @@ class WindowAttention:
         *,
         out,
         verify_ring=None,
+        positions=None,
     ):
         if q.shape[0] == 0:
-            self.kernel.empty(q, out)
+            self.kernel.empty(q, out, positions)
             return lambda: None
         if block_table.ndim != 2 or block_table.shape[1] < 1:
             raise ValueError(
@@ -204,6 +215,7 @@ class WindowAttention:
             sinks,
             out,
             verify_ring=verify_ring,
+            positions=positions,
         )
 
     def __call__(
@@ -218,6 +230,7 @@ class WindowAttention:
         *,
         out=None,
         verify_ring=None,
+        positions=None,
     ):
         out = q.new_empty(q.shape) if out is None else out
         self.bind(
@@ -230,6 +243,7 @@ class WindowAttention:
             window_lengths,
             out=out,
             verify_ring=verify_ring,
+            positions=positions,
         )()
         return out
 
@@ -239,6 +253,8 @@ class SparseAttention:
 
     Each instance fixes its ratio; C1 and C2 share one precompiled kernel.
     All compressed inputs remain explicit alongside SWA and sink tensors.
+    Optional INT32 positions also set the compressed causal cutoff and disable
+    window reuse.
     """
 
     def __init__(
@@ -280,11 +296,12 @@ class SparseAttention:
         *,
         out,
         verify_ring=None,
+        positions=None,
     ):
         if q.shape[0] == 0:
-            self.kernel.empty(q, out)
+            self.kernel.empty(q, out, positions)
             return lambda: None
-        if self.window_reuse and block_table.shape[0] != 1:
+        if self.window_reuse and positions is None and block_table.shape[0] != 1:
             raise ValueError("window reuse requires a single request")
         if any(
             table.ndim != 2 or table.shape[1] < 1
@@ -312,6 +329,7 @@ class SparseAttention:
             sinks,
             out,
             verify_ring=verify_ring,
+            positions=positions,
         )
 
     def __call__(
@@ -331,6 +349,7 @@ class SparseAttention:
         *,
         out=None,
         verify_ring=None,
+        positions=None,
     ):
         out = q.new_empty(q.shape) if out is None else out
         self.bind(
@@ -348,6 +367,7 @@ class SparseAttention:
             sinks,
             out=out,
             verify_ring=verify_ring,
+            positions=positions,
         )()
         return out
 
