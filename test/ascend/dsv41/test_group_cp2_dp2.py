@@ -33,7 +33,7 @@ def test_opt_in_validates_topology(monkeypatch):
         cp2.validate_options(cfg)
 
     monkeypatch.delenv("SGLANG_OPT_DSV41_GROUP_CP2_DP2", raising=False)
-    assert envs.SGLANG_OPT_DSV41_GROUP_CP2_DP2.get() == "0"
+    assert envs.SGLANG_OPT_DSV41_GROUP_CP2_DP2.get() == "1"
     cp2.validate_options(cfg)
     from sglang.srt.layers.moe import utils as moe_utils
 
@@ -46,7 +46,7 @@ def test_opt_in_validates_topology(monkeypatch):
     dp8 = SimpleNamespace(
         tp_size=8, attn_dp_size=8, attn_tp_size=1, attn_cp_size=1, moe_ep_size=8
     )
-    assert cp2.enabled(dp4) is False
+    assert cp2.enabled(dp4) is True
     assert cp2.enabled(dp8) is False
 
 

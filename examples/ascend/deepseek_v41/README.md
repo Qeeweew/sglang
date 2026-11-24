@@ -14,14 +14,14 @@
 
 在 910B 上，paged attention 的 QK/PV 由矩阵核计算，向量核处理 softmax、mask 和稀疏位置。主 KV 和滑窗 KV 用 BF16，Indexer 用 INT8 key 选择稀疏位置。CED 使用因果 encoder 的输出构建 decoder 的 global KV。Radix 命中时复用已缓存的全局状态，bounded SWA replay 恢复滑窗所需的局部状态。
 
-Decode 使用 DSpark，每步最多提出五个草稿 token。Target 和 draft 都使用 NPU Graph，prefill 走 eager。大 prefill 的 MoE 工作区在 EP 路由之后按本卡实际命中的专家行数 compact，有界的小批路径用于 decode。
+Decode 使用 DSpark，每步最多提出五个草稿 token。Target 和 draft 都使用 NPU Graph，prefill 走 eager。MoE 预填充按最多 8,192-token 窗口零主机同步推进，设备端直接读取本卡命中的专家行数；decode 使用有界小批路径。
 
 ### Attention 和 MoE 分开并行
 
 | Attention 配置 | Attention 请求分布 | 单组本地 prefill chunk | MoE |
 | --- | --- | ---: | --- |
 | DP8/TP1 | 八组，每条请求的 attention 和 KV 落在一张卡 | 4,096 | EP8 |
-| DP4/TP2 | 四组，两张卡分摊 query heads 和投影，单 KV head 在组内各存一份 | 8,192 | EP8 |
+| DP4（默认组内 CP2/DP2） | 四组，组内两卡共享 KV/状态镜像，以完整 query heads 交错执行 prefill、按请求对半执行 decode | 8,192 | EP8 |
 
 DP8 把独立请求散到更多组。DP4 减少单卡承担的 query heads，同时引入组内通信。单请求长 prefill 的 attention 只使用所在组，MoE 由八卡共同计算。两个配置均使用 32,768-token 全局 chunk 预算。
 
@@ -41,7 +41,7 @@ bash examples/ascend/deepseek_v41/build-image.sh
 
 ## 启动与验证
 
-通过 `DSV41_MODEL_DIR` 选择完整的 1017 checkpoint。两种模式使用同一镜像，SGLang 根据 checkpoint 配置加载对应的 target MoE。Compose 以只读方式挂载模型，默认监听 `127.0.0.1:31088`，启动 attention DP8/TP1 和 MoE EP8。
+通过 `DSV41_MODEL_DIR` 选择完整的 1017 checkpoint。两种模式使用同一镜像，SGLang 根据 checkpoint 配置加载对应的 target MoE。Compose 以只读方式挂载模型，默认监听 `127.0.0.1:31088`，启动默认四组组内 CP2/DP2（`DSV41_ATTN_DP_SIZE=4`）和 MoE EP8。
 
 ```bash
 export DSV41_MODEL_DIR=/path/to/DeepSeek-V4.1-Flash-1017
@@ -56,10 +56,10 @@ export DSV41_MODEL_DIR=/path/to/DeepSeek-V4.1-Flash-1017-quarot-int4-g32
 docker compose -f examples/ascend/deepseek_v41/compose.yaml up -d
 ```
 
-用同一份 Compose 切换到 attention DP4/TP2。
+用同一份 Compose 切换到 attention DP8/TP1（或在 DP4 下设 `SGLANG_OPT_DSV41_GROUP_CP2_DP2=0` 回退至传统 TP2）。
 
 ```bash
-DSV41_ATTN_DP_SIZE=4 docker compose -f examples/ascend/deepseek_v41/compose.yaml up -d
+DSV41_ATTN_DP_SIZE=8 docker compose -f examples/ascend/deepseek_v41/compose.yaml up -d
 ```
 
 `/ready` 返回 HTTP 200 后执行生成和前缀复用检查。`DSV41_PORT` 自定义端口时，同步传给 smoke 脚本的 `--url`。

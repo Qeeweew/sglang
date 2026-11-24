@@ -36,7 +36,7 @@ services:
       - deepjit-cache:/var/cache/dsv41/deepjit
     environment:
       DSV41_MODEL_PATH: /models/deepseek-v4.1-flash
-      DSV41_ATTN_DP_SIZE: "${DSV41_ATTN_DP_SIZE:-8}"
+      DSV41_ATTN_DP_SIZE: "${DSV41_ATTN_DP_SIZE:-4}"
       DSV41_PORT: "${DSV41_PORT:-31088}"
       DSV41_MAX_RUNNING_REQUESTS: "${DSV41_MAX_RUNNING_REQUESTS:-64}"
       DSV41_MEM_FRACTION_STATIC: "${DSV41_MEM_FRACTION_STATIC:-0.84}"

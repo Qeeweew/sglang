@@ -10,7 +10,7 @@ export SGLANG_DP_USE_REDUCE_SCATTER="${SGLANG_DP_USE_REDUCE_SCATTER:-1}"
 # This SGLang build's variable-length collectives require PyNCCL.
 export SGLANG_DP_USE_GATHERV=0
 export HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-1800}"
-DSV41_ATTN_DP_SIZE=$(dsv41_option --attn-dp-size "${DSV41_ATTN_DP_SIZE:-8}")
+DSV41_ATTN_DP_SIZE=$(dsv41_option --attn-dp-size "${DSV41_ATTN_DP_SIZE:-4}")
 if [[ "${DSV41_ATTN_DP_SIZE}" != 4 && "${DSV41_ATTN_DP_SIZE}" != 8 ]]; then
     echo "Attention DP size must be 4 or 8" >&2
     exit 2

@@ -25,9 +25,15 @@ MoE 的 FP32 rank 顺序求和与 HCCL 内部 reduction tree 的舍入顺序可�
 
 DSpark 使用独立的 stage runner，也接入相同融合：attention post 同时构造 FFN 的归一化输入；FFN post 返回完整四路 residual 和新的 pre-mix，供后续 draft stage 或输出 head 使用。
 
+默认开启 `SGLANG_OPT_DSV41_GROUP_CP2_DP2=1`（`serve.sh` 默认 `DSV41_ATTN_DP_SIZE=4`）后，DP4 配置在组内以完整 Attention heads 执行交错 Prefill 和按请求对半的 Decode；设为 `0` 可回退至传统 DP4/TP2。Target Verify 和 Draft 的 PeerMoE 使用每卡最多 64 行的 TP1 路径，超出时使用 HCCL。MoE 输出直接交给本卡残差。
+
+同时开启 `SGLANG_OPT_DSV41_NPU_PEER_COMM=1` 后，TP2 Peer Group Gather 直接将压缩器投影、Target 与 Draft 模型出口、以及 SWA 更新写入目标布局。双张量调用直接写入独立的输出，SWA 以层为主序写入，Draft SWA 镜像只写对端持有的有效行。注入 Draft 历史 KV 时，两卡各自投影一半 Target hidden 行，再跨组内两卡收集三层 KV，写回各自的 SWA 缓存。词表头、embedding 和 Markov 输出权重保持原有分片布局。
+
+Peer 通信关闭、跨主机、多流 forward 或超出 8 MiB 区域的有效负载容量时，使用组内 HCCL 聚合。交错 Prefill 的模型边界继续使用 HCCL。
+
 ## 数据和同步
 
-每组 communicator 的资源由 RuntimeContext 持有。TP2 每卡分配 2 MiB，EP8 每卡分配 8 MiB，均为独立 ACL 分配，避免导出 PyTorch allocator 中同页的其他数据。使用 ACL export key、bare TGID 白名单和带 peer access 的 import。地址表、IPC 映射、编译和 kernel handle 都在 eager warmup 中准备，capture / replay 只发射算子。
+每组 communicator 的资源由 RuntimeContext 持有。ABI 33 为 TP2 和 EP8 communicator 各分配每卡 8 MiB 的独立 ACL 区域，避免导出 PyTorch allocator 中同页的其他数据。使用 ACL export key、bare TGID 白名单和带 peer access 的 import。Group Gather 为 forward、verify commit 和 Draft KV 注入分别持有 communicator。地址表、IPC 映射、编译和 kernel handle 都在 eager warmup 中准备，capture / replay 只发射算子。
 
 每个 peer kernel 固定使用 16 个 AIV worker，并在启动时指定批调度（`schemMode=1`）：等本卡有足够资源再整组调度，避免部分 worker 已经开始轮询、其余 worker 却因争用无法运行。此设置不影响非 peer 算子。
 
@@ -49,6 +55,8 @@ sequenceDiagram
 
 只有 leader 跨卡检查 free，避免所有 AIV 争用同一控制行。未满足的轮询有短暂退避。payload 读写退休后才发布 done；每个 rank 的所有 worker 都完成后才允许下一轮复用区域。因此不同 shape、gather / return 和融合 kernel 可以共享同一 epoch 序列。未完成的 collective 在设备端超时后 trap，不返回部分结果。
 
+Group Gather 在 staging 中省略奇数批次的 padding。读写端使用同一生产者的有效行数来划分搬运区间，因此各 worker 可等待对端同一 channel 的 ready 信号后直接读取。无数据的 worker 也参与完整的 epoch。
+
 销毁时先退休设备工作，CPU group barrier，关闭全部 import，再 barrier，最后关闭 export 和释放 allocation。必须先退休引用这些地址的 Graph，再销毁 group / RuntimeContext。
 
 ## 验证与测量
@@ -66,5 +74,14 @@ DSV41_NATIVE_DIR="$peer_native_dir" \
 ```
 
 追加 `--attention-tp 1` 验证 DP8 布局；默认 `--attention-tp 2` 验证 DP4。测试同时运行四组 TP2 和一个 EP8，覆盖数值、NaN/Inf、输入拒绝、输出 canary、连续调用、对端延迟到达、非默认 stream、奇数行、不同 shape / collective 交替 replay，以及融合 mHC 的 changed-input replay。mHC 对照使用现有 native 实现；MoE 对照先独立计算各 rank 的 BF16 route combine，再在 CPU 上求和。
+
+在两张空闲卡上也可以单独验证 TP2 Group Gather、Graph replay 和 Draft KV 注入。先运行 `npu-smi info`，确认示例中的两张卡空闲。
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=6,7 PYTHONPATH=python:test/ascend TASK_QUEUE_ENABLE=0 \
+SGLANG_DSV41_910B=1 DSV41_NATIVE_DIR=build/dsv41 \
+  build/dsv41-venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=2 \
+  --module dsv41.kernels.operators.test_peer_group_gather
+```
 
 微基准在 Graph 内重复完整通信路径，使用 NPU event，七次取中位数，并保留每个 rank 的结果及 immutable library 路径。它排除了 GEMM 和 KV attention，不能替代固定 32K input、总 request batch 1–64 的 target+draft forward A/B。

@@ -19,7 +19,7 @@ routed experts. The backend also recognizes the target-only
 | `attention/` | Attention, Q/K projections, BF16 KV and INT8 Indexer pools |
 | `prefill/` | CED prefill and bounded SWA replay |
 | `dspark/` | Draft attention, KV injection and target verification |
-| `moe.py`, `parallel.py` | Resident MXFP4 experts, compact scratch and DP collectives |
+| `moe.py`, `parallel.py` | Resident MXFP4 experts, bounded scratch and DP collectives |
 | `checkpoint.py`, `dense_weights.py`, `linear.py`, `engram.py` | Checkpoint loading and persistent weight layouts |
 | `kernels/ops` | Python operator contracts and prepared invocations |
 | `kernels/native` | Ascend C sources, C++ bindings, and launch plans |
@@ -64,6 +64,22 @@ Both profiles use MoE EP8, separate shared experts, DSpark, CED, encoder and
 decoder SWA replay, and target/draft NPU Graph. Attention DP8/TP1 uses a 4,096-token
 local prefill chunk. Attention DP4/TP2 uses 8,192. Both default to a 1,048,576-token
 context limit, 64 global running requests, automatic KV sizing, and memory fraction 0.88.
+
+`serve.sh` defaults to `DSV41_ATTN_DP_SIZE=4` with `SGLANG_OPT_DSV41_GROUP_CP2_DP2=1`,
+running interleaved prefill and request-sharded decode, target verify, and draft
+on the DP4 service profile (set `SGLANG_OPT_DSV41_GROUP_CP2_DP2=0` for Attention TP2). Each lane uses all
+attention heads and returns its own rows from EP8. The vocabulary head,
+embedding, and Markov output weights retain their existing shards. Group
+collectives gather model outputs and mirror changes to the request caches.
+With `SGLANG_OPT_DSV41_NPU_PEER_COMM=1`, the TP2 gather writes compressor
+projections and paired model outputs directly to their destination tensors,
+and gathers SWA updates in layer-major order. Forward, verify commit, and
+target-hidden injection use separate IPC communicators. Draft KV injection
+projects half the rows per lane, then gathers the rotated KV before updating
+the mirrored draft buffers. HCCL handles peer-disabled, multi-stream,
+cross-host, and over-capacity calls. This mode requires TP8, attention DP4/CP1, EP8, MoE A2A
+`none`, and `--enable-dp-lm-head`. A step coordinated with prefill uses the prefill
+MoE layout so all ranks enter the same collectives.
 
 For a smaller HTTP smoke check, the context and request budgets can be overridden:
 
@@ -138,7 +154,10 @@ The FP16 handoff between AIV and AIC stays cached. This avoids filling L2
 with streamed weights but can increase HBM reads when weights would otherwise
 be reused from L2 across M tiles or calls.
 
-Large eager prefill batches compact scratch to the local EP routing count.
+Resident MoE prefill processes at most 8,192 tokens per window. Scratch covers
+all six routing slots per token, and kernels read the live EP row count on
+device. CP2+DP2 SUM_LEN prefill skips idle EP rank blocks during MoE compute
+and restores the full layout for reduce-scatter.
 Bounded replay uses the model's approximate SWA recovery. In the 1017 layout,
 layer 20 writes compressed KV and index keys for the uncached suffix and
 builds SWA KV for the whole extend, including encoder replay rows. Its Indexer
@@ -190,8 +209,9 @@ snapshots under immutable version directories. Keep the whole publication,
 not just the shared library. `DSV41_NATIVE_DIR` chooses a publication;
 `DSV41_JIT_CACHE_DIR` chooses a cache shared by the ranks on the node.
 
-Native ABI 31 exposes indexed row gather and scatter. Attention accepts a
-verify ring argument. CMake builds the host extension. The router produces
+Native ABI 33 adds TP2 Peer Group Gather with 8 MiB IPC regions. The library
+also exposes indexed row gather and scatter, and attention accepts a verify
+ring argument. CMake builds the host extension. The router produces
 grouped GEMM metadata on the device.
 AICore kernels compile through DeepJIT for the model geometries actually bound.
 Prepare and warm them before Graph capture; hot calls and replay do not compile.
