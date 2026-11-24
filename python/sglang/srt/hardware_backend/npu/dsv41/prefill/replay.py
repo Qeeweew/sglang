@@ -304,6 +304,12 @@ def adapt_prepare_sync(original_sync):
 
         if runner.model_config.hf_config.model_type == "deepseek_v41":
             prepare_replay_dp(fb, runner)
+            from .. import group_cp2_dp2
+
+            if group_cp2_dp2.prefill_step(fb):
+                from ..graph import refresh_counts
+
+                refresh_counts(fb, runner)
         return original_sync(fb, runner)
 
     return prepare_sync

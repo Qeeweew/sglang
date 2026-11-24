@@ -239,6 +239,16 @@ def adapt_init(original):
 
     @wraps(original)
     def init(self, config, layer_id, quant_config, prefix, **kwargs):
+        from . import group_cp2_dp2
+
+        if (
+            getattr(config, "model_type", None) == "deepseek_v41"
+            and group_cp2_dp2.enabled()
+        ):
+            from sglang.srt.runtime_context import get_device
+
+            if get_device().device == "npu":
+                kwargs["attention_projection_group"] = "replicated"
         original(self, config, layer_id, quant_config, prefix, **kwargs)
         if self.is_dsv41 and enabled_for(quant_config):
             layer = self.wo_a

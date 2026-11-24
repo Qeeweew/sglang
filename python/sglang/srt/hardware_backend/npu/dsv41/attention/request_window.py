@@ -1,7 +1,7 @@
 """Request-private BF16 SWA and provisional rows for target verify.
 
-Target verify reads accepted history directly from the ring.
-Prefill and ordinary decode use the paged workspace.
+Target verify and group-sharded decode read accepted history directly from the
+ring. Prefill and default decode use the paged workspace.
 """
 
 from types import SimpleNamespace
@@ -191,20 +191,27 @@ class BF16RequestWindow:
             dst = gather_rows(dst, rows)
         scatter_rows(values, dst, self.ring[layer])
 
-    def commit_verify(self, meta):
-        requests = meta.verify_requests[:, None]
-        keep = (requests > 0) & (meta.verify_lanes < meta.verify_commit_lens[:, None])
+    def commit_verify(self, meta, *, requests=None, accepted=None, comm_role="forward"):
+        requests = (meta.verify_requests if requests is None else requests)[:, None]
+        accepted = meta.verify_commit_lens if accepted is None else accepted
+        keep = (requests > 0) & (meta.verify_lanes < accepted[:, None])
         positions = meta.starts[:, None] + meta.verify_lanes
         dst = torch.add(positions % self.capacity, requests, alpha=self.capacity)
         ring = self.ring.view(-1, 512)
         # Scatter skips negative slots. Mask once per request so rejected rows
         # stay negative even after adding the last layer's offset.
         dst = self.layer_offsets + torch.where(keep, dst, -ring.shape[0])
-        self.position.scatter_bf16(
-            meta.swa_pending.view(-1, 512),
-            dst.flatten(),
-            ring,
+        shape = getattr(meta, "group_decode", None)
+        pending = (
+            meta.swa_pending
+            if shape is None
+            else shape.gather_layers(
+                meta.group_queries.swa_pending,
+                role="target_swa_ring",
+                comm_role=comm_role,
+            )
         )
+        self.position.scatter_bf16(pending.view(-1, 512), dst.flatten(), ring)
 
 
 class BF16RequestWindowMemory:

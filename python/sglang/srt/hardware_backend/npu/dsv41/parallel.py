@@ -7,6 +7,7 @@ on the compute stream, so serial layers can explicitly reuse these buffers.
 """
 
 from contextvars import ContextVar
+from dataclasses import replace
 from functools import cache, wraps
 
 import torch
@@ -71,7 +72,7 @@ def adapt_run(original):
         from sglang.srt.models.deepseek_common.moe_transport import (
             shared_expert_runs_locally,
         )
-        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.runtime_context import get_forward, get_parallel
         from .joint_experts import can_join
 
         if (
@@ -87,6 +88,39 @@ def adapt_run(original):
                 and moe_sequence_parallel_enabled(get_parallel())
             ):
                 joint = can_join(layer.mlp)
+                layout = getattr(forward_batch, "_dsv41_group_moe_rows", None)
+                if layout is not None:
+                    if layout.split_at_moe:
+                        from . import group_cp2_dp2
+
+                        shard, rows = group_cp2_dp2.interleave_shard(
+                            hidden_states, role="mixed_moe"
+                        )
+                        ids = kwargs.get("input_ids")
+                        if ids is not None:
+                            ids, _ = group_cp2_dp2.interleave_shard(
+                                ids, role="mixed_moe_ids"
+                            )
+                        with get_forward().scoped(npu_defer_moe_post=False):
+                            result = _run_group_shards(
+                                layer,
+                                shard,
+                                forward_batch,
+                                layout,
+                                joint=joint,
+                                input_ids=ids,
+                            )
+                        return group_cp2_dp2.interleave_gather(
+                            result, rows, role="mixed_moe_output"
+                        )
+                    return _run_group_shards(
+                        layer,
+                        hidden_states,
+                        forward_batch,
+                        layout,
+                        input_ids=kwargs.get("input_ids"),
+                        joint=joint,
+                    )
                 if _use_moe_sequence_parallel(
                     get_parallel(), forward_batch, joint
                 ) and (
@@ -261,6 +295,185 @@ def moe_routing_metadata(hidden, experts):
     ).get(1)[0]
 
 
+def _run_gathered_experts(mlp, gathered, batch, input_ids, global_ids, owner, peer):
+    from sglang.srt.runtime_context import get_forward
+
+    joint_args = {} if owner is None else {"joint_shared_slice": owner}
+    with get_forward().scoped(
+        mlp_reduce_scatter=True, npu_defer_route_combine=peer is not None
+    ):
+        return mlp(
+            gathered,
+            batch,
+            input_ids=input_ids,
+            input_ids_global=global_ids,
+            skip_shared_experts=True,
+            return_moe_output=False,
+            **joint_args,
+        )
+
+
+def _reduce_scatter(group, output, partial, shared, owned_rows):
+    group.reduce_scatter_tensor(output, partial)
+    if shared is not None:
+        # Add the replicated shared expert once on the owned token rows.
+        output[:owned_rows].add_(shared)
+
+
+def _run_compacted_group_shards(mlp, gathered, batch, layout, input_ids, owner, active):
+    stride = layout.stride
+    begin, end = active[0] * stride, (active[-1] + 1) * stride
+    contiguous = end - begin == len(active) * stride
+    global_ids = layout.global_input_ids
+    if contiguous:
+        hidden = gathered[begin:end]
+        counts = layout.counts[active[0] : active[-1] + 1]
+        if global_ids is not None:
+            global_ids = global_ids[begin:end]
+    else:
+        hidden = _workspace("group_moe_active", gathered, len(active) * stride)
+        ids = global_ids
+        if ids is not None:
+            global_ids = _workspace("group_moe_active_ids", ids, hidden.shape[0])
+        for index, rank in enumerate(active):
+            src = slice(rank * stride, (rank + 1) * stride)
+            dst = slice(index * stride, (index + 1) * stride)
+            hidden[dst].copy_(gathered[src])
+            if ids is not None:
+                global_ids[dst].copy_(ids[src])
+        counts = torch.cat([layout.counts[rank : rank + 1] for rank in active])
+
+    active_owner = None
+    if owner is not None:
+        owner_rank = owner.start // stride
+        if owner_rank in active:
+            start = active.index(owner_rank) * stride
+            active_owner = slice(start, start + owner.stop - owner.start)
+        else:
+            active_owner = slice(0, 0)
+
+    batch._dsv41_group_moe_rows = replace(
+        layout, counts=counts, global_input_ids=global_ids
+    )
+    try:
+        partial = _run_gathered_experts(
+            mlp, hidden, batch, input_ids, global_ids, active_owner, None
+        )
+    finally:
+        batch._dsv41_group_moe_rows = layout
+    shared = None
+    if owner is not None:
+        partial, shared = partial
+
+    # Gathered inputs have been consumed on this stream. Reuse their storage
+    # for the full reduce-scatter layout, including zeroes for idle ranks.
+    if contiguous:
+        gathered[:begin].zero_()
+        gathered[begin:end].copy_(partial)
+        gathered[end:].zero_()
+    else:
+        index = 0
+        for rank in range(layout.counts.numel()):
+            block = gathered[rank * stride : (rank + 1) * stride]
+            if index < len(active) and rank == active[index]:
+                block.copy_(partial[index * stride : (index + 1) * stride])
+                index += 1
+            else:
+                block.zero_()
+    return gathered, shared
+
+
+def _run_group_shards(
+    layer,
+    local,
+    batch,
+    layout,
+    *,
+    input_ids=None,
+    joint=False,
+):
+    from sglang.srt.runtime_context import get_parallel
+
+    from .peer_collectives import moe_communicator
+
+    parallel = get_parallel()
+    tp_group = parallel.tp_group
+    rows, stride = local.shape[0], layout.stride
+    if rows > stride:
+        raise ValueError("MoE local rows exceed the EP gather stride")
+    if not stride:
+        return torch.empty_like(local)
+
+    active = None
+    if not batch.dp_padding_mode.is_max_len() and layout.rank_counts_cpu is not None:
+        active = [
+            rank for rank, count in enumerate(layout.rank_counts_cpu) if count > 0
+        ]
+        if not active:
+            return torch.empty_like(local)
+        if len(active) == parallel.tp_size:
+            active = None
+
+    shard = local
+    if rows < stride:
+        shard = _workspace("group_moe_padded_input", local, stride)
+        shard[:rows].copy_(local)
+        shard[rows:].zero_()
+    gathered = _workspace("gather", local, stride * parallel.tp_size)
+    peer = (
+        moe_communicator(shard, tp_group, attention_tp=1)
+        if batch.dp_padding_mode.is_max_len()
+        else None
+    )
+    if peer is None:
+        tp_group.all_gather_into_tensor(gathered, shard)
+    else:
+        peer.gather(shard, gathered)
+
+    if (
+        layout.global_input_ids is None
+        and getattr(layer.mlp.gate, "e_score_correction_bias_vl", None) is not None
+    ):
+        if input_ids is None or input_ids.numel() != rows:
+            raise ValueError("MoE image routing requires local token IDs")
+        ids = input_ids.reshape(rows, 1)
+        ids_shard = _workspace("group_moe_id_shard", ids, stride)
+        ids_shard[:rows].copy_(ids)
+        ids_shard[rows:].zero_()
+        global_ids = _workspace("group_moe_ids", ids, gathered.shape[0])
+        tp_group.all_gather_into_tensor(global_ids, ids_shard)
+        layout.global_input_ids = global_ids
+
+    shared = None
+    owner = None
+    if joint:
+        start = parallel.tp_rank * stride
+        owner = slice(start, start + rows)
+    elif (
+        rows
+        and (active is None or parallel.tp_rank in active)
+        and getattr(layer.mlp, "shared_experts", None) is not None
+    ):
+        shared = layer.mlp._forward_shared_experts(local)
+    if active is not None:
+        partial, joint_shared = _run_compacted_group_shards(
+            layer.mlp, gathered, batch, layout, input_ids, owner, active
+        )
+        if joint:
+            shared = joint_shared
+    else:
+        partial = _run_gathered_experts(
+            layer.mlp, gathered, batch, input_ids, layout.global_input_ids, owner, peer
+        )
+        if joint:
+            partial, shared = partial
+    if peer is not None:
+        return peer.finish(partial, shared, stride)
+    output = local.new_empty((stride, local.shape[1]))
+    _reduce_scatter(tp_group, output, partial, shared, rows)
+    return output[:rows]
+
+
 def _run_sequence_parallel(
     layer,
     local,
@@ -272,7 +485,7 @@ def _run_sequence_parallel(
     joint=False,
 ):
     from sglang.srt.layers.dp_attention import _DpGatheredBufferWrapper as geometry
-    from sglang.srt.runtime_context import get_forward, get_parallel
+    from sglang.srt.runtime_context import get_parallel
 
     parallel = get_parallel()
     rows = geometry.get_local_dp_buffer_len()
@@ -326,24 +539,15 @@ def _run_sequence_parallel(
         gathered.view(parallel.attn_dp_size, rows, -1).copy_(
             padded_gather.view(parallel.attn_dp_size, padded_rows, -1)[:, :rows]
         )
-    with get_forward().scoped(
-        mlp_reduce_scatter=True, npu_defer_route_combine=peer is not None
-    ):
-        joint_args = {}
-        if joint:
-            owner = parallel.attn_dp_rank * rows + min(start, rows)
-            joint_args["joint_shared_slice"] = slice(owner, owner + owned_rows)
-        partial = layer.mlp(
-            gathered,
-            batch,
-            input_ids=input_ids,
-            input_ids_global=input_ids_global,
-            skip_shared_experts=True,
-            return_moe_output=False,
-            **joint_args,
-        )
-        if joint:
-            partial, shared = partial
+    owner = None
+    if joint:
+        first = parallel.attn_dp_rank * rows + min(start, rows)
+        owner = slice(first, first + owned_rows)
+    partial = _run_gathered_experts(
+        layer.mlp, gathered, batch, input_ids, input_ids_global, owner, peer
+    )
+    if joint:
+        partial, shared = partial
     if peer is not None:
         return peer.finish(partial, shared, rows)
     if padded_rows != rows:
@@ -358,11 +562,7 @@ def _run_sequence_parallel(
         if tp == 1
         else _workspace("moe_sp_shard", local, shard_rows)
     )
-    parallel.tp_group.reduce_scatter_tensor(shard_output, partial)
-    if shared is not None:
-        # EP8 already completed the expert sum. Add the replicated shared
-        # expert exactly once on its token shard, before restoring TP copies.
-        shard_output[:owned_rows].add_(shared)
+    _reduce_scatter(parallel.tp_group, shard_output, partial, shared, owned_rows)
     if tp == 1:
         return shard_output
     output = torch.empty(

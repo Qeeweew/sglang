@@ -386,11 +386,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
 
     native_910b = cfg.device == "npu" and dsv41_910b()
     if native_910b:
+        from sglang.srt.hardware_backend.npu.dsv41 import group_cp2_dp2
         from sglang.srt.hardware_backend.npu.dsv41.prefill.replay import (
             validate_options,
             validate_ced_config,
         )
 
+        group_cp2_dp2.validate_options(cfg)
         validate_options(cfg)
         if cfg.enable_decoder_swa_bounded_replay:
             validate_ced_config(model_config_of(server_args).hf_config)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sglang.srt.hardware_backend.npu.dsv41 import dense_weights as _dsv41_weights
 from sglang.srt.hardware_backend.npu.dsv41 import linear as _dsv41_w8a16
+from sglang.srt.hardware_backend.npu.dsv41 import group_cp2_dp2 as _dsv41_group
 from sglang.srt.hardware_backend.npu.dsv41.attention import (
     projections as _dsv41_projection,
 )
@@ -22,6 +23,7 @@ from typing import (
     Callable,
     Iterable,
     List,
+    Literal,
     NamedTuple,
     Optional,
     Set,
@@ -1037,11 +1039,16 @@ class MqaAttentionBase(nn.Module):
         wo_a_keeps_quant_config: Optional[bool] = None,
         wo_b_reduce_results: Optional[bool] = None,
         rope_original_seq_len: Optional[int] = None,
+        attention_projection_group: Literal["attn_tp", "replicated"] = "attn_tp",
     ) -> None:
         super().__init__()
         self.is_dsv41 = getattr(config, "model_type", None) == "deepseek_v41"
-        self.attn_tp_rank: int = get_parallel().attn_tp_rank
-        self.attn_tp_size: int = get_parallel().attn_tp_size
+        if attention_projection_group == "replicated":
+            self.attn_tp_rank, self.attn_tp_size = 0, 1
+            wo_b_reduce_results = False
+        else:
+            self.attn_tp_rank = get_parallel().attn_tp_rank
+            self.attn_tp_size = get_parallel().attn_tp_size
 
         self.layer_id = layer_id
         self.dim = config.hidden_size
@@ -1142,7 +1149,7 @@ class MqaAttentionBase(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("wq_b", prefix),
-            parallel_group="attn_tp",
+            parallel_group=attention_projection_group,
         )
         self.kv_norm = RMSNorm(self.head_dim, eps=self.eps)
         self.wo_a = ColumnParallelLinear(
@@ -1151,7 +1158,7 @@ class MqaAttentionBase(nn.Module):
             bias=False,
             quant_config=wo_a_quant_config,
             prefix=add_prefix("wo_a", prefix),
-            parallel_group="attn_tp",
+            parallel_group=attention_projection_group,
             **({} if quantize_wo_a else {"params_dtype": torch.bfloat16}),
         )
         if quantize_wo_a:
@@ -1182,9 +1189,11 @@ class MqaAttentionBase(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
-            use_dp_attention_reduce=is_dp_attention_enabled(),
+            use_dp_attention_reduce=(
+                attention_projection_group == "attn_tp" and is_dp_attention_enabled()
+            ),
             prefix=add_prefix("wo_b", prefix),
-            parallel_group="attn_tp",
+            parallel_group=attention_projection_group,
         )
 
         from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
@@ -2695,6 +2704,13 @@ class MQALayer(MqaAttentionBase):
     ) -> Union[torch.Tensor, mhc.AttnOutput]:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             return x
+        if (
+            _is_npu
+            and self.is_dsv41
+            and forward_batch.forward_mode.is_idle()
+            and _dsv41_group.decode_step(forward_batch)
+        ):
+            return torch.zeros_like(x)
 
         attn_backend = get_attn_backend()
         if TYPE_CHECKING:
@@ -4149,14 +4165,27 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: Optional[AuxHiddenStatePacker],
+        group_decode: Optional[_dsv41_group.DecodeRows] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
+        group_moe_rows = getattr(forward_batch, "_dsv41_group_moe_rows", None)
+        group_sharded = group_moe_rows is not None and not group_moe_rows.split_at_moe
         hash_ids = None
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
-        if self.engram_hasher is not None:
-            if cp_extend:
+        group_idle = group_decode is not None and forward_batch.forward_mode.is_idle()
+        if self.engram_hasher is not None and not group_idle:
+            if group_decode is not None:
+                hash_ids = group_decode.slice(
+                    self.engram_hasher(forward_batch.input_ids, forward_batch),
+                    role="decode_engram",
+                )
+            elif group_sharded:
+                hash_ids = _dsv41_group.prefill_hash_ids(
+                    self.engram_hasher, forward_batch
+                )
+            elif cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
                 hash_ids = self.engram_hasher(
@@ -4215,6 +4244,11 @@ class DeepseekV4Model(nn.Module):
                 tail_in_graph=tail_in_graph,
             )
         saved_full = None
+        tail_subset = (
+            attn_backend.tail_forward_metadata.group_selection
+            if group_sharded and tail is not None
+            else None
+        )
         # The HIP defer_post gate excludes residual readers. CUDA materializes
         # its producer update explicitly before these readers below.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
@@ -4303,17 +4337,35 @@ class DeepseekV4Model(nn.Module):
                         return residual, pre, tail
                 else:
                     saved_full = attn_backend.enter_late_layer_tail(forward_batch)
-                state = state.take_rows(tail.rows)
+                if tail_subset is None:
+                    state = state.take_rows(tail.rows)
+                    input_ids = tail.rows(input_ids)
+                    positions = tail.positions
+                    if hash_ids is not None:
+                        hash_ids = tail.rows(hash_ids)
+                else:
+                    state = state.take_rows(
+                        lambda value: tail_subset.redistribute(
+                            value, role="tail_residual"
+                        ).clone()
+                    )
+                    input_ids, _ = _dsv41_group.interleave_shard(
+                        forward_batch.input_ids, role="tail_ids"
+                    )
+                    positions = attn_backend.forward_metadata.group_queries.positions
+                    if hash_ids is not None:
+                        hash_ids = tail_subset.redistribute(hash_ids, role="tail_hash")
+                    prime_rope_cos_sin(
+                        (self.layers[j].self_attn for j in range(i, self.end_layer)),
+                        forward_batch,
+                        positions,
+                    )
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
-                input_ids = tail.rows(input_ids)
                 if not (
                     get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
                 ):
                     input_ids_global = tail.rows(input_ids_global)
-                positions = tail.positions
-                if hash_ids is not None:
-                    hash_ids = tail.rows(hash_ids)
                 if use_tail_graph:
                     residual, pre, aux = self.decoder_replay_tail.run(
                         state=state,
@@ -4364,11 +4416,18 @@ class DeepseekV4Model(nn.Module):
                     # Full-prefill IDs are not indexed by this rank's tail rows.
                     input_ids_global = (
                         _gather_late_layer_ids(input_ids, late_dp_counts, forward_batch)
-                        if self.late_layer_vl_routing
+                        if self.late_layer_vl_routing and group_moe_rows is None
                         else None
                     )
+                if group_moe_rows is not None:
+                    _dsv41_group.prepare_moe_rows(
+                        forward_batch,
+                        state.residual,
+                        counts=forward_batch.global_num_tokens_gpu,
+                        split_at_moe=not group_sharded,
+                    )
             engram = self.layers[i].engram
-            if engram is not None:
+            if engram is not None and not group_idle:
                 # No local name holds the pre-Engram residual: it would stay alive
                 # until the next Engram layer.
                 hidden_states = engram(
@@ -4389,7 +4448,11 @@ class DeepseekV4Model(nn.Module):
                 # The draft head reads the attention input of its target layers.
                 aux = state.residual
                 if tail is not None and i < self.late_layer_start:
-                    aux = tail.rows(aux)
+                    aux = (
+                        tail_subset.redistribute(aux, role="tail_aux_capture")
+                        if tail_subset is not None
+                        else tail.rows(aux)
+                    )
                 mhc_stream_mean(aux, out=dspark_aux_hidden_states.slot(aux[:, 0]))
                 del aux
             ctx = (
@@ -4591,9 +4654,13 @@ class DeepseekV4Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if not _is_cuda:
-            return self._forward_impl(
-                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
-            )
+            try:
+                return self._forward_impl(
+                    input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+                )
+            finally:
+                if hasattr(forward_batch, "_dsv41_group_moe_rows"):
+                    del forward_batch._dsv41_group_moe_rows
         from sglang.srt.layers.moe.mega_gate import mega_gate_forward_scope
 
         try:
@@ -4613,6 +4680,46 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        group_prefill = (
+            _is_npu
+            and _dsv41_group.prefill_step(forward_batch)
+            and self.config.model_type == "deepseek_v41"
+        )
+        group_query = None
+        group_decode = None
+        full_rows = input_ids.shape[0]
+        if not group_prefill and _is_npu and self.config.model_type == "deepseek_v41":
+            if _dsv41_group.decode_step(forward_batch):
+                width = 1
+                if forward_batch.forward_mode.is_target_verify() or (
+                    forward_batch.forward_mode.is_idle()
+                    and forward_batch.spec_algorithm is not None
+                    and forward_batch.spec_algorithm.is_dspark()
+                ):
+                    width = getattr(forward_batch.spec_info, "draft_token_num", 6)
+                group_decode = _dsv41_group.DecodeRows(forward_batch.batch_size, width)
+                input_ids = group_decode.slice(input_ids, role="decode_ids")
+                positions = group_decode.slice(positions, role="decode_positions")
+                if input_embeds is not None:
+                    input_embeds = group_decode.slice(
+                        input_embeds, role="decode_embeds"
+                    )
+                _dsv41_group.prepare_moe_rows(
+                    forward_batch, input_ids, rows_per_request=width
+                )
+        if group_prefill and forward_batch.forward_mode.is_extend_without_speculative():
+            group_query = get_attn_backend().forward_metadata.group_queries
+        if group_query is not None:
+            input_ids, _ = _dsv41_group.interleave_shard(input_ids, role="prefill_ids")
+            positions = group_query.positions
+            if input_embeds is not None:
+                input_embeds, _ = _dsv41_group.interleave_shard(
+                    input_embeds, role="prefill_embeds"
+                )
+        if group_prefill:
+            _dsv41_group.prepare_moe_rows(
+                forward_batch, input_ids, split_at_moe=group_query is None
+            )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4630,7 +4737,9 @@ class DeepseekV4Model(nn.Module):
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
 
-        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
+        if group_prefill or group_decode is not None:
+            input_ids_global = None
+        elif get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,
@@ -4699,6 +4808,7 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global,
                 capture_dspark,
                 dspark_aux_hidden_states,
+                group_decode,
             )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
@@ -4800,7 +4910,29 @@ class DeepseekV4Model(nn.Module):
         cuda_cp_tail = not capture_dspark and _needs_cp_tail_scatter(
             tail, forward_batch
         )
-        num_tokens = input_ids.shape[0]
+        num_tokens = full_rows
+        if group_decode is not None:
+            if not forward_batch.forward_mode.is_idle():
+                attn_backend.finish_group_decode(
+                    verify=forward_batch.forward_mode.is_target_verify()
+                )
+            # The vocabulary head and the sampler retain the scheduler order.
+            aux = dspark_aux_hidden_states.finalize() if capture_dspark else pre_hc_head
+            hidden_states, aux = group_decode.gather_pair(
+                hidden_states, aux, role="decode_output"
+            )
+            if capture_dspark:
+                return (hidden_states, pre_hc_head), aux
+            return hidden_states, aux
+        if group_query is not None:
+            output_rows = num_tokens if tail is None else tail.token_indices.shape[0]
+            hidden_states = _dsv41_group.interleave_gather(
+                hidden_states, output_rows, role="prefill_output"
+            )
+            if not capture_dspark:
+                pre_hc_head = _dsv41_group.interleave_gather(
+                    pre_hc_head, output_rows, role="prefill_residual"
+                )
         if tail is not None and (not capture_dspark or cuda_cp_tail):
             # The logits processor indexes rows by the full extend layout.
             hidden_states = _scatter_tail_rows(
@@ -4816,9 +4948,14 @@ class DeepseekV4Model(nn.Module):
                 zero=cuda_cp_tail,
             )
         if capture_dspark:
-            return (hidden_states, pre_hc_head), _finalize_dspark_aux(
+            aux = _finalize_dspark_aux(
                 dspark_aux_hidden_states, tail, num_tokens, cuda_cp_tail
             )
+            if group_query is not None:
+                aux = _dsv41_group.interleave_gather(
+                    aux, output_rows, role="prefill_aux"
+                )
+            return (hidden_states, pre_hc_head), aux
 
         return hidden_states, pre_hc_head
 

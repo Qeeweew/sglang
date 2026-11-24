@@ -15,15 +15,14 @@ from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import (
 )
 
 
-VERIFY_ROWS = 6
 PAGE_ROWS = 128
 WIDTH = 512
 LAYERS = 2
 
 
-def _case(batch, ratio, heads):
+def _case(batch, ratio, heads, width):
     dev = torch.device("npu", torch.npu.current_device())
-    rows = batch * VERIFY_ROWS
+    rows = batch * width
     window = BF16RequestWindow(
         num_slots=batch + 2, layers=LAYERS, page_size=PAGE_ROWS, capacity=134
     )
@@ -35,7 +34,7 @@ def _case(batch, ratio, heads):
     meta = SimpleNamespace(
         batch=batch,
         rows=rows,
-        cu=torch.arange(batch + 1, dtype=torch.int32, device=dev) * VERIFY_ROWS,
+        cu=torch.arange(batch + 1, dtype=torch.int32, device=dev) * width,
         starts=empty(batch, dtype=torch.int64),
         lengths=empty(batch),
         verify_requests=empty(batch, dtype=torch.int64),
@@ -45,7 +44,8 @@ def _case(batch, ratio, heads):
         cmp=empty(batch),
         residual=empty(batch),
     )
-    meta.window[1::VERIFY_ROWS] = 3
+    if width > 1:
+        meta.window[1::width] = 3
     inputs = empty(LAYERS, rows, WIDTH, dtype=torch.bfloat16)
     q = empty(rows, heads, WIDTH, dtype=torch.bfloat16)
     sinks = torch.linspace(-2, 4, heads, device=dev)
@@ -68,7 +68,7 @@ def _case(batch, ratio, heads):
     paged = empty(batch * pages + 1, PAGE_ROWS, 1, WIDTH, dtype=torch.bfloat16)
     row_offsets = torch.arange(pages * PAGE_ROWS, device=dev)
     page_columns = torch.arange(columns, device=dev)
-    query_bases = (torch.arange(batch, device=dev) * VERIFY_ROWS)[:, None]
+    query_bases = (torch.arange(batch, device=dev) * width)[:, None]
     physical_bases = (1 + torch.arange(batch, device=dev) * pages)[:, None]
 
     def build_paged_reference():
@@ -78,11 +78,11 @@ def _case(batch, ratio, heads):
         ring_rows = (
             meta.verify_requests[:, None] * window.capacity + pos % window.capacity
         )
-        pending_rows = query_bases + (pos - prefix).clamp(0, VERIFY_ROWS - 1)
+        pending_rows = query_bases + (pos - prefix).clamp(0, width - 1)
         history = window.ring[0].index_select(0, ring_rows.flatten())
         pending = inputs[0].index_select(0, pending_rows.flatten())
         values = torch.where((pos < prefix).view(-1, 1), history, pending)
-        live = (pos < prefix + VERIFY_ROWS) & (meta.verify_requests[:, None] > 0)
+        live = (pos < prefix + width) & (meta.verify_requests[:, None] > 0)
         paged[1:].view(-1, WIDTH).copy_(torch.where(live.view(-1, 1), values, 0))
         pages_live = (
             (page_columns >= first)
@@ -100,7 +100,7 @@ def _case(batch, ratio, heads):
         if batch > 1:
             dummy = (batch - 1 - generation) % batch
             requests[dummy] = starts[dummy] = 0
-        lengths = [start + VERIFY_ROWS for start in starts]
+        lengths = [start + width for start in starts]
         divisor = max(ratio, 1)
         for member, values in (
             ("starts", starts),
@@ -148,7 +148,7 @@ def _case(batch, ratio, heads):
         starts, requests = change(0)
         window.ring.normal_()
         before = window.ring.cpu()
-        window.init_verify(meta, VERIFY_ROWS)
+        window.init_verify(meta, width)
         direct, direct_out = bind(*window.verify_inputs(meta, 0))
         paged_call, paged_out = bind(paged)
 
@@ -164,12 +164,12 @@ def _case(batch, ratio, heads):
 
     def check(starts, requests, generation, before, commit):
         actual, expected = direct_out.cpu(), paged_out.cpu()
-        valid = torch.tensor(requests).ne(0).repeat_interleave(VERIFY_ROWS)
+        valid = torch.tensor(requests).ne(0).repeat_interleave(width)
         torch.testing.assert_close(actual[valid], expected[valid], atol=0, rtol=0)
         assert torch.count_nonzero(actual[~valid]).item() == 0
         torch.testing.assert_close(window.ring.cpu(), before, atol=0, rtol=0)
         accepts = [
-            ((0, 2, 6)[(i + generation) % 3] if request else 0)
+            ((0, min(2, width), width)[(i + generation) % 3] if request else 0)
             for i, request in enumerate(requests)
         ]
         expected_ring = before.clone()
@@ -177,7 +177,7 @@ def _case(batch, ratio, heads):
         for row, (start, request, accept) in enumerate(zip(starts, requests, accepts)):
             for j in range(accept):
                 slot = request * window.capacity + (start + j) % window.capacity
-                expected_ring[:, slot].copy_(source[:, row * VERIFY_ROWS + j])
+                expected_ring[:, slot].copy_(source[:, row * width + j])
         with torch.npu.stream(stream):
             meta.verify_commit_lens.copy_(torch.tensor(accepts, dtype=torch.int32))
             commit()
@@ -205,5 +205,6 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     for batch in (1, 5):
         for ratio in (0, 1, 2):
-            _case(batch, ratio, 32)
+            _case(batch, ratio, 32, 6)
+            _case(batch, ratio, 64, 1)
     print("PASS direct verify ring bitwise output, acceptance and Graph replay")

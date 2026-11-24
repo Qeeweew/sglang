@@ -933,6 +933,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         finally:
             residual_batch.clear(forward_batch)
 
+    @_dsv41_draft.adapt_model_forward
     def _forward_impl(self, input_ids, positions, forward_batch, input_embeds):
         if input_embeds is None:
             input_embeds = self.forward_embed(input_ids)

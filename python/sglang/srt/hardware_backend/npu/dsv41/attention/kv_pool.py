@@ -6,6 +6,7 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.dsv4 import dsv4_memory_pool as module
 from sglang.srt.hardware_backend.npu.dsv4 import dsv4_req_to_token_pool as req_module
+from sglang.srt.hardware_backend.npu.dsv41 import group_cp2_dp2
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -251,6 +252,20 @@ class DSV41NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             # registration below completes the existing ring accounting.
             self._swa_req_ring = True
             self._swa_ring_cost = pool.request_window.capacity
+
+    def evict_to_free_tokens(self, tree_cache, num_tokens):
+        if not (self.swa_req_ring and group_cp2_dp2.enabled()):
+            return super().evict_to_free_tokens(tree_cache, num_tokens)
+        # Ordinary Decode owns a request-scoped SWA ring. Only FULL token
+        # growth can require evicting a page from the prefix tree.
+        if (
+            tree_cache is not None
+            and tree_cache.supports_prefix_sharing()
+            and self.full_available_size() < num_tokens
+        ):
+            from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
+            tree_cache.evict_for_alloc(KVDemand(full_tokens=num_tokens))
 
     def free(self, free_index=None, *, req=None, req_to_token_pool=None):
         if free_index is not None:

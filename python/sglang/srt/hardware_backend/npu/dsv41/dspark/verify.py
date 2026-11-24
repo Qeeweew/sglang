@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import torch
 
+from .. import group_cp2_dp2
 from ..policy import enabled
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,10 @@ def _metadata(self, fb, in_capture=False):
         raise ValueError(
             "910B DSpark target verify currently uses the static six-row schedule"
         )
-    meta = self._bucket(batch, rows, "verify")
+    grouped = group_cp2_dp2.decode_step(fb)
+    meta = self._bucket(batch, rows, "verify", with_queries=not grouped)
+    if grouped:
+        self._stage_group_decode(meta, width, "verify_group_query")
     if not hasattr(meta, "verify_sources"):
         meta.verify_sources = {}
         meta.verify_token_mask = torch.empty(rows, dtype=torch.bool, device=self.device)
@@ -39,7 +43,7 @@ def _metadata(self, fb, in_capture=False):
             batch, dtype=torch.int32, device=self.device
         )
         meta.verify_requests = torch.empty(batch, dtype=torch.int64, device=self.device)
-        if meta.verify_window is not None:
+        if meta.verify_window is not None and not grouped:
             meta.verify_window.init_verify(meta, width)
         meta.verify_generation = 0
         meta.verify_committed_generation = -1
@@ -104,6 +108,10 @@ def _metadata_in_graph(self, fb):
     for ratio in (1, 2):
         meta.cmp_lengths[ratio].copy_(total // ratio)
         meta.residual[ratio].copy_(total % ratio)
+    if getattr(meta, "group_decode", None) is not None:
+        if self.request_window is None:
+            meta.swa_slots.masked_fill_(~meta.verify_token_mask, -1)
+        self._prepare_group_decode(meta, requests)
 
 
 def _record(self, layer, source):
@@ -149,9 +157,14 @@ def write_provisional_source_kv(self, layer, x):
     record.shadow.state.committed_lengths.copy_(source.state.committed_lengths)
     record.shadow.state.committed_lengths[meta.requests.long()] = meta.starts
     kv, scores = layer.compressor.project(x)
-    record.kv.copy_(kv)
-    if scores is not None:
-        record.scores.copy_(scores)
+    if getattr(meta, "group_decode", None) is not None:
+        meta.group_decode.gather_projection(
+            kv, scores, out_kv=record.kv, out_scores=record.scores
+        )
+    else:
+        record.kv.copy_(kv)
+        if scores is not None:
+            record.scores.copy_(scores)
     prepared = record.shadow.prepare(
         record.kv,
         record.scores,
@@ -186,10 +199,10 @@ def _commit_sources(meta):
             status=record.status,
         )
     if meta.verify_window is not None:
-        meta.verify_window.commit_verify(meta)
+        meta.verify_window.commit_verify(meta, comm_role="commit")
 
 
-def _commit_graph(meta, device):
+def _commit_graph(meta, device, capture_resources=None):
     """Capture once per verify bucket, using a zero-length warmup commit.
 
     Zero accepts leave pending payloads untouched. Prefix lengths are seeded
@@ -200,13 +213,17 @@ def _commit_graph(meta, device):
     sources = tuple(meta.verify_sources)
     if getattr(meta, "commit_graph_sources", None) != sources:
         meta.verify_commit_lens.zero_()
-        stream = torch.npu.Stream(device=device)
+        stream, pool = (
+            (torch.npu.Stream(device=device), None)
+            if capture_resources is None
+            else capture_resources
+        )
         stream.wait_stream(torch.npu.current_stream(device))
         with torch.npu.stream(stream):
             _commit_sources(meta)
         stream.synchronize()
         graph = torch.npu.NPUGraph()
-        with torch.npu.graph(graph, stream=stream):
+        with torch.npu.graph(graph, stream=stream, pool=pool):
             _commit_sources(meta)
         stream.synchronize()
         meta.commit_graph, meta.commit_graph_sources = graph, sources
@@ -237,7 +254,17 @@ def _commit(self, commit_lens, req_pool_indices=None, *, folded=False):
             "commit_lens must count 0..6 verified inputs, never the sampled bonus"
         )
     if not folded and (meta.verify_sources or meta.verify_window is not None):
-        graph = _commit_graph(meta, self.device)
+        resources = None
+        if getattr(meta, "group_decode", None) is not None:
+            # Commits run in stream order. Share capture scratch across buckets
+            # as the live batch shrinks.
+            if not hasattr(self, "_group_commit_capture"):
+                self._group_commit_capture = (
+                    torch.npu.Stream(device=self.device),
+                    torch.npu.graph_pool_handle(),
+                )
+            resources = self._group_commit_capture
+        graph = _commit_graph(meta, self.device, resources)
         accepted = meta.verify_commit_lens
         accepted.zero_()
         accepted[: counts.numel()].copy_(counts, non_blocking=True)

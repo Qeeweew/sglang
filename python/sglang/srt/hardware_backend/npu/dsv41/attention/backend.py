@@ -11,12 +11,14 @@ from types import SimpleNamespace
 from typing import NamedTuple
 
 import torch
-from sglang.srt.hardware_backend.npu.dsv41.dspark import verify as _dsv41_verify
+
+from sglang.srt.hardware_backend.npu.dsv41 import group_cp2_dp2
 from sglang.srt.hardware_backend.npu.dsv41.attention.projections import (
     _normalized_qkv,
     cached_rope,
     gather_rope,
 )
+from sglang.srt.hardware_backend.npu.dsv41.dspark import verify as _dsv41_verify
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
 logger = logging.getLogger(__name__)
@@ -71,7 +73,9 @@ class DSV41AttentionBackend(AttentionBackend):
             raise ValueError(
                 "V4.1/910B supports attention TP1/2/4 with complete DP groups"
             )
-        self.local_heads = self.config.num_attention_heads // attn_tp
+        self.local_heads = self.config.num_attention_heads // (
+            1 if group_cp2_dp2.enabled() else attn_tp
+        )
         self.batch_capacity = args.max_running_requests
         chunk = args.chunked_prefill_size
         if (
@@ -122,21 +126,15 @@ class DSV41AttentionBackend(AttentionBackend):
         return 1
 
     @torch.inference_mode(False)
-    def _bucket(self, batch, rows, decode):
+    def _bucket(self, batch, rows, decode, *, with_queries=True):
         # Scheduler metadata can outlive the inference-mode scope that first
         # requested it (e.g. Graph capture followed by eager preparation).
-        from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import (
-            QLIPlan,
-            SparseAttention,
-            WindowAttention,
-        )
-
-        key = (batch, rows, decode)
+        key = (batch, rows, decode, with_queries)
         if key in self.buckets:
             return self.buckets[key]
         if min(batch, rows) <= 0 or max(batch, rows) >= 2**31:
             raise ValueError("attention requires positive INT32 request/token counts")
-        eager = decode is False or decode == "tail"
+        eager = decode is False or decode in ("tail", "group_prefill", "group_tail")
         if eager:
             # Keep one eager metadata generation. Decode/verify metadata owns
             # captured addresses and stays pinned; kernels are shared below.
@@ -146,20 +144,6 @@ class DSV41AttentionBackend(AttentionBackend):
                     if self.forward_metadata is old:
                         self.forward_metadata = None
                     del old
-        window_reuse = batch == 1
-        if window_reuse not in self.operators:
-            self.operators[window_reuse] = SimpleNamespace(
-                swa=WindowAttention(heads=self.local_heads),
-                sparse={
-                    r: SparseAttention(
-                        ratio=r,
-                        window_reuse=window_reuse,
-                        heads=self.local_heads,
-                    )
-                    for r in (1, 2)
-                },
-            )
-        operators = self.operators[window_reuse]
 
         def empty(shape, dtype):
             return torch.zeros(shape, dtype=dtype, device=self.device)
@@ -175,23 +159,49 @@ class DSV41AttentionBackend(AttentionBackend):
             compressed_table=empty((batch, self.max_seq // 128), torch.int32),
             cmp_lengths={r: empty((batch,), torch.int32) for r in (1, 2)},
             residual={r: empty((batch,), torch.int32) for r in (1, 2)},
-            indices={
-                r: torch.full((rows, 1, 512), -1, dtype=torch.int32, device=self.device)
-                for r in (1, 2)
-            },
             window=empty((rows, 1), torch.int32),
             swa_slots=empty((rows,), torch.int64),
             full_slots=empty((rows,), torch.int64),
             starts=empty((batch,), torch.int64),
-            swa=operators.swa,
-            sparse=operators.sparse,
-            plans={},
-            qli_plans={},
-            candidates=None,
             late_layer_tail=None,
-            verify_window=self.request_window if decode == "verify" else None,
+            verify_window=(
+                self.request_window
+                if decode in ("verify", "decode_group_query", "verify_group_query")
+                else None
+            ),
             tail_source=None,
         )
+        if with_queries:
+            self._init_query_resources(meta, decode)
+        self.buckets[key] = meta
+        return meta
+
+    def _init_query_resources(self, meta, decode):
+        from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import (
+            QLIPlan,
+            SparseAttention,
+            WindowAttention,
+        )
+
+        batch, rows = meta.batch, meta.rows
+        window_reuse = batch == 1 and decode not in ("group_prefill", "group_tail")
+        if window_reuse not in self.operators:
+            self.operators[window_reuse] = SimpleNamespace(
+                swa=WindowAttention(heads=self.local_heads),
+                sparse={
+                    r: SparseAttention(
+                        ratio=r, window_reuse=window_reuse, heads=self.local_heads
+                    )
+                    for r in (1, 2)
+                },
+            )
+        operators = self.operators[window_reuse]
+        meta.swa, meta.sparse = operators.swa, operators.sparse
+        meta.indices = {
+            r: torch.full((rows, 1, 512), -1, dtype=torch.int32, device=self.device)
+            for r in (1, 2)
+        }
+        meta.plans, meta.qli_plans, meta.candidates = {}, {}, None
         # QLI and attention use the same exact request and query extents.
         cu = torch.tensor([0] * batch + [rows], dtype=torch.int32, device="cpu")
         lengths = torch.full((batch,), rows, dtype=torch.int32, device="cpu")
@@ -238,8 +248,34 @@ class DSV41AttentionBackend(AttentionBackend):
             meta.plans[layer] = plan
             if mode == "source":
                 meta.candidates = plan.candidate_out
-        self.buckets[key] = meta
-        return meta
+
+    def _group_prefill_queries(self, full, cu, positions, *, role):
+        valid = (full.accepted > 0).repeat_interleave(
+            torch.diff(cu).to(self.device), output_size=full.rows
+        )
+        positions = positions.masked_fill(~valid, -1)
+        local_positions, _ = group_cp2_dp2.interleave_shard(
+            positions, role=(role, "positions"), pad_value=-1
+        )
+        local = self._bucket(full.batch, local_positions.numel(), role)
+        counts = group_cp2_dp2.interleaved_counts(cu, group_cp2_dp2.lane())
+        counts[-1] += local.rows - sum(counts)
+        local.cu.copy_(
+            torch.tensor([0, *counts], dtype=torch.int32, device="cpu").cumsum(0).int()
+        )
+        for field in ("lengths", "table", "compressed_table"):
+            getattr(local, field).copy_(getattr(full, field))
+        for r in (1, 2):
+            local.cmp_lengths[r].copy_(full.cmp_lengths[r])
+            local.residual[r].copy_(full.residual[r])
+        local.window.copy_(
+            group_cp2_dp2.interleave_shard(
+                full.window, role=(role, "window"), pad_value=1
+            )[0]
+        )
+        local.positions = local_positions
+        local.query_positions = local_positions.int()
+        return local
 
     @_dsv41_verify.adapt_metadata
     def init_forward_metadata_out_graph(self, fb, in_capture=False):
@@ -302,7 +338,8 @@ class DSV41AttentionBackend(AttentionBackend):
             if swa_pages is not None:
                 swa_pages = torch.cat((swa_pages, torch.zeros_like(swa_pages[:1])))
             batch += 1
-        meta = self._bucket(batch, rows, False)
+        grouped = group_cp2_dp2.prefill_step(fb)
+        meta = self._bucket(batch, rows, False, with_queries=not grouped)
         cu = torch.tensor([0] + counts, dtype=torch.int32, device="cpu").cumsum(0).int()
         meta.cu.copy_(cu)
         meta.lengths.copy_(lengths)
@@ -363,6 +400,7 @@ class DSV41AttentionBackend(AttentionBackend):
             meta.cmp_lengths[r].copy_(lengths // r)
             meta.residual[r].copy_(lengths % r)
         self.forward_metadata = meta
+        meta.group_queries = meta.group_source = None
         meta.window.zero_()
         meta.source_rows = None
         if self.request_window is not None:
@@ -383,7 +421,8 @@ class DSV41AttentionBackend(AttentionBackend):
             floors = torch.tensor(floors_cpu, dtype=torch.int64, device=self.device)
             self.request_window.prepare(meta, counts=counts, floors=floors)
             source_counts = [
-                int(length) - prefix for length, prefix in zip(lengths, main_prefix)
+                0 if grouped and is_dummy else int(length) - prefix
+                for length, prefix, is_dummy in zip(lengths, main_prefix, dummy)
             ]
             source_rows = torch.cat(
                 [
@@ -396,6 +435,10 @@ class DSV41AttentionBackend(AttentionBackend):
             meta.source_rows = (
                 None if source_counts == counts else source_rows.to(self.device)
             )
+            if grouped and meta.source_rows is not None:
+                meta.group_source = group_cp2_dp2.PrefillSubset.from_rows(
+                    source_rows, self.device
+                )
             meta.source_cu = (
                 torch.tensor([0] + source_counts, dtype=torch.int32)
                 .cumsum(0)
@@ -424,6 +467,10 @@ class DSV41AttentionBackend(AttentionBackend):
                 .clamp(1, 128)
                 .int()
             )
+        if grouped:
+            meta.group_queries = self._group_prefill_queries(
+                meta, cu, fb.positions, role="group_prefill"
+            )
         if self.ced_enabled:
             # CPU coverage bookkeeping happens outside decode/verify capture.
             coverage = self.pool._dsv41_ced_coverage
@@ -442,7 +489,8 @@ class DSV41AttentionBackend(AttentionBackend):
         batch = fb.batch_size
         if fb.input_ids.numel() != batch or fb.positions.numel() != batch:
             raise ValueError("ordinary decode requires one input row per request")
-        meta = self._bucket(batch, batch, True)
+        grouped = group_cp2_dp2.decode_step(fb)
+        meta = self._bucket(batch, batch, True, with_queries=not grouped)
         if not hasattr(meta, "decode_requests"):
             meta.decode_requests = torch.empty(
                 batch, dtype=torch.int64, device=self.device
@@ -460,6 +508,10 @@ class DSV41AttentionBackend(AttentionBackend):
         meta.full_slots[: slots.numel()].copy_(slots)
         meta.decode_requests.copy_(fb.req_pool_indices[:batch])
         meta.starts.copy_(fb.positions)
+        if grouped:
+            self._stage_group_decode(meta, 1, "decode_group_query")
+        else:
+            meta.group_decode = meta.group_queries = None
         self.forward_metadata = meta
         # Allocator free/remap invalidates CED coverage for the new suffix.
         # As with verify, no CPU coverage readback is needed here.
@@ -503,8 +555,71 @@ class DSV41AttentionBackend(AttentionBackend):
         for ratio in (1, 2):
             meta.cmp_lengths[ratio].copy_(total // ratio)
             meta.residual[ratio].copy_(total % ratio)
-        if self.request_window is not None:
+        if meta.group_decode is not None:
+            self._prepare_group_decode(meta, requests)
+        elif self.request_window is not None:
             self.request_window.prepare(meta)
+
+    def _stage_group_decode(self, meta, width, role):
+        shape = group_cp2_dp2.DecodeRows(meta.batch, width)
+        local = self._bucket(shape.local_batch, shape.local_rows, role)
+        if not hasattr(local, "swa_pending"):
+            layers = len(self.pool.swa_layer_ids())
+            local.swa_pending = torch.empty(
+                (layers, shape.local_rows, 512),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            local.verify_requests = torch.empty(
+                shape.local_batch, dtype=torch.int64, device=self.device
+            )
+        meta.group_decode, meta.group_queries = shape, local
+        if not hasattr(meta, "verify_lanes"):
+            meta.verify_lanes = torch.arange(width, device=self.device)
+
+    def _prepare_group_decode(self, meta, requests):
+        shape, local = meta.group_decode, meta.group_queries
+        local.verify_requests.copy_(
+            shape.slice(requests, role="target_requests", per_request=True)
+        )
+        live = local.verify_requests != 0
+        local.cu.copy_(
+            torch.arange(local.batch + 1, dtype=torch.int32, device=self.device)
+            * shape.width
+        )
+        local.lengths.copy_(
+            shape.slice(meta.lengths, role="target_lengths", per_request=True)
+        ).masked_fill_(~live, 0)
+        for ratio in (1, 2):
+            local.cmp_lengths[ratio].copy_(local.lengths // ratio)
+            local.residual[ratio].copy_(local.lengths % ratio)
+        local.compressed_table.copy_(
+            shape.slice(
+                meta.compressed_table, role="target_compressed_table", per_request=True
+            )
+        )
+        if local.verify_window is None:
+            local.table.copy_(
+                shape.slice(meta.table, role="target_table", per_request=True)
+            )
+            local.swa_slots.copy_(
+                shape.slice(meta.swa_slots, role="target_slots", pad_value=-1)
+            )
+
+    def finish_group_decode(self, *, verify):
+        meta = self.forward_metadata
+        if self.request_window is None:
+            pending = meta.group_decode.gather_layers(
+                meta.group_queries.swa_pending, role="target_swa_paged"
+            )
+            for layer, values in zip(self.pool.swa_layer_ids(), pending):
+                self.position.scatter_bf16(
+                    values, meta.swa_slots, self.pool.get_swa_buffer(layer).squeeze(2)
+                )
+        elif not verify:
+            self.request_window.commit_verify(
+                meta, requests=meta.decode_requests, accepted=meta.accepted
+            )
 
     def _init_tail_metadata(self, fb, full, cu, counts, lengths):
         from sglang.srt.hardware_backend.npu.dsv41.prefill.replay import TailRows
@@ -542,7 +657,8 @@ class DSV41AttentionBackend(AttentionBackend):
         start = int(row_map_cpu[0]) if rows else 0
         contiguous = rows > 0 and int(row_map_cpu[-1]) - start + 1 == rows
         row_map = row_map_cpu.to(self.device)
-        tail = self._bucket(full.batch, rows, "tail")
+        grouped = getattr(full, "group_queries", None) is not None
+        tail = self._bucket(full.batch, rows, "tail", with_queries=not grouped)
         tail_cu = (
             torch.tensor([0] + tail_counts, dtype=torch.int32, device="cpu")
             .cumsum(0)
@@ -580,6 +696,17 @@ class DSV41AttentionBackend(AttentionBackend):
             if (value := getattr(fb, name, None)) is not None
         }
         self.tail_forward_metadata = tail
+        tail.group_queries = tail.group_selection = None
+
+        def group_queries():
+            if grouped:
+                tail.group_queries = self._group_prefill_queries(
+                    tail, tail_cu, selection.positions, role="group_tail"
+                )
+                tail.group_selection = group_cp2_dp2.PrefillSubset.from_rows(
+                    row_map_cpu, self.device
+                )
+
         if self.request_window is not None:
             floors = list(getattr(fb, "_dsv41_swa_floor", None) or [0] * fb.batch_size)
             floors.extend([0] * (full.batch - len(floors)))
@@ -598,6 +725,7 @@ class DSV41AttentionBackend(AttentionBackend):
                 (plan.positions - row_floor + 1).clamp(1, 128).int()
             )
             self.request_window.activate(full.ring_plan)
+            group_queries()
             return
         tail.table.copy_(full.table)
         selection.rows(full.swa_slots, out=tail.swa_slots)
@@ -617,6 +745,7 @@ class DSV41AttentionBackend(AttentionBackend):
             full.full_slots.cpu()[row_map_cpu],
             full.swa_slots.cpu()[row_map_cpu],
         )
+        group_queries()
 
     def enter_late_layer_tail(self, fb):
         if self._tail_saved is not None or self.tail_forward_metadata is None:
@@ -624,10 +753,25 @@ class DSV41AttentionBackend(AttentionBackend):
         full, tail = self.forward_metadata, self.tail_forward_metadata
         rows = tail.late_layer_tail
         if tail.tail_source is None and not getattr(fb, "_dsv41_ced_skip_all", False):
-            for r in (1, 2):
-                rows.rows(full.indices[r], out=tail.indices[r])
-            if full.candidates is not None:
-                rows.rows(full.candidates, out=tail.candidates)
+            if tail.group_queries is not None:
+                subset = tail.group_selection
+                for r in (1, 2):
+                    tail.group_queries.indices[r].copy_(
+                        subset.redistribute(
+                            full.group_queries.indices[r], role=("tail_indices", r)
+                        )
+                    )
+                if full.group_queries.candidates is not None:
+                    tail.group_queries.candidates.copy_(
+                        subset.redistribute(
+                            full.group_queries.candidates, role="tail_candidates"
+                        )
+                    )
+            else:
+                for r in (1, 2):
+                    rows.rows(full.indices[r], out=tail.indices[r])
+                if full.candidates is not None:
+                    rows.rows(full.candidates, out=tail.candidates)
         # Preserve the exact original objects, including optional scalar tensors.
         updates = {
             "input_ids": rows.rows(fb.input_ids),
@@ -644,7 +788,7 @@ class DSV41AttentionBackend(AttentionBackend):
             if value is not None:
                 updates[name] = tail.fb_scalars[name]
         memo = getattr(fb, "_dsv41_rope_memo", None)
-        if memo:
+        if memo and tail.group_queries is None:
             from sglang.srt.hardware_backend.npu.dsv41.attention.projections import (
                 expanded_rope,
             )
@@ -662,6 +806,8 @@ class DSV41AttentionBackend(AttentionBackend):
                 )
                 narrowed[key] = (rows.positions, selected, expanded_rope(selected))
             updates["_dsv41_rope_memo"] = narrowed
+        elif memo:
+            updates["_dsv41_rope_memo"] = {}
         saved = (full, {name: getattr(fb, name) for name in updates})
         self._tail_saved = saved
         for name, value in updates.items():
@@ -703,6 +849,19 @@ class DSV41AttentionBackend(AttentionBackend):
 
     def store_cache(self, *, layer_id, swa_k, forward_batch):
         meta = self.forward_metadata
+        if getattr(meta, "group_decode", None) is not None:
+            local = meta.group_queries
+            values = swa_k.view(-1, 512).contiguous()
+            local.swa_pending[self.pool._swa_local_layer_id(layer_id)].copy_(values)
+            if local.verify_window is None:
+                self.position.scatter_bf16(
+                    values,
+                    local.swa_slots,
+                    self.pool.get_swa_buffer(layer_id).squeeze(2),
+                )
+            return
+        if getattr(meta, "group_queries", None) is not None:
+            swa_k = group_cp2_dp2.interleave_gather(swa_k, meta.rows, role="swa")
         if meta.verify_window is not None:
             local = self.pool._swa_local_layer_id(layer_id)
             meta.swa_pending[local].copy_(swa_k.view(-1, 512))
@@ -741,16 +900,40 @@ class DSV41AttentionBackend(AttentionBackend):
         # no pending-pair payload is needed. Subsequent odd chunk/decode
         # boundaries use this request's committed pending pair.
         selected = getattr(meta, "source_rows", None)
-        source_x = x if selected is None else x.index_select(0, selected)
         starts = meta.starts if selected is None else meta.source_starts
         cu = meta.cu if selected is None else meta.source_cu
         accepted = meta.accepted if selected is None else meta.source_counts
         full_slots = meta.full_slots if selected is None else meta.source_slots
         source.state.committed_lengths[meta.requests.long()] = starts
-        kv, scores = layer.compressor.project(source_x)
+        group_decode = getattr(meta, "group_decode", None)
+        if group_decode is not None:
+            kv, scores = group_decode.gather_projection(*layer.compressor.project(x))
+        elif getattr(meta, "group_queries", None) is None:
+            source_x = x if selected is None else x.index_select(0, selected)
+            kv, scores = layer.compressor.project(source_x)
+        else:
+            subset = meta.group_source
+            kv, scores = layer.compressor.project(
+                x if subset is None else subset.select(x)
+            )
+            projection = kv if scores is None else torch.cat((kv, scores), dim=-1)
+            projection = (
+                group_cp2_dp2.interleave_gather(
+                    projection, meta.rows, role="compressor"
+                )
+                if subset is None
+                else subset.gather(projection, role="compressor")
+            )
+            if scores is None:
+                kv = projection
+            else:
+                kv, scores = projection.split((kv.shape[-1], scores.shape[-1]), dim=-1)
+        if group_decode is None:
+            kv = kv.contiguous()
+            scores = None if scores is None else scores.contiguous()
         prepared = source.prepare(
-            kv.contiguous(),
-            None if scores is None else scores.contiguous(),
+            kv,
+            scores,
             cu[: meta.batch + 1],
             meta.requests,
         )
@@ -801,7 +984,14 @@ class DSV41AttentionBackend(AttentionBackend):
         # The next layer can reuse the workspace once this attention has run.
         cache = self.pool.get_swa_buffer(layer.layer_id)
         window = full.window
-        if tail.rows != full.rows:
+        if getattr(full, "group_queries", None) is not None:
+            window, _ = group_cp2_dp2.interleave_shard(
+                tail.late_layer_tail.rows(window),
+                role="tail_source_window",
+                pad_value=1,
+            )
+            q_lora = tail.group_selection.redistribute(q_lora, role="tail_q_lora")
+        elif tail.rows != full.rows:
             rows = tail.late_layer_tail
             window = rows.rows(window)
             q_lora = rows.rows(q_lora)
@@ -823,6 +1013,7 @@ class DSV41AttentionBackend(AttentionBackend):
                     "CED late queries cannot advance source compressor state"
                 )
         if layer.indexer is not None:
+            meta = getattr(meta, "group_queries", None) or meta
             index = layer.indexer
             q, _ = index.wq_b(q_lora)
             q = q.view(-1, 32, 128).contiguous()
@@ -838,31 +1029,33 @@ class DSV41AttentionBackend(AttentionBackend):
             pool = self.pool.index_pools[r]
             local = self.pool.layer_mapping[layer.layer_id].compress_layer_id
             plan = meta.plans[layer.layer_id]
-            indices, _ = plan.run(
+            plan.run(
                 codes,
                 pool.index_k_buffer[local].view(-1, 128 // r, 128),
                 weight,
                 qscale,
                 pool.index_scale_buffer[local].view(-1, 128 // r),
                 candidates=meta.candidates if plan.mode == 2 else None,
+                out=meta.indices[r][: meta.rows, 0],
+                positions=getattr(meta, "query_positions", None),
             )
-            meta.indices[r].fill_(-1)
-            meta.indices[r][: meta.rows, 0].copy_(indices)
 
     def forward(
         self, q, k, v, layer, forward_batch, *, compress_ratio, attn_sink, **kwargs
     ):
         m = self.forward_metadata
+        source = m.tail_source
+        m = getattr(m, "group_queries", None) or m
         if q.shape[0] != m.rows:
             raise ValueError("attention Q rows must match the runtime metadata")
         if q.shape[1:] != (self.local_heads, 512):
             raise ValueError("attention Q must contain exactly the local TP heads")
         table, window = m.table, m.window
         verify_ring = None
-        source = m.tail_source
+        positions = getattr(m, "query_positions", None)
         if source is not None and layer.layer_id == source.layer_id:
             cache, table, window = source.cache, source.table, source.window
-            m.tail_source = None
+            self.forward_metadata.tail_source = None
         elif m.verify_window is not None:
             cache, verify_ring = m.verify_window.verify_inputs(
                 m, self.pool._swa_local_layer_id(layer.layer_id)
@@ -872,7 +1065,15 @@ class DSV41AttentionBackend(AttentionBackend):
         sinks = attn_sink.contiguous()
         if compress_ratio == 0:
             return m.swa(
-                q, cache, table, m.cu, m.lengths, sinks, window, verify_ring=verify_ring
+                q,
+                cache,
+                table,
+                m.cu,
+                m.lengths,
+                sinks,
+                window,
+                verify_ring=verify_ring,
+                positions=positions,
             )
         r = compress_ratio
         return m.sparse[r](
@@ -889,4 +1090,5 @@ class DSV41AttentionBackend(AttentionBackend):
             window,
             sinks,
             verify_ring=verify_ring,
+            positions=positions,
         )

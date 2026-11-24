@@ -11,6 +11,8 @@ import torch
 from sglang.srt.hardware_backend.npu.dsv41.dense_weights import enabled, prepare_weights
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
+from .. import group_cp2_dp2
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,7 +39,8 @@ class DSV41DraftBackend(AttentionBackend):
         from sglang.srt.runtime_context import get_parallel
 
         self.page_metadata = DraftPageMetadata(device=self.device)
-        self.local_heads = runner.model_config.hf_config.num_attention_heads // get_parallel().attn_tp_size
+        attn_tp = 1 if group_cp2_dp2.enabled() else get_parallel().attn_tp_size
+        self.local_heads = runner.model_config.hf_config.num_attention_heads // attn_tp
         self.capacity = runner.server_args.max_running_requests
         self.window_capacity = 256
         table_capacity = self.req_pool.req_to_token.shape[1]
@@ -63,6 +66,26 @@ class DSV41DraftBackend(AttentionBackend):
         if fb.forward_mode.is_idle():
             return
         meta = self.forward_metadata
+        self._prepare_pages(meta)
+        local = meta.group_queries
+        if local is not None:
+            shape = meta.group_decode
+            for field, per_request, pad in (
+                ("requests", True, 0),
+                ("prefix", True, 0),
+                ("full_slots", False, -1),
+            ):
+                getattr(local, field).copy_(
+                    shape.slice(
+                        getattr(meta, field),
+                        role=("draft_pages", field),
+                        per_request=per_request,
+                        pad_value=pad,
+                    )
+                )
+            self._prepare_pages(local)
+
+    def _prepare_pages(self, meta):
         batch, block = meta.batch, meta.block
         requests = meta.requests[:batch]
         self.page_metadata(
@@ -79,10 +102,10 @@ class DSV41DraftBackend(AttentionBackend):
             block=block,
         )
 
-    def _bucket(self, batch, rows):
+    def _bucket(self, batch, rows, *, local=False):
         from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import DraftAttention
 
-        key = (batch, rows)
+        key = (batch, rows, local)
         if key not in self.buckets:
 
             def empty(shape, dtype):
@@ -112,13 +135,17 @@ class DSV41DraftBackend(AttentionBackend):
             raise RuntimeError(
                 f"draft batch {batch} exceeds max_running_requests={self.capacity}"
             )
-        if batch <= 0 or rows % batch:
+        grouped = group_cp2_dp2.decode_step(fb)
+        if batch <= 0 or (not grouped and rows % batch):
             raise ValueError("DSpark draft rows must form complete per-request blocks")
-        block = rows // batch
+        block = fb.spec_info.num_tokens_per_req if grouped else rows // batch
+        if grouped:
+            # Eager MLP alignment can append one token outside the request blocks.
+            if rows not in (batch * block, batch * block + 1):
+                raise ValueError("invalid padding outside DSpark draft request blocks")
+            rows = batch * block
         if block <= 0 or block + 128 > self.window_capacity:
-            raise RuntimeError(
-                "DSpark block does not fit the 256-token draft window"
-            )
+            raise RuntimeError("DSpark block does not fit the 256-token draft window")
         # build_replay_fb_view combines padded query/request buffers with the
         # original, potentially shorter cache locations and CPU length mirror.
         raw_batch = batch - int(getattr(fb, "num_padding", 0))
@@ -139,23 +166,40 @@ class DSV41DraftBackend(AttentionBackend):
         if raw_batch:
             meta.requests[:raw_batch].copy_(fb.req_pool_indices[:raw_batch])
             meta.prefix[:raw_batch].copy_(
-                fb.positions.view(batch, block)[:raw_batch, 0]
+                fb.positions[: batch * block].view(batch, block)[:raw_batch, 0]
             )
             meta.full_slots[:real_rows].copy_(fb.out_cache_loc[:real_rows])
+        meta.group_queries = None
+        if grouped:
+            shape = group_cp2_dp2.DecodeRows(batch, block)
+            local = self._bucket(shape.local_batch, shape.local_rows, local=True)
+            local.batch, local.block = shape.local_batch, block
+            if not hasattr(local, "swa_pending"):
+                local.swa_pending = torch.empty(
+                    (len(self.runner.model.stages), shape.local_rows, 512),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+            meta.group_decode, meta.group_queries = shape, local
         self.forward_metadata = meta
 
     def get_swa_out_cache_loc(self, forward_batch):
-        return self.forward_metadata.slots
+        meta = self.forward_metadata
+        return (meta.group_queries or meta).slots
 
     def store_cache(self, *, layer_id, swa_k, forward_batch):
+        meta = self.forward_metadata
+        local = meta.group_queries
+        if local is not None:
+            local.swa_pending[self.pool._swa_local_layer_id(layer_id)].copy_(swa_k)
         self.position.scatter_bf16(
             swa_k.contiguous(),
-            self.forward_metadata.slots,
+            (local or meta).slots,
             self.pool.get_swa_buffer(layer_id).squeeze(2),
         )
 
     def forward(self, q, k, v, layer, forward_batch, *, attn_sink, **kwargs):
-        meta = self.forward_metadata
+        meta = self.forward_metadata.group_queries or self.forward_metadata
         return meta.attention(
             q,
             self.pool.get_swa_buffer(layer.layer_id),
@@ -164,6 +208,62 @@ class DSV41DraftBackend(AttentionBackend):
             meta.lengths,
             attn_sink.contiguous(),
         )
+
+    def mirror_group_swa(self, stages):
+        meta = self.forward_metadata
+        shape = meta.group_decode
+        pending = shape.gather_layers(
+            meta.group_queries.swa_pending, role="draft_swa", skip_own_output=True
+        )
+        peer = shape.peer_slice
+        slots = meta.slots[peer]
+        if not slots.numel():
+            return
+        for stage in stages:
+            layer = stage.self_attn.layer_id
+            self.position.scatter_bf16(
+                pending[self.pool._swa_local_layer_id(layer), peer],
+                slots,
+                self.pool.get_swa_buffer(layer).squeeze(2),
+            )
+
+
+def adapt_model_forward(original):
+    if not enabled():
+        return original
+
+    @wraps(original)
+    def forward(model, input_ids, positions, batch, input_embeds):
+        if input_ids.device.type != "npu" or not group_cp2_dp2.decode_step(batch):
+            return original(model, input_ids, positions, batch, input_embeds)
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        if not isinstance(backend, DSV41DraftBackend):
+            return original(model, input_ids, positions, batch, input_embeds)
+        idle = batch.forward_mode.is_idle()
+        shape = (
+            group_cp2_dp2.DecodeRows(
+                batch.batch_size, batch.spec_info.num_tokens_per_req
+            )
+            if idle
+            else backend.forward_metadata.group_decode
+        )
+        ids = shape.slice(input_ids, role="draft_ids")
+        pos = shape.slice(positions, role="draft_positions")
+        embeds = (
+            None
+            if input_embeds is None
+            else shape.slice(input_embeds, role="draft_embeds")
+        )
+        group_cp2_dp2.prepare_moe_rows(batch, ids, rows_per_request=shape.width)
+        result = original(model, ids, pos, batch, embeds)
+        if not idle:
+            backend.mirror_group_swa(model.stages)
+        result.hidden_states = shape.gather(result.hidden_states, role="draft_output")
+        return result
+
+    return forward
 
 
 def load_draft_weights(model, weights):
@@ -282,16 +382,18 @@ def adapt_inject(original_inject):
     if not enabled():
         return original_inject
 
-    def rotate(self, x, positions, *, inverse=False):
+    def rotate(self, x, positions, *, out=None):
         from sglang.srt.hardware_backend.npu.dsv41.attention.projections import (
             position_operator,
         )
 
         op = position_operator(x.device)
-        from sglang.srt.hardware_backend.npu.dsv41.attention.projections import gather_rope
+        from sglang.srt.hardware_backend.npu.dsv41.attention.projections import (
+            gather_rope,
+        )
 
         trig = gather_rope(self.freqs_cis, positions.long())
-        return op.rope(x.contiguous(), trig.cos, trig.sin, inverse=inverse)
+        return op.rope(x.contiguous(), trig.cos, trig.sin, out=out)
 
     @wraps(original_inject)
     def inject(model, *, main_hidden, swa_loc, positions, pool):
@@ -314,14 +416,45 @@ def adapt_inject(original_inject):
             raise ValueError(
                 "V4.1 draft injection requires aligned hidden, positions and SWA locations"
             )
+        shape = None
+        if group_cp2_dp2.enabled():
+            rows = main_hidden.shape[0]
+            if not rows:
+                return
+            # Prefill and verify supply the same DP-local rows to both TP lanes.
+            shape = group_cp2_dp2.DecodeRows(rows, 1)
+            main_hidden = shape.slice(main_hidden, role="inject_hidden")
+            positions = shape.slice(positions, role="inject_positions")
+
         main = model.project_target_hidden(main_hidden)
         op = position_operator(main.device)
-        for stage in model.stages:
+        pending = (
+            None
+            if shape is None
+            else main.new_empty((len(model.stages), shape.local_rows, 512))
+        )
+        slots = swa_loc.long()
+        for i, stage in enumerate(model.stages):
             layer = stage.self_attn
-            kv = rotate(layer, layer.kv_norm(layer.wkv(main)[0]), positions)
-            op.scatter_bf16(
-                kv, swa_loc.long(), pool.get_swa_buffer(layer.layer_id).squeeze(2)
+            kv = rotate(
+                layer,
+                layer.kv_norm(layer.wkv(main)[0]),
+                positions,
+                out=None if pending is None else pending[i],
             )
+            if pending is None:
+                op.scatter_bf16(
+                    kv, slots, pool.get_swa_buffer(layer.layer_id).squeeze(2)
+                )
+        if shape is not None:
+            gathered = shape.gather_layers(
+                pending, role="draft_inject", comm_role="inject"
+            )
+            for stage, kv in zip(model.stages, gathered):
+                layer = stage.self_attn
+                op.scatter_bf16(
+                    kv, slots, pool.get_swa_buffer(layer.layer_id).squeeze(2)
+                )
 
     return inject
 
@@ -333,7 +466,7 @@ def adapt_attention_init(original_attention_init):
     @wraps(original_attention_init)
     def attention_init(self, *args, **kwargs):
         original_attention_init(self, *args, **kwargs)
-        if self.is_dsv41:
+        if self.is_dsv41 and self.wo_b.parallel_group == "attn_tp":
             self.wo_b.use_dp_attention_reduce = True
 
     return attention_init
