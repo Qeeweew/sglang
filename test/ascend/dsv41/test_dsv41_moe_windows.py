@@ -7,8 +7,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.srt.hardware_backend.npu.dsv41 import moe, parallel
-from sglang.srt.runtime_context import get_forward
+from sglang.srt.hardware_backend.npu.dsv41 import group_cp2_dp2, moe, parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 
 
 @pytest.mark.parametrize(
@@ -72,6 +72,48 @@ def test_window_output_slices_and_masks(monkeypatch, rows, stride, counts, valid
         assert storage == routed.data_ptr() and offset == start
         start += size
     assert start == rows
+
+
+def test_layout_change_refreshes_mask_for_reused_ids():
+    """After CED switches to tail rows, routing follows the new IDs in the same buffer."""
+    image_id = 3
+    ids = torch.tensor([[image_id], [5]])
+    hidden = torch.zeros(2, 1)
+    counts = torch.tensor([2])
+    method = moe.ResidentMXFP4Method()
+    method.first_expert, method.e = 0, 1
+    method.routed = lambda x, mask, **kwargs: mask
+
+    def gate(x, _):
+        return x
+
+    gate.e_score_correction_bias = torch.zeros(1)
+    gate.e_score_correction_bias_vl = torch.ones(1)
+    layer = SimpleNamespace(
+        experts=SimpleNamespace(quant_method=method),
+        gate=gate,
+        config=SimpleNamespace(image_token_id=image_id),
+        _dsv41_resident_router=SimpleNamespace(
+            route=lambda *args, image_mask, **kwargs: image_mask
+        ),
+        _enable_a2a_moe=False,
+        is_hash=False,
+        routed_scaling_factor=1.0,
+        reduce_results=False,
+    )
+    batch = SimpleNamespace()
+    with (
+        patch.dict(os.environ, {"SGLANG_DSV41_910B": "1"}),
+        get_parallel().override(attn_dp_size=4),
+    ):
+        forward = moe.adapt_forward(lambda *args, **kwargs: pytest.fail("fallback"))
+        for live_ids, expected in (([image_id, 5], [1, 0]), ([5, image_id], [0, 1])):
+            ids[:, 0].copy_(torch.tensor(live_ids))
+            batch._dsv41_group_moe_rows = group_cp2_dp2.MoeRows(
+                stride=2, counts=counts, split_at_moe=False, global_input_ids=ids
+            )
+            mask = forward(layer, hidden, batch, input_ids_global=ids)
+            assert mask.tolist() == expected
 
 
 def _resident_experts(g32):
