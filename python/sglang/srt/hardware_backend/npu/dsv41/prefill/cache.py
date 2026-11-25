@@ -91,30 +91,13 @@ def adapt_checkpoint(original_checkpoint):
     @wraps(original_checkpoint)
     def checkpoint(self, req, *, up_to, **kwargs):
         pool = self.token_to_kv_pool_allocator.get_kvcache()
-        coverage = getattr(pool, "_dsv41_ced_coverage", None)
-        if coverage is not None:
+        if getattr(pool, "_dsv41_ced_coverage", None) is not None:
             req.swa_branching_seqlen = None
-            if not req.finished():
-                self.advance_unpublished_req(req)
-                return
-        elif (
-            getattr(pool, "_dsv41_910b", False)
-            and pool.request_window is not None
-            and pool.needs_paged_swa_allocator
-            and self.decoder_swa_bounded_replay
-            and not self.disable
-            and not req.finished()
+        if getattr(pool, "_dsv41_ced_coverage", None) is not None and (
+            not req.finished()
         ):
-            from .replay import CED_KEEP_TOKENS
-
-            # A canonical FULL prefix can predate draft KV injection. Keep
-            # the pages the running draft will read on its private locations.
-            prompt_end = max(req.extend_end, len(req.origin_input_ids))
-            up_to = min(up_to, max(0, prompt_end - CED_KEEP_TOKENS))
-            if up_to < req.kv.cache_protected_len + self.page_size:
-                req.swa_branching_seqlen = None
-                self.advance_unpublished_req(req)
-                return
+            self.advance_unpublished_req(req)
+            return
         return original_checkpoint(self, req, up_to=up_to, **kwargs)
 
     return checkpoint

@@ -237,60 +237,6 @@ class ReplayInputs(unittest.TestCase):
                 self.assertIs(merged_prefill(view, runner), view)
 
 
-def test_running_radix_checkpoint_keeps_request_owned_draft_window():
-    """An existing FULL prefix may lack draft SWA for a shorter request's tail."""
-    from sglang.srt.hardware_backend.npu.dsv41.prefill.cache import adapt_checkpoint
-    from sglang.srt.managers.schedule_batch import ReqKvInfo
-    from sglang.srt.mem_cache.common import checkpoint_kv_cache
-
-    page = 128
-    own_slots = torch.arange(1024) + 128
-    tree_slots = own_slots + 1024
-    req_slots = own_slots.clone()
-    pool = SimpleNamespace(
-        _dsv41_910b=True, request_window=object(), needs_paged_swa_allocator=True
-    )
-    tree = SimpleNamespace(
-        page_size=page,
-        disable=False,
-        decoder_swa_bounded_replay=True,
-        token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: pool),
-        advance_unpublished_req=lambda req: None,
-    )
-
-    def adopt_tree_slots(cache, req, *, up_to):
-        boundary = up_to // cache.page_size * cache.page_size
-        req_slots[req.kv.cache_protected_len : boundary] = tree_slots[
-            req.kv.cache_protected_len : boundary
-        ]
-        req.kv.protect_prefix(boundary)
-
-    req = SimpleNamespace(
-        origin_input_ids=range(1024),
-        skip_radix_cache_insert=False,
-        prefix_len=0,
-        extend_end=512,
-        kv=ReqKvInfo(req_pool_idx=1),
-        finished=lambda: False,
-    )
-    with patch.dict(os.environ, {"SGLANG_DSV41_910B": "1"}):
-        tree.checkpoint = MethodType(adapt_checkpoint(adopt_tree_slots), tree)
-
-    checkpoint_kv_cache(req, tree)
-    assert req.prefix_len == req.kv.cache_protected_len == 512
-    req.extend_end = 1024
-    checkpoint_kv_cache(req, tree)
-
-    assert req.prefix_len == 1024
-    assert req.kv.cache_protected_len == 768
-    torch.testing.assert_close(req_slots[:768], tree_slots[:768])
-    torch.testing.assert_close(req_slots[768:], own_slots[768:])
-
-    req.finished = lambda: True
-    tree.checkpoint(req, up_to=1024)
-    torch.testing.assert_close(req_slots, tree_slots)
-
-
 class TokenizerValidation(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

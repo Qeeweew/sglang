@@ -1025,8 +1025,19 @@ class DSV41AttentionBackend(AttentionBackend):
             index = layer.indexer
             q, _ = index.wq_b(q_lora)
             q = q.view(-1, 32, 128).contiguous()
-            # The model primes this memo on each forward, including graph capture.
-            trig = cached_rope(layer.freqs_cis, positions, forward_batch)
+            pos = positions.long()
+            if verify:
+                vmemo = getattr(forward_batch, "_dsv41_verify_rope_memo", None)
+                if vmemo is None:
+                    vmemo = {}
+                    forward_batch._dsv41_verify_rope_memo = vmemo
+                vkey = (id(layer.freqs_cis), positions.data_ptr(), positions.shape)
+                trig = vmemo.get(vkey)
+                if trig is None:
+                    trig = gather_rope(layer.freqs_cis, pos)
+                    vmemo[vkey] = trig
+            else:
+                trig = cached_rope(layer.freqs_cis, pos, forward_batch)
             codes, qscale = self.position.quantize_query(q, cos=trig.cos, sin=trig.sin)
             weight, _ = index.weights_proj(x)
             weight = (weight.float() * index.head_weight_scale).half().contiguous()

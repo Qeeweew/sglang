@@ -562,29 +562,32 @@ def adapt_forward(original):
             )
         if not hasattr(self, "_dsv41_resident_router"):
             self._dsv41_resident_router = Router(device=hidden_states.device)
-        layout = getattr(forward_batch, "_dsv41_group_moe_rows", None)
         alternate = getattr(self.gate, "e_score_correction_bias_vl", None)
         image_mask = None
         if alternate is not None and input_ids_global is not None:
-            use_layout_mask = (
-                getattr(layout, "global_input_ids", None) is input_ids_global
+            mask_key = (input_ids_global.data_ptr(), input_ids_global.numel())
+            cached_mask = (
+                getattr(forward_batch, "_dsv41_image_mask_cache", None)
+                if forward_batch is not None
+                else None
             )
-            if use_layout_mask:
-                image_mask = layout.image_mask
-            if image_mask is None:
+            if cached_mask is not None and cached_mask[0] == mask_key:
+                image_mask = cached_mask[1]
+            else:
                 image_mask = (
                     (input_ids_global.reshape(-1) == self.config.image_token_id)
                     .int()
                     .contiguous()
                 )
-                if use_layout_mask:
-                    layout.image_mask = image_mask
+                if forward_batch is not None:
+                    forward_batch._dsv41_image_mask_cache = (mask_key, image_mask)
         parallel = get_parallel()
         valid = (
             forward_batch.moe_num_token_non_padded()
             if forward_batch is not None and parallel.attn_dp_size == 1
             else None
         )
+        layout = getattr(forward_batch, "_dsv41_group_moe_rows", None)
         counts, stride = None, None
         if layout is not None:
             counts, stride = layout.counts, layout.stride
