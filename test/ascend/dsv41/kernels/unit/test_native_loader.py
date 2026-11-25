@@ -25,7 +25,7 @@ def test_loader_pins_one_resolved_version(tmp_path, monkeypatch):
     )
     configure = Mock()
     validate = Mock()
-    ops = SimpleNamespace(abi=lambda: 33, configure_jit=configure)
+    ops = SimpleNamespace(abi=lambda: 34, configure_jit=configure)
     monkeypatch.setattr(native, "_loaded_path", None)
     monkeypatch.setattr(native, "validate_jit_toolchain", validate)
     monkeypatch.setattr(native.torch.ops, "load_library", loads.append)
@@ -60,7 +60,7 @@ def test_failed_load_does_not_publish_a_version(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "abi", [12, 13, 14, 15, 16, 17, 18, 19, 23, 24, 28, 29, 30, 31, 32]
+    "abi", [12, 13, 14, 15, 16, 17, 18, 19, 23, 24, 28, 29, 30, 31, 32, 33]
 )
 def test_obsolete_native_abi_is_rejected(tmp_path, monkeypatch, abi):
     library = tmp_path / f"abi{abi}.so"

@@ -15,15 +15,16 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize(
-    "width,interleaved", [(256, False), (2304, True), (5120, False)]
+    "width,interleaved,rows",
+    [(256, False, 4096), (2304, True, 65), (5120, False, 65)],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_h32(width, interleaved, dtype):
+def test_h32(width, interleaved, rows, dtype):
     import torch_npu  # noqa: F401
 
     torch.npu.set_device(0)
     gen = torch.Generator().manual_seed(32)
-    source = torch.randint(-127, 128, (65, width), generator=gen).to(dtype)
+    source = torch.randint(-127, 128, (rows, width), generator=gen).to(dtype)
     source[0].zero_()
     matrix = torch.ones(1, 1)
     for _ in range(5):

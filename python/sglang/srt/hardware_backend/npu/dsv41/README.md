@@ -204,10 +204,11 @@ snapshots under immutable version directories. Keep the whole publication,
 not just the shared library. `DSV41_NATIVE_DIR` chooses a publication;
 `DSV41_JIT_CACHE_DIR` chooses a cache shared by the ranks on the node.
 
-Native ABI 33 adds TP2 Peer Group Gather with 8 MiB IPC regions. The library
-also exposes indexed row gather and scatter, and attention accepts a verify
-ring argument. CMake builds the host extension. The router produces
-grouped GEMM metadata on the device.
+Native ABI 34 removes the H32 quantizer's index tensor argument. The library
+also exposes TP2 Peer Group Gather with 8 MiB IPC regions (added in ABI 33)
+and indexed row gather and scatter, and attention accepts a verify ring
+argument. CMake builds the host extension. The router produces grouped GEMM
+metadata on the device.
 AICore kernels compile through DeepJIT for the model geometries actually bound.
 Prepare and warm them before Graph capture; hot calls and replay do not compile.
 Warm eager prefill and encoder replay geometries as well before measuring

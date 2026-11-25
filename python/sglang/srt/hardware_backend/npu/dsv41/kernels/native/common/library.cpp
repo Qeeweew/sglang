@@ -2,7 +2,7 @@
 #include "jit.h"
 
 TORCH_LIBRARY(dsv41, m) {
-    m.def("abi() -> int", []() -> int64_t { return 33; });
+    m.def("abi() -> int", []() -> int64_t { return 34; });
     m.def("configure_jit(str source_root, str signature, str cache_root) -> ()",
           &native_jit::configure);
     m.def("begin_prepare_batch() -> ()", &native_jit::begin_prepare_batch);
