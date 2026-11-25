@@ -270,7 +270,7 @@ def test_sum_len_compacts_idle_ranks_and_restores_collective_layout(
             torch.testing.assert_close(partial.view_as(hidden), expected)
             out.copy_(expected[local_rank])
 
-        def mlp(x, fb, *, input_ids_global, joint_shared_slice, **kwargs):
+        def mlp(x, fb, *, input_ids_global, **kwargs):
             torch.testing.assert_close(x, hidden[active].flatten(0, 1), equal_nan=True)
             assert torch.equal(input_ids_global, ids[active].flatten(0, 1))
             assert fb._dsv41_group_moe_rows.counts.tolist() == [
@@ -280,16 +280,16 @@ def test_sum_len_compacts_idle_ranks_and_restores_collective_layout(
                 assert (
                     x.data_ptr() == gather_ptr + active[0] * stride * x.element_size()
                 )
-            shared = x[joint_shared_slice]
-            torch.testing.assert_close(shared, local)
-            return (x + 2).nan_to_num(0), shared + 7 if len(shared) else None
+            return (x + 2).nan_to_num(0)
 
         topology.tp_group = SimpleNamespace(
             all_gather_into_tensor=gather, reduce_scatter_tensor=reduce_scatter
         )
         mlp.gate = None
+        mlp.shared_experts = object()
+        mlp._forward_shared_experts = lambda x: x + 7
         actual = parallel._run_group_shards(
-            SimpleNamespace(mlp=mlp), local, batch, layout, joint=True
+            SimpleNamespace(mlp=mlp), local, batch, layout
         )
         torch.testing.assert_close(actual, 2 * local + 9)
         assert calls == (["gather", "reduce_scatter"] if active else [])

@@ -191,7 +191,23 @@ class NonCudaDecoderMixin:
             fuse_all_reduce_mhc = self._can_fuse_ffn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
-            with get_forward().scoped(npu_defer_moe_post=x.device.type == "npu"):
+            from sglang.srt.hardware_backend.npu.dsv41 import mhc as _dsv41_mhc
+
+            moe_stats_ctx = (
+                _dsv41_mhc.moe_stats_scope(self.ffn_hc, residual)
+                if (
+                    x.device.type == "npu"
+                    and precomputed is None
+                    and stats_stream is None
+                    and forward_batch.dp_padding_mode is not None
+                    and forward_batch.dp_padding_mode.is_max_len()
+                )
+                else _dsv41_mhc.moe_stats_scope(self.ffn_hc, residual[:0])
+            )
+            with (
+                get_forward().scoped(npu_defer_moe_post=x.device.type == "npu"),
+                moe_stats_ctx as _moe_stats_box,
+            ):
                 y = self._run_moe_ffn_dp_sync(
                     x,
                     forward_batch,
@@ -199,6 +215,12 @@ class NonCudaDecoderMixin:
                     input_ids_global=input_ids_global,
                     return_moe_output=fuse_all_reduce_mhc,
                 )
+            if (
+                precomputed is None
+                and _moe_stats_box is not None
+                and _moe_stats_box[2] is not None
+            ):
+                precomputed = _moe_stats_box[2]
             del x
             return mhc.run_moe_post(
                 self.ffn_hc,
@@ -486,7 +508,6 @@ class NonCudaDecoderMixin:
         # release (freed on the compute stream, no record_stream deferral).
         state.pop("gather_keepalive")
 
-    @_dsv41_dp_buffers.adapt_tbo_moe
     def op_moe(self, state):
         state.global_expert_out = _tbo_run_moe(
             self, state.pop("global_hidden"), state.forward_batch, state.do_shared_local

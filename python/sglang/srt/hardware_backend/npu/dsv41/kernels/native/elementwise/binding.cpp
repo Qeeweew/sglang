@@ -62,8 +62,7 @@ void rms_norm(const at::Tensor &x, const at::Tensor &weight, const at::Tensor &o
                           ptr(x), ptr(weight), ptr(out), x.size(0), u32(x.size(1)), f32(eps));
 }
 void swiglu(const at::Tensor &gate, const at::Tensor &up, const std::optional<at::Tensor> &count,
-            const at::Tensor &out, double limit, bool packed,
-            const std::optional<at::Tensor> &shared_out = std::nullopt) {
+            const at::Tensor &out, double limit, bool packed) {
     auto device = gate.device();
     auto type = gate.scalar_type();
     check(gate, type, device);
@@ -78,21 +77,12 @@ void swiglu(const at::Tensor &gate, const at::Tensor &up, const std::optional<at
             elementwise::SwiGluLayout(elementwise::align_elements(u32(d))).bytes <=
                 arch2201::kUbBytes,
         "SwiGLU row exceeds arch22 UB capacity");
-    int64_t shared_rows = 0;
-    if (shared_out) {
-        check(up, type, device);
-        TORCH_CHECK_VALUE(up.dim() == 2 && up.size(1) == gate.size(1),
-                          "joint SwiGLU expects two packed inputs with the same width");
-        shared_rows = up.size(0);
-        check(*shared_out, type, device, {shared_rows, d});
-    } else {
-        check(up, type, device, gate.sizes());
-    }
-    const auto rows = gate.size(0) + shared_rows;
-    check(out, type, device, {gate.size(0), d});
+    check(up, type, device, gate.sizes());
+    const auto rows = gate.size(0);
+    check(out, type, device, {rows, d});
     if (count)
         check(*count, at::kInt, device, {1});
-    disjoint({out, shared_out}, {gate, up, count});
+    disjoint({out}, {gate, up, count});
     if (!rows)
         return;
     c10_npu::NPUGuard guard(device);
@@ -101,10 +91,9 @@ void swiglu(const at::Tensor &gate, const at::Tensor &up, const std::optional<at
     track(up, stream);
     track(count, stream);
     track(out, stream);
-    track(shared_out, stream);
     dsv41_swiglu_launch(stream.stream(), u32(core_count(gate.get_device())), ptr(gate), ptr(up),
                         ptr(count), ptr(out), rows, u32(d), f32(limit), packed,
-                        type == at::kHalf, shared_out.has_value(), shared_rows, ptr(shared_out));
+                        type == at::kHalf);
 }
 } // namespace
 TORCH_LIBRARY_FRAGMENT(dsv41, m) {
@@ -112,15 +101,7 @@ TORCH_LIBRARY_FRAGMENT(dsv41, m) {
           "float second_eps) -> (Tensor, Tensor)", &split_rms_norm);
     m.def("rms_norm(Tensor x, Tensor weight, Tensor(a!) out, float epsilon) -> ()", &rms_norm);
     m.def("swiglu(Tensor gate, Tensor up, Tensor? count, Tensor(a!) out, float limit, bool packed) "
-          "-> ()",
-          [](const at::Tensor &gate, const at::Tensor &up, const std::optional<at::Tensor> &count,
-             const at::Tensor &out, double limit, bool packed) { swiglu(gate, up, count, out, limit, packed); });
-    m.def("joint_swiglu(Tensor shared, Tensor routed, Tensor count, Tensor(a!) shared_out, "
-          "Tensor(b!) routed_out, float limit) -> ()",
-          [](const at::Tensor &shared, const at::Tensor &routed, const at::Tensor &count,
-             const at::Tensor &shared_out, const at::Tensor &routed_out, double limit) {
-              swiglu(routed, shared, count, routed_out, limit, true, shared_out);
-          });
+          "-> ()", &swiglu);
     m.def("prepare_rms_norm(Tensor x, Tensor weight, Tensor out, float epsilon) -> ()",
           [](const at::Tensor &x, const at::Tensor &weight, const at::Tensor &out, double eps) {
               native_jit::PrepareOnlyScope prepare;

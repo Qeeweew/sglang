@@ -14,6 +14,41 @@ from sglang.srt.hardware_backend.npu.dsv41.kernels.config import V41
 
 logger = logging.getLogger(__name__)
 _prefill_fusions = ContextVar("dsv41_prefill_fusions", default=None)
+_pending_moe_stats = ContextVar("dsv41_pending_moe_stats", default=None)
+
+
+@contextmanager
+def moe_stats_scope(hc, residual):
+    """Allow the MoE auxiliary stream to compute mHC stats during PeerMoE/Routed MoE."""
+    if not _supported(hc.cfg, residual) or residual.shape[0] <= 0:
+        yield None
+        return
+    box = [hc, residual, None]
+    token = _pending_moe_stats.set(box)
+    try:
+        yield box
+    finally:
+        _pending_moe_stats.reset(token)
+
+
+def has_pending_moe_stats():
+    box = _pending_moe_stats.get()
+    return box is not None and box[2] is None
+
+
+def compute_pending_moe_stats(main_stream):
+    """Run pending MoE mHC stats on the current (auxiliary) stream."""
+    box = _pending_moe_stats.get()
+    if box is None or box[2] is not None:
+        return
+    hc, residual, _ = box
+    _validate_config(hc.cfg)
+    aux_stream = torch.npu.current_stream(residual.device)
+    residual.record_stream(aux_stream)
+    triplet = tuple(operator().stats(residual.contiguous(), hc.fn, hc.scale, hc.base))
+    for tensor in triplet:
+        tensor.record_stream(main_stream)
+    box[2] = triplet
 
 
 @contextmanager

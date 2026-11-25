@@ -14,17 +14,6 @@ def npu_peer_all_reduce(input, output, handle):
     return output
 
 
-def npu_peer_moe_gather(input, output, handle):
-    """Gather owned token shards into compact EP8 ``[DP*rows,5120]`` order.
-
-    The handle fixes attention TP2 (DP4, 1..128 local rows) or TP1 (DP8,
-    1..64 local rows). BF16 local input is [rows,5120]; ranks are ordered
-    DP0/TP0, DP0/TP1, DP1/TP0, ... . Odd TP2 padding is omitted.
-    """
-    handle.gather(input, output)
-    return output
-
-
 def npu_peer_group_gather(
     input, output, handle, *, other=None, other_output=None, skip_own_output=False
 ):

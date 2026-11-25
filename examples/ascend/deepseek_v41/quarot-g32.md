@@ -9,25 +9,20 @@ MTP/DSpark retains its original weights and quantization. Attention, Engram
 and the residual stream retain their original basis. Target conversion reads
 weights only; evaluation prompts never participate in fitting.
 
-### Joint shared/routed execution
+### Shared/routed execution and overlap
 
-With EP8 sequence-parallel dispatch, the first collective still gathers BF16
-tokens. Each receiving rank quantizes the gathered token matrix **once**.
-The local shared expert takes its owner slice, and route gather copies the
-same INT8 codes and FP32 token scales into expert order. Router precision,
-checkpoint layout, on-device weight storage and MTP are unchanged.
+With EP8 sequence-parallel dispatch, the first collective uses default HCCL
+`all_gather_into_tensor` to gather BF16 tokens. On fixed-size decode/verify
+batches (`SGLANG_OPT_DSV41_NPU_MOE_OVERLAP=1`, default), the local shared
+expert (`_forward_shared_experts`) and pending MoE `mhc_stats` run on an
+auxiliary NPU stream concurrently with HCCL gather and routed experts, then
+join before `PeerMoE.finish` / reduce-scatter.
 
-Shared W8A8 and routed G32 gate/up are separate GEMMs returning BF16. A single
-clipped SwiGLU launch reads their two packed inputs directly (no concatenation)
-and writes `[owned shared rows, live routed rows]` as BF16. A **separate** H32
-launch quantizes that prefix, retaining one scale per row. Both operators read
-the live routed count on device, including replay when no local expert fires.
-The down GEMMs take slices of the resulting codes/scales. Routed down returns
-BF16 for weighted combine. Shared down writes BF16 directly at the model boundary.
-Only routed output is weighted and combined; shared is added once on its owner.
-For both G32 and source MXFP4, the EP8 serving transport leaves shared for
-this joint stage even with unequal DP segments or peer communication disabled.
-An idle DP with a nonempty global batch still computes its local routed experts.
+On the main stream, routed G32 experts quantize the gathered BF16 tokens via
+`h32_quant`, gather INT8 codes and FP32 scales in expert order, run G32
+gate/up (`BF16`), prefix clipped SwiGLU (`BF16`), prefix `h32_quant`, and
+G32 down (`BF16`), reading the live routed row count on device without host
+synchronization. Shared is added once on its owner at the return boundary.
 
 ### Checkpoint format
 

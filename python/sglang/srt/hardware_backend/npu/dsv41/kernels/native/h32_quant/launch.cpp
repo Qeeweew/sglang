@@ -19,9 +19,9 @@ native_jit::Kernel &entry(uint32_t workers, uint32_t width, bool bf16, bool inte
 
 void launch(void *stream, uint32_t workers, uint32_t width, bool bf16, bool interleaved,
             uint8_t *input, uint8_t *indices, uint8_t *codes, uint8_t *scales, int64_t rows,
-            uint8_t *count, int64_t shared_rows) {
+            uint8_t *count) {
     entry(workers, width, bf16, interleaved)
-        .launch_persistent(stream, rows, input, indices, codes, scales, rows, count, shared_rows);
+        .launch_persistent(stream, rows, input, indices, codes, scales, rows, count);
 }
 TORCH_LIBRARY_FRAGMENT(dsv41, m) {
     m.def("precompile_h32_quant(int width, bool bf16, bool interleaved) -> ()",

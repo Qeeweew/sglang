@@ -11,58 +11,6 @@ import numpy as np
 import pytest
 
 
-@pytest.mark.skipif(os.getenv("SGLANG_DSV41_TEST_NPU") != "1", reason="opt-in 910B")
-@pytest.mark.parametrize(
-    "shared_rows,capacity", [(0, 7), (3, 0), (1, 6), (3, 150), (155, 193)]
-)
-def test_fp16_joint_graph(shared_rows, capacity):
-    import torch
-    import torch_npu  # noqa: F401
-    from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.elementwise import (
-        PackedClippedSwiGLU,
-    )
-    from sglang.srt.hardware_backend.npu.dsv41.kernels.runtime.native import (
-        load_library,
-    )
-
-    torch.npu.set_device(0)
-    joint = load_library().joint_swiglu
-    width = 2304
-    split = PackedClippedSwiGLU(dimension=width, dtype="f16")
-    stream = torch.npu.Stream()
-    with torch.npu.stream(stream):
-        generator = torch.Generator().manual_seed(19)
-        shared, routed = [
-            (torch.randn(rows, 2 * width, generator=generator) * 8).half().npu()
-            for rows in (shared_rows, capacity)
-        ]
-        shared_out = shared.new_empty((shared_rows, width))
-        routed_out = routed.new_empty((capacity, width))
-        count = torch.tensor([capacity], dtype=torch.int32, device="npu")
-
-        def run_joint():
-            joint(shared, routed, count, shared_out, routed_out, 10.0)
-
-        run_joint()
-        stream.synchronize()
-        graph = torch.npu.NPUGraph()
-        with torch.npu.graph(graph, stream=stream, auto_dispatch_capture=True):
-            run_joint()
-        for live in (0, capacity // 2, capacity):
-            shared.neg_()
-            routed.neg_()
-            shared_out.fill_(-123)
-            routed_out.fill_(-123)
-            count.fill_(live)
-            graph.replay()
-            if shared_rows:
-                torch.testing.assert_close(shared_out, split(shared), atol=0, rtol=0)
-            if live:
-                torch.testing.assert_close(
-                    routed_out[:live], split(routed[:live]), atol=0, rtol=0
-                )
-            assert (routed_out[live:] == -123).all().item()
-
 
 def run(args):
     from sglang.srt.hardware_backend.npu.dsv41.kernels.runtime.health import (

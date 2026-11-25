@@ -211,15 +211,19 @@ class GenerationBatchResult:
                     self.logits_output.input_token_logprobs
                 )
             if self.logits_output.next_token_top_logprobs_val is not None:
-                self.logits_output.next_token_top_logprobs_val = [
-                    _async_d2h(v) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_top_logprobs_val
-                ]
+                top_val = self.logits_output.next_token_top_logprobs_val
+                self.logits_output.next_token_top_logprobs_val = (
+                    _async_d2h(top_val)
+                    if torch.is_tensor(top_val)
+                    else [_async_d2h(v) if torch.is_tensor(v) else v for v in top_val]
+                )
             if self.logits_output.next_token_top_logprobs_idx is not None:
-                self.logits_output.next_token_top_logprobs_idx = [
-                    _async_d2h(x) if torch.is_tensor(x) else x
-                    for x in self.logits_output.next_token_top_logprobs_idx
-                ]
+                top_idx = self.logits_output.next_token_top_logprobs_idx
+                self.logits_output.next_token_top_logprobs_idx = (
+                    _async_d2h(top_idx)
+                    if torch.is_tensor(top_idx)
+                    else [_async_d2h(x) if torch.is_tensor(x) else x for x in top_idx]
+                )
             if self.logits_output.next_token_token_ids_logprobs_val is not None:
                 self.logits_output.next_token_token_ids_logprobs_val = [
                     _async_d2h(v) if torch.is_tensor(v) else v

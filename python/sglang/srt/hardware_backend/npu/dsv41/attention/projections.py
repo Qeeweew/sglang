@@ -16,17 +16,34 @@ from sglang.srt.hardware_backend.npu.dsv41.kernels.config import V41
 logger = logging.getLogger(__name__)
 
 
+def _padded_rope_tables(freqs_cis):
+    cached = getattr(freqs_cis, "_dsv41_cos_sin_padded", None)
+    if cached is not None:
+        return cached
+    if freqs_cis.device.type == "npu" and torch.npu.is_current_stream_capturing():
+        raise RuntimeError("warm padded RoPE table before Graph capture")
+    table = torch.view_as_real(freqs_cis).flatten(-2)
+    limit = table.shape[0]
+    half = table.shape[1] // 2
+    cos = torch.cat((table[:, 0::2], table.new_ones((1, half))), dim=0).contiguous()
+    sin = torch.cat((table[:, 1::2], table.new_zeros((1, half))), dim=0).contiguous()
+    cached = (cos, sin, limit)
+    freqs_cis._dsv41_cos_sin_padded = cached
+    return cached
+
+
 def gather_rope(freqs_cis, positions):
     """Gather from CUDA's compact complex64 table without full-length copies."""
     from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.position_quant import (
         RopeTables,
     )
 
-    table = torch.view_as_real(freqs_cis).flatten(-2)
-    valid = (positions >= 0) & (positions < table.shape[0])
-    rows = table.index_select(0, positions.clamp(0, table.shape[0] - 1))
-    cos = torch.where(valid[:, None], rows[:, 0::2], 1.0).contiguous()
-    sin = torch.where(valid[:, None], rows[:, 1::2], 0.0).contiguous()
+    cos_pad, sin_pad, limit = _padded_rope_tables(freqs_cis)
+    pos = positions.long()
+    valid = (pos >= 0) & (pos < limit)
+    idx = torch.where(valid, pos, limit)
+    cos = cos_pad.index_select(0, idx)
+    sin = sin_pad.index_select(0, idx)
     return RopeTables(cos, sin, valid.int(), None)
 
 

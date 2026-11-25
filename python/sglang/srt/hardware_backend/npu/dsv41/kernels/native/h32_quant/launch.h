@@ -7,5 +7,5 @@ constexpr bool valid_width(int64_t width) {
 }
 void launch(void *stream, uint32_t workers, uint32_t width, bool bf16, bool interleaved,
             uint8_t *input, uint8_t *indices, uint8_t *codes, uint8_t *scales, int64_t rows,
-            uint8_t *count, int64_t shared_rows);
+            uint8_t *count);
 } // namespace h32_quant

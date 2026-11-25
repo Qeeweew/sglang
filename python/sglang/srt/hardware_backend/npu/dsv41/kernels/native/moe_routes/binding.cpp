@@ -7,8 +7,7 @@ namespace {
 namespace route_metadata = grouped_metadata;
 void gather_rows(const at::Tensor &x, const at::Tensor &order, const at::Tensor &metadata,
             const at::Tensor &sorted, const at::Tensor &inverse, int64_t topk,
-            const std::optional<at::Tensor> &scales, const std::optional<at::Tensor> &sorted_scales,
-            const std::optional<at::Tensor> &shared = {}, int64_t first = 0) {
+            const std::optional<at::Tensor> &scales, const std::optional<at::Tensor> &sorted_scales) {
     const auto device = x.device();
     check(x, scales ? at::kChar : at::kBFloat16, device);
     TORCH_CHECK_VALUE(x.dim() == 2 && topk > 0, "invalid route gather shape");
@@ -30,12 +29,7 @@ void gather_rows(const at::Tensor &x, const at::Tensor &order, const at::Tensor 
         check(*scales, at::kFloat, device, {x.size(0)});
         check(*sorted_scales, at::kFloat, device, {sorted.size(0)});
     }
-    if (shared) {
-        check(*shared, at::kHalf, device);
-        TORCH_CHECK_VALUE(!scales && shared->dim() == 2 && shared->size(1) == x.size(1) &&
-                          first >= 0 && first <= x.size(0) - shared->size(0), "invalid shared owner slice");
-    }
-    disjoint({sorted, inverse, sorted_scales, shared}, {x, order, metadata, scales});
+    disjoint({sorted, inverse, sorted_scales}, {x, order, metadata, scales});
     if (!x.size(0))
         return;
 
@@ -52,15 +46,13 @@ void gather_rows(const at::Tensor &x, const at::Tensor &order, const at::Tensor 
                               ptr(sorted), ptr(sorted_scales), ptr(inverse), sorted.size(0), x.size(1), topk);
         return;
     }
-    track(shared, stream);
     dsv41_route_gather(stream.stream(), blocks, x.data_ptr(), order.data_ptr(), metadata.data_ptr(),
                        sorted.data_ptr(), inverse.data_ptr(), x.size(0), x.size(1), topk,
-                       sorted.size(0), ptr(shared), first, shared ? shared->size(0) : 0);
+                       sorted.size(0));
 }
 void gather(const at::Tensor &x, const at::Tensor &order, const at::Tensor &metadata,
-            const at::Tensor &sorted, const at::Tensor &inverse, int64_t topk,
-            const std::optional<at::Tensor> &shared, int64_t first) {
-    gather_rows(x, order, metadata, sorted, inverse, topk, {}, {}, shared, first);
+            const at::Tensor &sorted, const at::Tensor &inverse, int64_t topk) {
+    gather_rows(x, order, metadata, sorted, inverse, topk, {}, {});
 }
 void combine(const at::Tensor &values, const at::Tensor &inverse, const at::Tensor &ids,
              const at::Tensor &weights, const at::Tensor &output) {
@@ -96,12 +88,11 @@ TORCH_LIBRARY_FRAGMENT(dsv41, m) {
               gather_rows(x, order, metadata, sorted, inverse, topk, scales, sorted_scales);
           });
     m.def("prepare_route_gather(Tensor x, Tensor order, Tensor metadata, Tensor sorted, Tensor "
-          "inverse, int topk, Tensor? shared=None, int first=0) -> ()",
+          "inverse, int topk) -> ()",
           [](const at::Tensor &x, const at::Tensor &order, const at::Tensor &metadata,
-             const at::Tensor &sorted, const at::Tensor &inverse, int64_t topk,
-             const std::optional<at::Tensor> &shared, int64_t first) {
+             const at::Tensor &sorted, const at::Tensor &inverse, int64_t topk) {
               native_jit::PrepareOnlyScope prepare;
-              gather(x, order, metadata, sorted, inverse, topk, shared, first);
+              gather(x, order, metadata, sorted, inverse, topk);
           });
     m.def("prepare_route_combine(Tensor values, Tensor inverse, Tensor ids, Tensor weights, Tensor "
           "output) -> ()",
@@ -111,7 +102,7 @@ TORCH_LIBRARY_FRAGMENT(dsv41, m) {
               combine(values, inverse, ids, weights, output);
           });
     m.def("route_gather(Tensor x, Tensor order, Tensor metadata, Tensor(a!) sorted, Tensor(b!) "
-          "inverse, int topk, Tensor(c!)? shared=None, int first=0) -> ()",
+          "inverse, int topk) -> ()",
           &gather);
     m.def("route_combine(Tensor values, Tensor inverse, Tensor ids, Tensor weights, Tensor(a!) "
           "output) -> ()",

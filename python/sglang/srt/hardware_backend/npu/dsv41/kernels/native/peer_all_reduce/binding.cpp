@@ -21,7 +21,7 @@ class PeerCommunicator : public torch::CustomClassHolder {
         TORCH_CHECK(local_ && table_.defined(), "peer communicator is not connected");
     }
     void rows(int64_t count) const {
-        TORCH_CHECK(count > 0 && count <= (world_ == 2 ? 128 : 64 * attention_tp_),
+        TORCH_CHECK(count > 0 && count <= (world_ == 2 ? 128 : 128 * attention_tp_),
                     "peer communication exceeds its local row capacity");
     }
     void matrix(const at::Tensor &x, int64_t n, at::ScalarType dtype = at::kBFloat16) const {
@@ -141,21 +141,6 @@ class PeerCommunicator : public torch::CustomClassHolder {
         launch_peer_all_reduce(current.stream(), input.data_ptr(), output.data_ptr(), local_,
                                peers_[1 - rank_], table_.data_ptr(), input.numel());
     }
-    void gather(const at::Tensor &input, const at::Tensor &output) {
-        connected();
-        TORCH_CHECK(world_ == 8 && input.dim() == 2, "expected EP8 matrix");
-        rows(input.size(0));
-        matrix(input, input.size(0));
-        matrix(output, (8 / attention_tp_) * input.size(0));
-        disjoint({output}, {input});
-        c10_npu::NPUGuard guard(device());
-        auto current = stream();
-        record(input, current);
-        record(output, current);
-        launch_peer_moe(current.stream(), input.data_ptr(), nullptr, nullptr, nullptr, nullptr,
-                        output.data_ptr(), local_, table_.data_ptr(), rank_, input.size(0), 0, true,
-                        false, attention_tp_);
-    }
     void group_gather(const at::Tensor &in_a, const OptionalTensor &in_b, const at::Tensor &out_a,
                       const OptionalTensor &out_b, int64_t valid_rows, bool skip_own_output) {
         connected();
@@ -215,7 +200,7 @@ class PeerCommunicator : public torch::CustomClassHolder {
         record(output, current);
         launch_peer_moe(current.stream(), partial.data_ptr(), nullptr, nullptr, nullptr,
                         ptr(shared), output.data_ptr(), local_, table_.data_ptr(), rank_, n, 0,
-                        false, false, attention_tp_);
+                        false, attention_tp_);
     }
     void finalize_return(const at::Tensor &values, const at::Tensor &inverse, const at::Tensor &ids,
                          const at::Tensor &weights, const OptionalTensor &shared,
@@ -235,7 +220,7 @@ class PeerCommunicator : public torch::CustomClassHolder {
         track(shared, current);
         launch_peer_moe(current.stream(), values.data_ptr(), inverse.data_ptr(), ids.data_ptr(),
                         weights.data_ptr(), ptr(shared), output.data_ptr(), local_,
-                        table_.data_ptr(), rank_, n, topk, false, true, attention_tp_, values.scalar_type() == at::kBFloat16);
+                        table_.data_ptr(), rank_, n, topk, true, attention_tp_, values.scalar_type() == at::kBFloat16);
     }
     void post(const at::Tensor &input, const at::Tensor &residual, const at::Tensor &pre,
               const at::Tensor &post_mix, const at::Tensor &comb, const OptionalTensor &weight,
@@ -313,7 +298,6 @@ TORCH_LIBRARY_FRAGMENT(dsv41, m) {
         .def("allow", &PeerCommunicator::allow)
         .def("connect", &PeerCommunicator::connect)
         .def("reduce", &PeerCommunicator::reduce)
-        .def("gather", &PeerCommunicator::gather)
         .def("group_gather", &PeerCommunicator::group_gather)
         .def("return_sum", &PeerCommunicator::return_sum)
         .def("finalize_return", &PeerCommunicator::finalize_return)

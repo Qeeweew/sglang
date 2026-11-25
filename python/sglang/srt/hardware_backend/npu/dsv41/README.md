@@ -100,18 +100,13 @@ Engram backing details, and checkpoint read timings.
 
 With the source checkpoint, target/draft dense and shared expert weights use W8A16 G256. Checkpoint FP8
 weights are converted to INT8 at load time, then repacked with raw FP16
-scales into N16 layout. Dense layers and the model boundary stay BF16. For the
-legacy target's TP1 shared expert, EP dispatch and the router still consume
-BF16. After routing, one local gather writes both the owned shared inputs and
-the expert-major routed inputs as FP16. Both gate/up projections output FP16;
-one clipped SwiGLU computes both in FP32 and stores FP16 directly into the two
-down inputs. Shared W8A16 down writes BF16 directly from its FP32 accumulator,
-whereas routed MXFP4 down writes FP16 for FP32 weighted combine. The peer wire
-format is unchanged. Source MXFP4 and G32 target experts use the same EP8
-schedule: transport does not run shared before gather. Fixed-size shards and
-unequal DP segments both pass their owner rows to the joint SwiGLU, and add
-shared only after the routed sum returns. Source MXFP4 experts use FP16
-activations for both target and draft projections.
+scales into N16 layout. Dense layers and the model boundary stay BF16. MoE EP8 input gather uses
+default HCCL `all_gather_into_tensor`, while the local shared expert and
+pending MoE `mhc_stats` run independently on an auxiliary NPU stream during
+decode/verify (`SGLANG_OPT_DSV41_NPU_MOE_OVERLAP=1`, default) and join before
+the 40-worker `PeerMoE` return/mHC boundary. Source MXFP4 routed experts use
+FP16 activations for both target and draft projections and write FP16 for
+FP32 weighted combine; shared is added once on its owner at the return boundary.
 
 The G32 checkpoint instead selects signed INT4 × INT8 grouped GEMM for the
 target experts without any environment switch. Both shared and routed target

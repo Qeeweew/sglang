@@ -9,6 +9,7 @@ on the compute stream, so serial layers can explicitly reuse these buffers.
 from contextvars import ContextVar
 from dataclasses import replace
 from functools import cache, wraps
+import os
 
 import torch
 
@@ -48,17 +49,15 @@ def row_buffer(role, device, stream, width, dtype=torch.bfloat16):
     return RowBuffer(device, width, dtype)
 
 
-def adapt_shared_before_gather(original):
-    if not enabled():
-        return original
+@cache
+def _moe_aux_stream(device):
+    if torch.npu.is_current_stream_capturing():
+        raise RuntimeError("warm MoE auxiliary stream before Graph capture")
+    return torch.npu.Stream(device=device)
 
-    @wraps(original)
-    def before_gather(mlp):
-        from .joint_experts import can_join
 
-        return original(mlp) and not can_join(mlp)
-
-    return before_gather
+def _moe_overlap_enabled():
+    return os.environ.get("SGLANG_OPT_DSV41_NPU_MOE_OVERLAP", "1") != "0"
 
 
 def adapt_run(original):
@@ -73,7 +72,6 @@ def adapt_run(original):
             shared_expert_runs_locally,
         )
         from sglang.srt.runtime_context import get_forward, get_parallel
-        from .joint_experts import can_join
 
         if (
             layer.config.model_type != "deepseek_v41"
@@ -87,7 +85,6 @@ def adapt_run(original):
                 and not deepseek_v4.is_cp_active(forward_batch)
                 and moe_sequence_parallel_enabled(get_parallel())
             ):
-                joint = can_join(layer.mlp)
                 layout = getattr(forward_batch, "_dsv41_group_moe_rows", None)
                 if layout is not None:
                     if layout.split_at_moe:
@@ -107,7 +104,6 @@ def adapt_run(original):
                                 shard,
                                 forward_batch,
                                 layout,
-                                joint=joint,
                                 input_ids=ids,
                             )
                         return group_cp2_dp2.interleave_gather(
@@ -119,20 +115,14 @@ def adapt_run(original):
                         forward_batch,
                         layout,
                         input_ids=kwargs.get("input_ids"),
-                        joint=joint,
                     )
-                if _use_moe_sequence_parallel(
-                    get_parallel(), forward_batch, joint
-                ) and (
-                    joint
-                    or getattr(layer.mlp, "shared_experts", None) is None
+                if _use_moe_sequence_parallel(get_parallel(), forward_batch) and (
+                    getattr(layer.mlp, "shared_experts", None) is None
                     or shared_expert_runs_locally(layer.mlp)
                 ):
                     return _run_sequence_parallel(
-                        layer, hidden_states, forward_batch, joint=joint, **kwargs
+                        layer, hidden_states, forward_batch, **kwargs
                     )
-                if joint:
-                    return _run_dp_joint(layer, hidden_states, forward_batch, **kwargs)
             return original(layer, hidden_states, forward_batch, **kwargs)
         finally:
             _in_moe.reset(token)
@@ -175,7 +165,7 @@ def moe_sequence_parallel_enabled(parallel):
     )
 
 
-def _use_moe_sequence_parallel(parallel, batch, joint):
+def _use_moe_sequence_parallel(parallel, batch):
     from sglang.srt.environ import envs
 
     from .peer_collectives import enabled as peer_enabled
@@ -186,89 +176,9 @@ def _use_moe_sequence_parallel(parallel, batch, joint):
         and (
             parallel.attn_tp_size == 2
             or peer_enabled()
-            or (joint and envs.SGLANG_DP_USE_REDUCE_SCATTER.get())
+            or envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
         )
     )
-
-
-def _joint_dp_rows(mlp, gathered, batch, rows, input_ids, input_ids_global):
-    from sglang.srt.layers.dp_attention import dp_slot_in, get_dp_global_num_tokens
-
-    counts = get_dp_global_num_tokens()
-    slot = dp_slot_in(counts)
-    if counts[slot] != rows or sum(counts) != gathered.shape[0]:
-        raise ValueError("joint MoE owner rows disagree with the DP gather layout")
-    if not gathered.shape[0]:
-        return gathered, None
-    first = sum(counts[:slot])
-    return mlp(
-        gathered,
-        batch,
-        input_ids=input_ids,
-        input_ids_global=input_ids_global,
-        skip_shared_experts=True,
-        joint_shared_slice=slice(first, first + rows),
-    )
-
-
-def _run_dp_joint(
-    layer,
-    local,
-    batch,
-    *,
-    input_ids=None,
-    input_ids_global=None,
-    return_moe_output=False,
-):
-    """Use the DP transport's published row layout, including unequal and idle DPs."""
-    from sglang.srt.layers.moe.utils import post_experts_all_reduce
-    from sglang.srt.models.deepseek_common.moe_transport import MoeRowTransport
-
-    transport = MoeRowTransport(layer.mlp, local, batch, input_ids, input_ids_global)
-    with transport.scope():
-        routed, shared = _joint_dp_rows(
-            layer.mlp,
-            transport.input,
-            batch,
-            local.shape[0],
-            transport.input_ids,
-            transport.input_ids_global,
-        )
-        if not routed.shape[0]:
-            return torch.empty_like(local)
-        if not transport.mlp_reduce_scatter and layer.mlp.reduce_results:
-            routed = post_experts_all_reduce(routed)
-    output = transport.return_output(routed)
-    return output + shared if shared is not None else output
-
-
-def adapt_tbo_moe(original):
-    if not enabled():
-        return original
-
-    @wraps(original)
-    def run(layer, state):
-        from sglang.srt.runtime_context import get_forward
-
-        from .joint_experts import can_join
-
-        if not can_join(layer.mlp):
-            return original(layer, state)
-        if state.pop("shared_local") is not None:
-            raise RuntimeError("shared target expert ran before the TBO gather")
-        batch = state.forward_batch
-        ids = batch._tbo_global_input_ids
-        with get_forward().scoped(mlp_reduce_scatter=True):
-            state.global_expert_out, state.shared_local = _joint_dp_rows(
-                layer.mlp,
-                state.pop("global_hidden"),
-                batch,
-                batch.tbo_padded_len,
-                ids,
-                ids,
-            )
-
-    return run
 
 
 def _workspace(role, x, rows):
@@ -295,10 +205,9 @@ def moe_routing_metadata(hidden, experts):
     ).get(1)[0]
 
 
-def _run_gathered_experts(mlp, gathered, batch, input_ids, global_ids, owner, peer):
+def _run_gathered_experts(mlp, gathered, batch, input_ids, global_ids, peer):
     from sglang.srt.runtime_context import get_forward
 
-    joint_args = {} if owner is None else {"joint_shared_slice": owner}
     with get_forward().scoped(
         mlp_reduce_scatter=True, npu_defer_route_combine=peer is not None
     ):
@@ -309,7 +218,6 @@ def _run_gathered_experts(mlp, gathered, batch, input_ids, global_ids, owner, pe
             input_ids_global=global_ids,
             skip_shared_experts=True,
             return_moe_output=False,
-            **joint_args,
         )
 
 
@@ -320,7 +228,41 @@ def _reduce_scatter(group, output, partial, shared, owned_rows):
         output[:owned_rows].add_(shared)
 
 
-def _run_compacted_group_shards(mlp, gathered, batch, layout, input_ids, owner, active):
+def _prepare_aux_overlap(shared_input, *, can_overlap, has_shared):
+    from . import mhc as _dsv41_mhc
+
+    overlap_shared = can_overlap and has_shared
+    overlap_stats = can_overlap and _dsv41_mhc.has_pending_moe_stats()
+    if not (overlap_shared or overlap_stats):
+        return None
+    main_stream = torch.npu.current_stream(shared_input.device)
+    aux_stream = _moe_aux_stream(shared_input.device)
+    ev_fork = torch.npu.Event()
+    ev_fork.record(main_stream)
+    aux_stream.wait_event(ev_fork)
+    if overlap_shared:
+        shared_input.record_stream(aux_stream)
+    return main_stream, aux_stream, overlap_shared, overlap_stats
+
+
+def _launch_aux_overlap(plan, layer, shared_input):
+    from . import mhc as _dsv41_mhc
+
+    main_stream, aux_stream, overlap_shared, overlap_stats = plan
+    shared = None
+    with torch.npu.stream(aux_stream):
+        if overlap_shared:
+            shared = layer.mlp._forward_shared_experts(shared_input)
+            if shared is not None:
+                shared.record_stream(main_stream)
+        if overlap_stats:
+            _dsv41_mhc.compute_pending_moe_stats(main_stream)
+        aux_done = torch.npu.Event()
+        aux_done.record(aux_stream)
+    return shared, aux_done
+
+
+def _run_compacted_group_shards(mlp, gathered, batch, layout, input_ids, active):
     stride = layout.stride
     begin, end = active[0] * stride, (active[-1] + 1) * stride
     contiguous = end - begin == len(active) * stride
@@ -343,27 +285,15 @@ def _run_compacted_group_shards(mlp, gathered, batch, layout, input_ids, owner, 
                 global_ids[dst].copy_(ids[src])
         counts = torch.cat([layout.counts[rank : rank + 1] for rank in active])
 
-    active_owner = None
-    if owner is not None:
-        owner_rank = owner.start // stride
-        if owner_rank in active:
-            start = active.index(owner_rank) * stride
-            active_owner = slice(start, start + owner.stop - owner.start)
-        else:
-            active_owner = slice(0, 0)
-
     batch._dsv41_group_moe_rows = replace(
         layout, counts=counts, global_input_ids=global_ids
     )
     try:
         partial = _run_gathered_experts(
-            mlp, hidden, batch, input_ids, global_ids, active_owner, None
+            mlp, hidden, batch, input_ids, global_ids, None
         )
     finally:
         batch._dsv41_group_moe_rows = layout
-    shared = None
-    if owner is not None:
-        partial, shared = partial
 
     # Gathered inputs have been consumed on this stream. Reuse their storage
     # for the full reduce-scatter layout, including zeroes for idle ranks.
@@ -380,7 +310,7 @@ def _run_compacted_group_shards(mlp, gathered, batch, layout, input_ids, owner, 
                 index += 1
             else:
                 block.zero_()
-    return gathered, shared
+    return gathered
 
 
 def _run_group_shards(
@@ -390,9 +320,8 @@ def _run_group_shards(
     layout,
     *,
     input_ids=None,
-    joint=False,
 ):
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.runtime_context import get_forward, get_parallel
 
     from .peer_collectives import moe_communicator
 
@@ -425,10 +354,28 @@ def _run_group_shards(
         if batch.dp_padding_mode.is_max_len()
         else None
     )
-    if peer is None:
-        tp_group.all_gather_into_tensor(gathered, shard)
-    else:
-        peer.gather(shard, gathered)
+    has_shared = (
+        rows > 0
+        and (active is None or parallel.tp_rank in active)
+        and getattr(layer.mlp, "shared_experts", None) is not None
+    )
+    can_overlap = (
+        _moe_overlap_enabled()
+        and local.device.type == "npu"
+        and batch.dp_padding_mode.is_max_len()
+        and active is None
+        and not get_forward().multi_stream
+    )
+    aux_plan = _prepare_aux_overlap(
+        local, can_overlap=can_overlap, has_shared=has_shared
+    )
+
+    tp_group.all_gather_into_tensor(gathered, shard)
+
+    shared = None
+    aux_done = None
+    if aux_plan is not None:
+        shared, aux_done = _launch_aux_overlap(aux_plan, layer, local)
 
     if (
         layout.global_input_ids is None
@@ -444,29 +391,18 @@ def _run_group_shards(
         tp_group.all_gather_into_tensor(global_ids, ids_shard)
         layout.global_input_ids = global_ids
 
-    shared = None
-    owner = None
-    if joint:
-        start = parallel.tp_rank * stride
-        owner = slice(start, start + rows)
-    elif (
-        rows
-        and (active is None or parallel.tp_rank in active)
-        and getattr(layer.mlp, "shared_experts", None) is not None
-    ):
+    if has_shared and (aux_plan is None or not aux_plan[2]):
         shared = layer.mlp._forward_shared_experts(local)
     if active is not None:
-        partial, joint_shared = _run_compacted_group_shards(
-            layer.mlp, gathered, batch, layout, input_ids, owner, active
+        partial = _run_compacted_group_shards(
+            layer.mlp, gathered, batch, layout, input_ids, active
         )
-        if joint:
-            shared = joint_shared
     else:
         partial = _run_gathered_experts(
-            layer.mlp, gathered, batch, input_ids, layout.global_input_ids, owner, peer
+            layer.mlp, gathered, batch, input_ids, layout.global_input_ids, peer
         )
-        if joint:
-            partial, shared = partial
+    if aux_done is not None:
+        aux_plan[0].wait_event(aux_done)
     if peer is not None:
         return peer.finish(partial, shared, stride)
     output = local.new_empty((stride, local.shape[1]))
@@ -482,10 +418,9 @@ def _run_sequence_parallel(
     input_ids=None,
     input_ids_global=None,
     return_moe_output=False,
-    joint=False,
 ):
     from sglang.srt.layers.dp_attention import _DpGatheredBufferWrapper as geometry
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.runtime_context import get_forward, get_parallel
 
     parallel = get_parallel()
     rows = geometry.get_local_dp_buffer_len()
@@ -509,25 +444,28 @@ def _run_sequence_parallel(
     owned_rows = max(0, min(shard_rows, rows - start))
     shard = local if tp == 1 else local.narrow(0, min(start, rows), owned_rows)
     shard_input = shard
-    if owned_rows != shard_rows and peer is None:
+    if owned_rows != shard_rows:
         shard_input = _workspace("moe_sp_padded_input", local, shard_rows)
         if owned_rows:
             shard_input[:owned_rows].copy_(shard)
         shard_input[owned_rows:].zero_()
-    shared = None
-    if (
-        not joint
-        and owned_rows
-        and getattr(layer.mlp, "shared_experts", None) is not None
-    ):
-        shared = layer.mlp._forward_shared_experts(shard)
+
+    has_shared = (
+        owned_rows > 0 and getattr(layer.mlp, "shared_experts", None) is not None
+    )
+    can_overlap = (
+        _moe_overlap_enabled()
+        and local.device.type == "npu"
+        and not get_forward().multi_stream
+    )
+    aux_plan = _prepare_aux_overlap(
+        shard, can_overlap=can_overlap, has_shared=has_shared
+    )
 
     # Rank order is DP0/TP0, DP0/TP1, DP1/TP0, ...; concatenating
     # these halves preserves the original global DP token order.
     gathered = _workspace("gather", local, global_rows)
-    if peer is not None:
-        peer.gather(local, gathered)
-    elif padded_rows == rows:
+    if padded_rows == rows:
         parallel.tp_group.all_gather_into_tensor(gathered, shard_input)
     else:
         # HCCL requires equal payloads. Compact the communication-only holes
@@ -539,15 +477,19 @@ def _run_sequence_parallel(
         gathered.view(parallel.attn_dp_size, rows, -1).copy_(
             padded_gather.view(parallel.attn_dp_size, padded_rows, -1)[:, :rows]
         )
-    owner = None
-    if joint:
-        first = parallel.attn_dp_rank * rows + min(start, rows)
-        owner = slice(first, first + owned_rows)
+
+    shared = None
+    aux_done = None
+    if aux_plan is not None:
+        shared, aux_done = _launch_aux_overlap(aux_plan, layer, shard)
+    elif has_shared:
+        shared = layer.mlp._forward_shared_experts(shard)
+
     partial = _run_gathered_experts(
-        layer.mlp, gathered, batch, input_ids, input_ids_global, owner, peer
+        layer.mlp, gathered, batch, input_ids, input_ids_global, peer
     )
-    if joint:
-        partial, shared = partial
+    if aux_done is not None:
+        aux_plan[0].wait_event(aux_done)
     if peer is not None:
         return peer.finish(partial, shared, rows)
     if padded_rows != rows:

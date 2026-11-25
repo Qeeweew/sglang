@@ -7,7 +7,6 @@ import torch
 import torch.distributed as dist
 
 from sglang.kernels.ops.communication.npu_peer_collectives import (
-    npu_peer_moe_gather,
     npu_peer_moe_return,
     npu_peer_post,
 )
@@ -74,9 +73,6 @@ def benchmark_ep8(comm2, pair_group, device, rank, iterations, attention_tp=2):
                 )
 
         record = {"rows": rows}
-        record["gather_peer_us"] = time_op(
-            lambda: npu_peer_moe_gather(local, gathered, comm.handle)
-        )
         record["gather_hccl_us"] = time_op(hccl_gather)
         partial = torch.zeros_like(gathered)
         padded_partial = torch.zeros_like(padded_gather)

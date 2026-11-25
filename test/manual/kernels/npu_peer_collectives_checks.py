@@ -7,7 +7,6 @@ import torch
 import torch.distributed as dist
 
 from sglang.kernels.ops.communication.npu_peer_collectives import (
-    npu_peer_moe_gather,
     npu_peer_moe_return,
     npu_peer_post,
 )
@@ -68,19 +67,10 @@ def validate_ep8(comm2, device, rank, stress, attention_tp=2):
             exact(normalized, en.cpu())
 
     for rows in [1, 3, 5, 6, 10, 12, 20, 24, 40, 48] + (
-        [80, 96, 127, 128] if tp == 2 else [63, 64]
+        [80, 96, 127, 128] if tp == 2 else [63, 64, 96, 128]
     ):
         base_input = torch.arange(rows * 5120).reshape(rows, 5120) % 97 / 32
         source = (base_input + rank // tp).bfloat16()
-        expected = torch.cat([(base_input + d).bfloat16() for d in range(dp)])
-        guard = torch.full(
-            (dp * rows * 5120 + 32,), 123, dtype=torch.bfloat16, device=device
-        )
-        gathered = guard[16:-16].view(dp * rows, 5120)
-        npu_peer_moe_gather(source.to(device), gathered, comm.handle)
-        exact(gathered, expected)
-        exact(guard[:16], torch.full((16,), 123, dtype=torch.bfloat16))
-        exact(guard[-16:], torch.full((16,), 123, dtype=torch.bfloat16))
         base = (
             (torch.arange(dp * rows * 5120).reshape(dp * rows, 5120) % 17 - 8) / 32
         ).bfloat16()
@@ -119,7 +109,7 @@ def validate_ep8(comm2, device, rank, stress, attention_tp=2):
                 comm2.handle,
             )
     print(
-        f"rank {rank}: EP8 TP{tp} gather/owner SUM/shared and applicable attention mHC passed",
+        f"rank {rank}: EP8 TP{tp} owner SUM/shared and applicable attention mHC passed",
         flush=True,
     )
 
@@ -144,20 +134,17 @@ def validate_ep8(comm2, device, rank, stress, attention_tp=2):
         npu_peer_moe_return(partial, out, comm.handle)
         exact(out, total.bfloat16())
 
-    invalid_rows = 64 * tp + 1
-    bad = torch.empty((invalid_rows, 5120), dtype=torch.bfloat16, device=device)
-    bad_out = torch.empty(
-        (dp * invalid_rows, 5120), dtype=torch.bfloat16, device=device
-    )
+    invalid_rows = 128 * tp + 1
+    bad = torch.empty((dp * invalid_rows, 5120), dtype=torch.bfloat16, device=device)
+    bad_out = torch.empty((invalid_rows, 5120), dtype=torch.bfloat16, device=device)
     try:
-        npu_peer_moe_gather(bad, bad_out, comm.handle)
+        npu_peer_moe_return(bad, bad_out, comm.handle)
     except (ValueError, RuntimeError):
         pass
     else:
         raise AssertionError("out-of-capacity EP8 input was accepted")
     alias = torch.empty((dp, 5120), dtype=torch.bfloat16, device=device)
     for op in [
-        lambda: npu_peer_moe_gather(alias[:1], alias, comm.handle),
         lambda: npu_peer_moe_return(alias, alias[:1], comm.handle),
     ]:
         try:
@@ -228,36 +215,25 @@ def validate_ep8(comm2, device, rank, stress, attention_tp=2):
 
     graphs = []
     stream = torch.npu.Stream()
-    for rows in [5, 48 if tp == 1 else 96]:
+    for rows in [5, 96]:
         local = torch.zeros((rows, 5120), dtype=torch.bfloat16, device=device)
         partial = torch.zeros((dp * rows, 5120), dtype=torch.bfloat16, device=device)
-        gathered, returned = torch.empty_like(partial), torch.empty_like(local)
+        returned = torch.empty_like(local)
         torch.npu.synchronize()
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph, stream=stream, auto_dispatch_capture=True):
-            npu_peer_moe_gather(local, gathered, comm.handle)
             npu_peer_moe_return(partial, returned, comm.handle)
-        graphs.append((graph, local, partial, gathered, returned))
+        graphs.append((graph, partial, returned))
     snapshots = []
     for phase in range(max(64, stress // 2)):
-        graph, local, partial, gathered, returned = graphs[phase % 2]
-        local.fill_(phase % 8 + rank // tp)
+        graph, partial, returned = graphs[phase % 2]
         partial.fill_(phase % 8 + rank / 8)
         graph.replay()
         if phase % 17 == 0:
-            snapshots.append((phase, gathered.clone(), returned.clone()))
+            snapshots.append((phase, returned.clone()))
     torch.npu.synchronize()
-    for phase, gathered, returned in snapshots:
+    for phase, returned in snapshots:
         rows = returned.shape[0]
-        exact(
-            gathered,
-            torch.cat(
-                [
-                    torch.full((rows, 5120), phase % 8 + d, dtype=torch.bfloat16)
-                    for d in range(dp)
-                ]
-            ),
-        )
         exact(
             returned,
             torch.full((rows, 5120), 8 * (phase % 8) + 3.5, dtype=torch.bfloat16),

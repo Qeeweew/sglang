@@ -26,7 +26,6 @@ register_kernel(
 
 for _fn in (
     "npu_peer_group_gather",
-    "npu_peer_moe_gather",
     "npu_peer_moe_return",
     "npu_peer_post",
 ):

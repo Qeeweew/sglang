@@ -3,7 +3,7 @@
 import torch
 
 
-def h32_quant(x, interleaved, *, count=None, shared_rows=0):
+def h32_quant(x, interleaved, *, count=None):
     from sglang.srt.hardware_backend.npu.dsv41.kernels.runtime.native import (
         load_library,
     )
@@ -26,6 +26,6 @@ def h32_quant(x, interleaved, *, count=None, shared_rows=0):
     codes = x.new_empty((rows, width), dtype=torch.int8)
     scale = x.new_empty(rows, dtype=torch.float32)
     load_library().h32_quant(
-        x.contiguous(), perm, codes, scale, interleaved, count, shared_rows
+        x.contiguous(), perm, codes, scale, interleaved, count
     )
     return codes, scale

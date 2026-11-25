@@ -4,8 +4,7 @@
 namespace h32_quant {
 using namespace native_host;
 void run(const at::Tensor &input, const at::Tensor &indices, const at::Tensor &codes,
-         const at::Tensor &scales, bool interleaved, const std::optional<at::Tensor> &count,
-         int64_t shared_rows) {
+         const at::Tensor &scales, bool interleaved, const std::optional<at::Tensor> &count) {
     const auto device = input.device();
     TORCH_CHECK_VALUE(input.dim() == 2 && (input.scalar_type() == at::kHalf ||
                                            input.scalar_type() == at::kBFloat16),
@@ -18,8 +17,6 @@ void run(const at::Tensor &input, const at::Tensor &indices, const at::Tensor &c
     check(scales, at::kFloat, device, {rows});
     if (count)
         check(*count, at::kInt, device, {1});
-    TORCH_CHECK_VALUE(shared_rows >= 0 && shared_rows <= rows && (!shared_rows || count),
-                      "invalid shared prefix");
     disjoint({codes, scales}, {input, indices, count});
     if (!rows)
         return;
@@ -31,11 +28,11 @@ void run(const at::Tensor &input, const at::Tensor &indices, const at::Tensor &c
     const uint64_t workers = core_count(device.index());
     const bool bf16 = input.scalar_type() == at::kBFloat16;
     launch(stream.stream(), workers, width, bf16, interleaved, ptr(input), ptr(indices), ptr(codes),
-           ptr(scales), rows, ptr(count), shared_rows);
+           ptr(scales), rows, ptr(count));
 }
 TORCH_LIBRARY_FRAGMENT(dsv41, m) {
     m.def("h32_quant(Tensor input, Tensor indices, Tensor(a!) codes, Tensor(b!) scales, bool "
-          "interleaved, Tensor? count=None, int shared_rows=0) -> ()",
+          "interleaved, Tensor? count=None) -> ()",
           &run);
 }
 } // namespace h32_quant

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from functools import cache, wraps
+from typing import NamedTuple
 
 import torch
 
@@ -44,13 +45,22 @@ def _expert_projections(experts, hidden, width, device, g32):
     )
 
 
+class G32Projections(NamedTuple):
+    gate_up: object
+    down: object
+    gate_up_weight: tuple[torch.Tensor, ...]
+    down_weight: tuple[torch.Tensor, ...]
+
+
 @cache
-def activation(width, *, prefix=True):
+def activation(width, *, limit=10.0, dtype="f16", prefix=True):
     from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.elementwise import (
         PackedClippedSwiGLU,
     )
 
-    return PackedClippedSwiGLU(dimension=width, dtype="f16", prefix=prefix)
+    return PackedClippedSwiGLU(
+        dimension=width, limit=limit, dtype=dtype, prefix=prefix
+    )
 
 
 class ExpertScratch:
@@ -302,8 +312,6 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
             self.e, self.h, self.i, torch.npu.current_device(), self.g32
         )
         if self.g32:
-            from .joint_experts import G32Projections
-
             return G32Projections(up, down, gate_up_weight, down_weight)
         from .kernels.ops import MXFP4LocalExperts
 
@@ -313,7 +321,7 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
             gate_up_weight,
             down_weight,
             limit=self.limit,
-            activation_op=activation(self.i),
+            activation_op=activation(self.i, limit=self.limit),
         )
 
     def process_weights_after_loading(self, layer):
@@ -358,36 +366,21 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
         # count on device, while the arena reserves the worst case.
         return arena, arena.get(slots, reserve=window_budget * routing.ids.shape[1])
 
-    def prepare_routed(
-        self, x, routing, *, shared_input=None, first=0, window_budget=0
-    ):
+    def prepare_routed(self, x, routing, *, window_budget=0):
         arena, (sorted_x, inverse, gate_up, activated, values) = self.routed_storage(
             x, routing, torch.float16, window_budget=window_budget
         )
         rows = sorted_x.shape[0]
-        if rows or (shared_input is not None and shared_input.shape[0]):
-            self.routes.gather(
-                x,
-                routing,
-                out=sorted_x,
-                inverse=inverse,
-                shared=shared_input,
-                first=first,
-            )
+        if rows:
+            self.routes.gather(x, routing, out=sorted_x, inverse=inverse)
         if not rows:
             return inverse, gate_up, activated, values, None
         bound = x.shape[0]
         mean = rows / (self.e * self.ep)
-        projections_only = shared_input is not None
-        key = (routing.metadata.data_ptr(), rows, bound, projections_only)
+        key = (routing.metadata.data_ptr(), rows, bound)
         previous_key, invoke = arena.bindings.get(self.local_experts, (None, None))
         if previous_key != key:
-            bind = (
-                self.local_experts.bind_projections
-                if projections_only
-                else self.local_experts.bind
-            )
-            invoke = bind(
+            invoke = self.local_experts.bind(
                 sorted_x,
                 routing.metadata,
                 gate_up=gate_up,
@@ -404,9 +397,57 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
             arena.graph_bindings[self.local_experts, key] = invoke
         return inverse, gate_up, activated, values, invoke
 
+    def _routed_g32(self, x, routing, *, out=None, window_budget=0):
+        from .kernels.ops.h32_quant import h32_quant
+
+        _, (storage, inverse, gate_up, mid, values) = self.routed_storage(
+            x, routing, torch.bfloat16, window_budget=window_budget
+        )
+        rows = gate_up.shape[0]
+        metadata = routing.metadata
+        if rows:
+            quantized, scales = h32_quant(x, False)
+            sorted_codes = (
+                storage.view(torch.int8).flatten()[: rows * self.h].view(rows, self.h)
+            )
+            sorted_scales = scales.new_empty(rows)
+            self.routes.library.route_gather_a8(
+                quantized,
+                routing.order,
+                metadata,
+                sorted_codes,
+                inverse,
+                routing.ids.shape[1],
+                scales,
+                sorted_scales,
+            )
+            projections = self.local_experts
+            projections.gate_up.from_quantized(
+                sorted_codes,
+                sorted_scales,
+                projections.gate_up_weight,
+                metadata,
+                out=gate_up,
+            )
+            count = metadata[1:2]
+            activation(self.i, limit=self.limit, dtype="bf16", prefix=True)(
+                gate_up, out=mid, rows=count
+            )
+            codes, scale = h32_quant(mid, True, count=count)
+            projections.down.from_quantized(
+                codes,
+                scale,
+                projections.down_weight,
+                metadata,
+                out=values,
+            )
+        return self.finish_routed(values, inverse, routing, out=out)
+
     def routed(self, x, routing, *, out=None, window_budget=0):
         if x.shape[0] == 0:
             return torch.empty_like(x)
+        if self.g32:
+            return self._routed_g32(x, routing, out=out, window_budget=window_budget)
         inverse, _, _, values, invoke = self.prepare_routed(
             x, routing, window_budget=window_budget
         )
@@ -424,14 +465,14 @@ class ResidentMXFP4Method(FusedMoEMethodBase):
         return self.routes.combine(values, inverse, routing, out=out)
 
 
-def _run_expert_windows(hidden, run, *, counts, stride, valid, image_mask, owned):
+def _run_expert_windows(hidden, run, *, counts, stride, valid, image_mask):
     from sglang.srt.runtime_context import get_forward
 
     from .parallel import moe_routed_output
 
     rows = hidden.shape[0]
     if rows <= NO_SYNC_PREFILL_TOKENS:
-        return run(hidden, counts, stride, valid, image_mask, owned)
+        return run(hidden, counts, stride, valid, image_mask)
     if get_forward().npu_defer_route_combine:
         raise ValueError("windowed MoE requires immediate route combine")
 
@@ -445,12 +486,6 @@ def _run_expert_windows(hidden, run, *, counts, stride, valid, image_mask, owned
             budget = (budget // stride) * stride
 
     routed = moe_routed_output(hidden)
-    shared = None
-    if owned is not None:
-        s0, s1, step = owned.indices(rows)
-        if step != 1:
-            raise ValueError("shared owner rows must be contiguous")
-
     for chunk in range(0, rows, chunk_rows):
         chunk_end = min(chunk + chunk_rows, rows)
         for start in range(chunk, chunk_end, budget):
@@ -471,31 +506,16 @@ def _run_expert_windows(hidden, run, *, counts, stride, valid, image_mask, owned
             elif valid is not None:
                 win_valid = (valid - start).clamp(0, stop - start)
 
-            win_owned = None
-            if owned is not None:
-                first = max(s0, start)
-                end = min(s1, stop)
-                win_owned = (
-                    slice(first - start, end - start) if first < end else slice(0, 0)
-                )
-            _, win_shared = run(
+            run(
                 hidden[start:stop],
                 win_counts,
                 win_stride,
                 win_valid,
                 image_mask[start:stop] if image_mask is not None else None,
-                win_owned,
                 out=routed[start:stop],
                 window_budget=budget,
             )
-            if win_shared is not None:
-                if win_shared.shape[0] == s1 - s0:
-                    shared = win_shared
-                else:
-                    if shared is None:
-                        shared = win_shared.new_empty((s1 - s0, hidden.shape[1]))
-                    shared[first - s0 : end - s0].copy_(win_shared)
-    return routed, shared
+    return routed
 
 
 def adapt_forward(original):
@@ -513,7 +533,6 @@ def adapt_forward(original):
         skip_shared_experts=False,
         return_moe_output=False,
         leave_output_sum=False,
-        joint_shared_slice=None,
     ):
         from sglang.srt.layers.moe.utils import post_experts_all_reduce
         from sglang.srt.models.deepseek_v2 import MoEOutput
@@ -534,7 +553,6 @@ def adapt_forward(original):
         from sglang.srt.hardware_backend.npu.dsv41.kernels.ops import Router
         from sglang.srt.runtime_context import get_parallel
 
-        from .joint_experts import can_join, run_joint_experts
         from .parallel import moe_routing_metadata
         from .peer_collectives import RoutedOutput
 
@@ -547,11 +565,22 @@ def adapt_forward(original):
         alternate = getattr(self.gate, "e_score_correction_bias_vl", None)
         image_mask = None
         if alternate is not None and input_ids_global is not None:
-            image_mask = (
-                (input_ids_global.reshape(-1) == self.config.image_token_id)
-                .int()
-                .contiguous()
+            mask_key = (input_ids_global.data_ptr(), input_ids_global.numel())
+            cached_mask = (
+                getattr(forward_batch, "_dsv41_image_mask_cache", None)
+                if forward_batch is not None
+                else None
             )
+            if cached_mask is not None and cached_mask[0] == mask_key:
+                image_mask = cached_mask[1]
+            else:
+                image_mask = (
+                    (input_ids_global.reshape(-1) == self.config.image_token_id)
+                    .int()
+                    .contiguous()
+                )
+                if forward_batch is not None:
+                    forward_batch._dsv41_image_mask_cache = (mask_key, image_mask)
         parallel = get_parallel()
         valid = (
             forward_batch.moe_num_token_non_padded()
@@ -576,15 +605,9 @@ def adapt_forward(original):
             raise ValueError(
                 f"resident TP MoE DP chunks: stride={stride}, ranks={counts.numel()}, rows={rows}"
             )
-        joint_local = not skip_shared_experts and can_join(self) and rows > 0
-        owned = joint_shared_slice
-        if owned is None:
-            owned = slice(None) if joint_local else slice(0, 0) if method.g32 else None
         metadata = moe_routing_metadata(hidden_states, method.e)
 
-        def run_window(
-            x, counts, stride, valid, mask, owned, *, out=None, window_budget=0
-        ):
+        def run_window(x, counts, stride, valid, mask, *, out=None, window_budget=0):
             routing = self._dsv41_resident_router.route(
                 self.gate(x, gemm_output_zero_allocator).float(),
                 self.gate.e_score_correction_bias,
@@ -598,38 +621,25 @@ def adapt_forward(original):
                 image_mask=mask,
                 metadata_out=metadata,
             )
-            if owned is not None and x.shape[0]:
-                return run_joint_experts(
-                    method,
-                    getattr(self, "shared_experts", None),
-                    x,
-                    routing,
-                    owned,
-                    out=out,
-                    window_budget=window_budget,
-                )
-            return method.routed(x, routing, out=out, window_budget=window_budget), None
+            return method.routed(x, routing, out=out, window_budget=window_budget)
 
-        routed, shared = _run_expert_windows(
+        routed = _run_expert_windows(
             hidden_states,
             run_window,
             counts=counts,
             stride=stride,
             valid=valid.reshape(1) if valid is not None else None,
             image_mask=image_mask,
-            owned=owned,
         )
-        if joint_shared_slice is not None and rows:
-            return routed, shared
         if isinstance(routed, RoutedOutput):
             if not skip_shared_experts or return_moe_output or leave_output_sum:
                 raise ValueError(
                     "deferred native route combine requires the SP return boundary"
                 )
             return routed
+        shared = None
         if (
-            not joint_local
-            and not skip_shared_experts
+            not skip_shared_experts
             and hasattr(self, "shared_experts")
             and hidden_states.shape[0]
         ):

@@ -6,11 +6,14 @@ namespace peer_moe {
 namespace p = peer_all_reduce;
 namespace s = peer_protocol;
 // Attention TP is a finite layout choice; protocol and exported capacity are
-// identical for DP4/TP2 and DP8/TP1 (at most 512 global token rows).
+// identical for DP4/TP2 and DP8/TP1 (at most 1024 global token rows).
 #ifndef PEER_ATTN_TP
 #define PEER_ATTN_TP 2
 #endif
-constexpr uint32_t H = 5120, T = p::kMoeTile, TP = PEER_ATTN_TP, DP = 8 / TP;
+#ifndef PEER_MOE_WORKERS
+#define PEER_MOE_WORKERS peer_all_reduce::kMoeReturnWorkers
+#endif
+constexpr uint32_t H = 5120, T = p::kMoeTile, TP = PEER_ATTN_TP, DP = 8 / TP, W = PEER_MOE_WORKERS;
 static_assert(TP == 1 || TP == 2);
 struct View {
     GM_ADDR local;
@@ -20,7 +23,7 @@ struct View {
     __aicore__ View(GM_ADDR l, GM_ADDR peers, uint32_t r, uint32_t n)
         : local(l), table(peers), rank(r), rows(n), shard_rows((n + TP - 1) / TP),
           owned(n - r % TP * shard_rows < shard_rows ? n - r % TP * shard_rows : shard_rows),
-          epoch(s::begin(l, peers, 8)) {}
+          epoch(s::begin(l, peers, 8, nullptr, W)) {}
     __aicore__ uint32_t first_row(uint32_t r) const {
         return r / TP * rows + r % TP * shard_rows;
     }
@@ -45,43 +48,12 @@ struct View {
         s::publish(s::signal(local, kind, AscendC::GetBlockIdx()), epoch);
     }
     __aicore__ void all_ready(uint32_t kind) const {
-        s::aggregate(local, kind, epoch);
+        s::aggregate(local, kind, epoch, W);
     }
     __aicore__ void finish() const {
-        s::finish(local, epoch);
+        s::finish(local, epoch, W);
     }
 };
-
-// Fixed whole-token address ownership survives odd rows and shape changes.
-__aicore__ inline void gather(const View &v, GM_ADDR input, GM_ADDR output) {
-    auto raw = reinterpret_cast<__ubuf__ bfloat16_t *>(uint64_t(0));
-    const uint32_t channel = AscendC::GetBlockIdx(), stride = p::kWorkers * T;
-    auto x = reinterpret_cast<__gm__ bfloat16_t *>(input) + (v.rank % TP) * v.shard_rows * H;
-    const uint32_t destination = v.first_row(v.rank) * H;
-    for (uint32_t offset = channel * T; offset < v.owned * H; offset += stride) {
-        asc_copy_gm2ub(raw, x + offset, T * 2);
-        native_device::pipe_fence<PIPE_MTE2, PIPE_MTE3, EVENT_ID0>();
-        // Push the owned row directly into every destination's compact gather
-        // plane. Rotate destinations to avoid synchronized many-to-one bursts.
-        for (uint32_t step = 0; step < 8; ++step)
-            asc_copy_ub2gm(v.payload((v.rank + step) % 8) + destination + offset, raw, T * 2);
-        s::stored();
-    }
-    v.ready(1);
-    for (uint32_t rank = 0; rank < 8; ++rank) {
-        s::await(s::signal(v.region(rank), 1, channel), v.epoch);
-        native_device::pipe_fence<PIPE_S, PIPE_MTE2, EVENT_ID0>();
-        const uint32_t count = v.owned_rows(rank);
-        auto out = reinterpret_cast<__gm__ bfloat16_t *>(output) + v.first_row(rank) * H;
-        for (uint32_t offset = channel * T; offset < count * H; offset += stride) {
-            const uint32_t source = v.first_row(rank) * H;
-            asc_copy_gm2ub(raw, v.payload(v.rank) + source + offset, T * 2);
-            native_device::pipe_fence<PIPE_MTE2, PIPE_MTE3, EVENT_ID0>();
-            asc_copy_ub2gm(out + offset, raw, T * 2);
-            s::stored();
-        }
-    }
-}
 
 template <bool Finalize>
 __aicore__ inline void publish_partial(const View &v, GM_ADDR input, GM_ADDR inverse, GM_ADDR ids,
@@ -90,7 +62,7 @@ __aicore__ inline void publish_partial(const View &v, GM_ADDR input, GM_ADDR inv
     auto packed = reinterpret_cast<__ubuf__ bfloat16_t *>(uint64_t(2 * T));
     auto fp = reinterpret_cast<__ubuf__ float *>(uint64_t(4 * T));
     auto sum = reinterpret_cast<__ubuf__ float *>(uint64_t(8 * T));
-    const uint32_t stride = p::kWorkers * T;
+    const uint32_t stride = W * T;
     for (uint32_t offset = AscendC::GetBlockIdx() * T; offset < DP * v.rows * H; offset += stride) {
         if constexpr (Finalize) {
             const uint32_t row = offset / H, col = offset % H;
@@ -134,9 +106,9 @@ __aicore__ inline void reduce_owned(const View &v, GM_ADDR shared) {
     auto raw = reinterpret_cast<__ubuf__ bfloat16_t *>(uint64_t(0));
     auto fp = reinterpret_cast<__ubuf__ float *>(uint64_t((TP == 1 ? 16 : 4) * T));
     auto sum = reinterpret_cast<__ubuf__ float *>(uint64_t((TP == 1 ? 20 : 8) * T));
-    const uint32_t channel = AscendC::GetBlockIdx(), stride = p::kWorkers * T;
+    const uint32_t channel = AscendC::GetBlockIdx(), stride = W * T;
     const uint32_t first = v.first_row(v.rank) * H;
-    const uint32_t source_channel = (first / T + channel) % p::kWorkers;
+    const uint32_t source_channel = (first / T + channel) % W;
     for (uint32_t rank = 0; rank < 8; ++rank)
         s::await(s::signal(v.region(rank), 1, source_channel), v.epoch);
     native_device::pipe_fence<PIPE_S, PIPE_MTE2, EVENT_ID0>();
@@ -203,7 +175,7 @@ __aicore__ inline void restore(const View &v, GM_ADDR output) {
         native_device::pipe_fence<PIPE_S, PIPE_MTE2, EVENT_ID0>();
         const uint32_t count = v.owned_rows(rank);
         auto out = reinterpret_cast<__gm__ bfloat16_t *>(output) + rank % TP * v.shard_rows * H;
-        for (uint32_t offset = channel * T; offset < count * H; offset += p::kWorkers * T) {
+        for (uint32_t offset = channel * T; offset < count * H; offset += W * T) {
             asc_copy_gm2ub(raw, v.returned(rank) + offset, T * 2);
             native_device::pipe_fence<PIPE_MTE2, PIPE_MTE3, EVENT_ID0>();
             asc_copy_ub2gm(out + offset, raw, T * 2);

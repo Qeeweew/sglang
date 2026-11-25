@@ -10,8 +10,8 @@ void launch_peer_group_gather(void *stream, void *in_a, void *in_b, void *out_a,
 void prepare_peer_moe(uint32_t attention_tp);
 void launch_peer_moe(void *stream, void *input, void *inverse, void *ids, void *weights,
                      void *shared, void *output, void *local, void *table, uint32_t rank,
-                     uint32_t rows, uint32_t topk, bool gather, bool finalize,
-                     uint32_t attention_tp, bool routed_bf16 = false);
+                     uint32_t rows, uint32_t topk, bool finalize, uint32_t attention_tp,
+                     bool routed_bf16 = false);
 void prepare_peer_mhc(uint32_t world, uint32_t attention_tp);
 void launch_peer_mhc(void *stream, void *input, void *residual, void *pre, void *post, void *comb,
                      void *weight, void *updated, void *output, void *local, void *table,

@@ -112,6 +112,8 @@ def get_top_logprobs_raw(
     top_logprobs_idx = []
 
     if stage == LogprobStage.DECODE:
+        if no_copy_to_cpu and top_logprobs_nums and all(k == max_k for k in top_logprobs_nums):
+            return values.contiguous(), indices.contiguous()
         for i, k in enumerate(top_logprobs_nums):
             top_logprobs_val.append(values[i][:k])
             top_logprobs_idx.append(indices[i][:k])
@@ -414,6 +416,60 @@ def compute_spec_logprobs(
         gathered_logits = next_token_logits
         accepted_token_ids = predict
 
+    spec_cache = getattr(next_token_logits, "_dsv41_spec_logprob_cache", None)
+    if spec_cache is not None:
+        delattr(next_token_logits, "_dsv41_spec_logprob_cache")
+
+    want_top_logprobs = bool(
+        batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums)
+    )
+    want_token_ids_logprobs = bool(
+        batch.token_ids_logprobs
+        and any(x is not None for x in batch.token_ids_logprobs)
+    )
+    use_cached = (
+        spec_cache is not None
+        and accept_index is None
+        and not want_token_ids_logprobs
+        and not (
+            batch.sampling_info.is_all_greedy
+            or envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get()
+        )
+        and spec_cache[0] is batch.sampling_info.temperatures
+        and (
+            not want_top_logprobs
+            or max(batch.top_logprobs_nums) <= spec_cache[3].shape[-1]
+        )
+    )
+    if use_cached:
+        _, expanded_temperature, unmasked_topk_scaled, topk_indices, full_lse = spec_cache
+        min_val = torch.finfo(unmasked_topk_scaled.dtype).min
+        lse_col = full_lse.unsqueeze(-1)
+        selected_logits = gathered_logits.gather(
+            1, accepted_token_ids.long().view(-1, 1)
+        )
+        logits_output.next_token_logprobs = (
+            (selected_logits / expanded_temperature) - lse_col
+        ).clamp(min=min_val).view(bs, max_accept)
+        if want_top_logprobs:
+            top_logprobs_nums_expanded = [
+                num for num in batch.top_logprobs_nums for _ in range(max_accept)
+            ]
+            max_k = max(top_logprobs_nums_expanded)
+            top_vals = (unmasked_topk_scaled[:, :max_k] - lse_col).clamp(min=min_val)
+            top_idx = topk_indices[:, :max_k]
+            if all(k == max_k for k in top_logprobs_nums_expanded):
+                logits_output.next_token_top_logprobs_val = top_vals.contiguous()
+                logits_output.next_token_top_logprobs_idx = top_idx.contiguous()
+            else:
+                logits_output.next_token_top_logprobs_val = [
+                    top_vals[i][:k] for i, k in enumerate(top_logprobs_nums_expanded)
+                ]
+                logits_output.next_token_top_logprobs_idx = [
+                    top_idx[i][:k] for i, k in enumerate(top_logprobs_nums_expanded)
+                ]
+        return
+
     if batch.sampling_info.is_all_greedy or envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
         gathered_logprobs = torch.nn.functional.log_softmax(gathered_logits, dim=-1)
     else:
@@ -425,22 +481,29 @@ def compute_spec_logprobs(
         gathered_logprobs = torch.nn.functional.log_softmax(
             gathered_logits / temperatures, dim=-1
         )
-    gathered_logprobs.clamp_(min=torch.finfo(gathered_logprobs.dtype).min)
+    min_val = torch.finfo(gathered_logprobs.dtype).min
+    if want_token_ids_logprobs:
+        gathered_logprobs.clamp_(min=min_val)
 
-    logits_output.next_token_logprobs = gathered_logprobs.gather(
-        1, accepted_token_ids.long().view(-1, 1)
-    ).view(bs, max_accept)
+    logits_output.next_token_logprobs = (
+        gathered_logprobs.gather(1, accepted_token_ids.long().view(-1, 1))
+        .clamp(min=min_val)
+        .view(bs, max_accept)
+    )
 
-    if batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
+    if want_top_logprobs:
         top_logprobs_nums_expanded = [
             num for num in batch.top_logprobs_nums for _ in range(max_accept)
         ]
-        (
-            logits_output.next_token_top_logprobs_val,
-            logits_output.next_token_top_logprobs_idx,
-        ) = get_top_logprobs(
+        vals, idxs = get_top_logprobs(
             gathered_logprobs, top_logprobs_nums_expanded, no_copy_to_cpu=True
         )
+        if torch.is_tensor(vals):
+            vals = vals.clamp(min=min_val)
+        else:
+            vals = [v.clamp(min=min_val) if torch.is_tensor(v) else v for v in vals]
+        logits_output.next_token_top_logprobs_val = vals
+        logits_output.next_token_top_logprobs_idx = idxs
 
     if batch.token_ids_logprobs and any(
         x is not None for x in batch.token_ids_logprobs

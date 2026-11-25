@@ -269,53 +269,42 @@ def test_shared_w8a8_output_dtype():
     assert not torch.equal(fp16.cpu(), default.cpu().half())
 
 
-def test_joint_g32_bf16_activations():
+def test_routed_g32_bf16_activations():
     """FP16 intermediates change SwiGLU rounding and overflow finite down outputs."""
-    from sglang.srt.hardware_backend.npu.dsv41.joint_experts import run_joint_experts
     from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.router import Router
     from sglang.srt.hardware_backend.npu.dsv41.moe import ResidentMXFP4Method
-    from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
     torch.npu.set_device(0)
     width = 256
 
     def weights(channel):
-        # Both experts use all-one integer weights with unit G32 factors.
         n = channel.numel()
         codes = torch.full((n, width // 2), 0x11, dtype=torch.uint8)
         factors = torch.full((n, width // 64), 0x88, dtype=torch.uint8)
         metadata = torch.cat((factors, channel.view(torch.uint8).view(n, 4)), dim=1)
-        routed = tuple(t[None].npu() for t in int4_g32_a8.pack_g32(codes, metadata))
-        shared = SimpleNamespace(
-            weight=npu_format_cast(torch.ones(width, n, dtype=torch.int8).npu()),
-            weight_scale_inv=channel.npu(),
-        )
-        return routed, shared
+        return tuple(t[None].npu() for t in int4_g32_a8.pack_g32(codes, metadata))
 
     gate_scale = 1.003 / width
     down_scale = torch.tensor([1.0, 1024.0]).repeat(width // 2)
-    gate, shared_gate = weights(torch.full((2 * width,), gate_scale))
-    down, shared_down = weights(down_scale)
+    gate = weights(torch.full((2 * width,), gate_scale))
+    down = weights(down_scale)
     method = ResidentMXFP4Method(g32=True)
     method.h = method.i = width
     method.e = method.ep = 1
     method.limit = 10.0
     method.local_experts = method.bind_local_experts(gate, down)
-    shared = SimpleNamespace(gate_up_proj=shared_gate, down_proj=shared_down)
     hidden = torch.ones(1, width, dtype=torch.bfloat16, device="npu")
     ids = torch.zeros((1, 1), dtype=torch.int32, device="npu")
     plan = Router().bucket(ids, torch.ones_like(ids, dtype=torch.float32), 0, 1)
 
     def run():
-        return run_joint_experts(method, shared, hidden, plan, slice(None))
+        return method.routed(hidden, plan)
 
-    def check(outputs, sign):
-        # For a constant row the sum after each unnormalized H32 is width * input.
+    def check(output, sign):
         z = torch.tensor(sign * width * gate_scale).bfloat16().float()
         mid = (torch.nn.functional.silu(z) * z).bfloat16().float()
         expected = (width * mid * down_scale).bfloat16().unsqueeze(0)
-        for output in outputs:
-            torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
 
     stream = torch.npu.Stream()
     stream.wait_stream(torch.npu.current_stream())
@@ -323,52 +312,42 @@ def test_joint_g32_bf16_activations():
         check(run(), 1)
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph, stream=stream, auto_dispatch_capture=True):
-            outputs = run()
+            output = run()
         hidden.neg_()
         graph.replay()
-        check(outputs, -1)
+        check(output, -1)
 
 
-@pytest.mark.parametrize("shared_rows,capacity", [(0, 7), (3, 0), (1, 6), (3, 150)])
+@pytest.mark.parametrize("capacity", [7, 6, 150])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_joint_swiglu_and_separate_h32(shared_rows, capacity, dtype):
+def test_prefix_swiglu_and_h32_quant(capacity, dtype):
     from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.elementwise import (
         PackedClippedSwiGLU,
-    )
-    from sglang.srt.hardware_backend.npu.dsv41.kernels.runtime.native import (
-        load_library,
     )
 
     import torch_npu  # noqa: F401
 
     torch.npu.set_device(0)
     width = 2304
-    library = load_library()
-    split = PackedClippedSwiGLU(
-        dimension=width, dtype="f16" if dtype == torch.float16 else "bf16"
-    )
-    shared, routed = [
-        torch.randn(rows, 2 * width).mul_(8).to(dtype).npu()
-        for rows in (shared_rows, capacity)
-    ]
-    out = shared.new_full((shared_rows + capacity, width), -123)
+    dtype_name = "f16" if dtype == torch.float16 else "bf16"
+    split = PackedClippedSwiGLU(dimension=width, dtype=dtype_name)
+    prefix = PackedClippedSwiGLU(dimension=width, dtype=dtype_name, prefix=True)
+    routed = torch.randn(capacity, 2 * width).mul_(8).to(dtype).npu()
+    out = routed.new_full((capacity, width), -123)
     count = torch.tensor([capacity], dtype=torch.int32).npu()
 
     def run():
-        library.joint_swiglu(
-            shared, routed, count, out[:shared_rows], out[shared_rows:], 10.0
-        )
-        return h32_quant(out, True, count=count, shared_rows=shared_rows)
+        prefix(routed, out=out, rows=count)
+        return h32_quant(out, True, count=count)
 
     def check(live, codes, scales):
-        parts = [split(part) for part in (shared, routed[:live]) if len(part)]
-        if parts:
-            expected = torch.cat(parts)
-            torch.testing.assert_close(out[: len(expected)], expected, atol=0, rtol=0)
+        if live:
+            expected = split(routed[:live])
+            torch.testing.assert_close(out[:live], expected, atol=0, rtol=0)
             ref_codes, ref_scales = h32_quant(expected, True)
-            assert torch.equal(codes[: len(expected)], ref_codes)
-            assert torch.equal(scales[: len(expected)], ref_scales)
-        assert (out[shared_rows + live :] == -123).all().item()
+            assert torch.equal(codes[:live], ref_codes)
+            assert torch.equal(scales[:live], ref_scales)
+        assert (out[live:] == -123).all().item()
 
     check(capacity, *run())
     graph = torch.npu.NPUGraph()
@@ -377,7 +356,6 @@ def test_joint_swiglu_and_separate_h32(shared_rows, capacity, dtype):
     for live in (0, capacity // 2, capacity):
         out.fill_(-123)
         count.fill_(live)
-        shared.neg_()
         routed.neg_()
         graph.replay()
         check(live, codes, scales)

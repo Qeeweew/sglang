@@ -3,22 +3,19 @@
 #include "actual_entry.h"
 #include "torch.h"
 namespace {
-enum class Operation : uint64_t { Rms, SwiGlu, JointSwiGlu };
+enum class Operation : uint64_t { Rms, SwiGlu };
 using Entries = native_jit::ActualEntries<8>;
-uint64_t swiglu_tiles(uint64_t rows, uint64_t shared_rows, uint32_t tile_rows) {
-    return (shared_rows + tile_rows - 1) / tile_rows + (rows - shared_rows + tile_rows - 1) / tile_rows;
-}
 native_jit::Kernel &entry(Operation operation, uint64_t rows, uint32_t width, uint32_t budget,
-                          bool packed = false, bool fp16 = false, bool prefix = false, uint64_t shared_rows = 0) {
+                          bool packed = false, bool fp16 = false, bool prefix = false) {
     static thread_local Entries entries;
     const uint32_t tile_rows =
         operation == Operation::Rms ? 1 : elementwise::tile_rows(rows, width, budget);
-    const uint64_t tiles = swiglu_tiles(rows, shared_rows, tile_rows);
+    const uint64_t tiles = (rows + tile_rows - 1) / tile_rows;
     const uint32_t workers = budget;
     const Entries::Key key{
         uint64_t(operation), uint64_t(tiles <= workers), width, tile_rows, packed, fp16, prefix, workers};
     return entries.get(key, [&] {
-        std::string tag = operation == Operation::Rms ? "rms_norm" : operation == Operation::JointSwiGlu ? "joint_swiglu" : "swiglu";
+        std::string tag = operation == Operation::Rms ? "rms_norm" : "swiglu";
         for (auto value : key)
             tag += "_" + std::to_string(value);
         std::vector<std::string> flags{"--cce-auto-sync=off",
@@ -29,8 +26,6 @@ native_jit::Kernel &entry(Operation operation, uint64_t rows, uint32_t width, ui
                                        "-DELEMENTWISE_PREFIX=" + std::to_string(prefix)};
         if (operation == Operation::Rms)
             flags.emplace_back("-DELEMENTWISE_RMS=1");
-        if (operation == Operation::JointSwiGlu)
-            flags.emplace_back("-DELEMENTWISE_JOINT=1");
         if (fp16)
             flags.emplace_back("-DELEMENTWISE_STORAGE_FP16=1");
         if (tiles <= workers)
@@ -72,17 +67,11 @@ extern "C" void dsv41_rms_norm_launch(void *stream, uint32_t blocks, uint8_t *in
 }
 extern "C" void dsv41_swiglu_launch(void *stream, uint32_t blocks, uint8_t *gate, uint8_t *up,
                                     uint8_t *count, uint8_t *output, int64_t capacity,
-                                    uint32_t width, float limit, bool packed, bool fp16, bool joint,
-                                    int64_t shared_rows, uint8_t *shared_output) {
+                                    uint32_t width, float limit, bool packed, bool fp16) {
     const uint32_t tile_rows = elementwise::tile_rows(capacity, width, blocks);
-    auto &kernel = entry(joint ? Operation::JointSwiGlu : Operation::SwiGlu, capacity, width, blocks,
-                         packed, fp16, count != nullptr, shared_rows);
-    const auto tiles = swiglu_tiles(capacity, shared_rows, tile_rows);
-    if (joint)
-        kernel.launch_persistent(stream, tiles, gate, up, count, output, limit, capacity - shared_rows,
-                                 shared_output, shared_rows);
-    else
-        kernel.launch_persistent(stream, tiles, gate, up, count, output, limit, capacity);
+    auto &kernel = entry(Operation::SwiGlu, capacity, width, blocks, packed, fp16, count != nullptr);
+    const uint64_t tiles = (capacity + tile_rows - 1) / tile_rows;
+    kernel.launch_persistent(stream, tiles, gate, up, count, output, limit, capacity);
 }
 TORCH_LIBRARY_FRAGMENT(dsv41, m) {
     m.def("precompile_elementwise(str operation, int rows, int width, int workers, bool "

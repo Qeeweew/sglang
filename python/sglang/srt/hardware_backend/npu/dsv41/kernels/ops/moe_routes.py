@@ -16,7 +16,7 @@ class MoERoutes(NativeOperator):
         super().__init__(device)
         self.library = load_library()
 
-    def bind_gather(self, x, routing, *, out, inverse, shared=None, first=0):
+    def bind_gather(self, x, routing, *, out, inverse):
         from functools import partial
 
         args = (
@@ -26,8 +26,6 @@ class MoERoutes(NativeOperator):
             out,
             inverse,
             routing.ids.shape[1],
-            shared,
-            first,
         )
         self.library.prepare_route_gather(*args)
         return partial(
@@ -36,8 +34,6 @@ class MoERoutes(NativeOperator):
             routing,
             out=out,
             inverse=inverse,
-            shared=shared,
-            first=first,
         )
 
     def bind_combine(self, values, inverse, routing, *, out):
@@ -48,7 +44,7 @@ class MoERoutes(NativeOperator):
         )
         return partial(self.combine, values, inverse, routing, out=out)
 
-    def gather(self, x, routing, *, out=None, inverse=None, shared=None, first=0):
+    def gather(self, x, routing, *, out=None, inverse=None):
         """Gather valid expert rows; out capacity must cover metadata[1].
 
         An eager EP caller may use its exact local count. Inverse always covers
@@ -62,7 +58,7 @@ class MoERoutes(NativeOperator):
         )
         inverse = routing.order.new_empty(rows * topk) if inverse is None else inverse
         self.library.route_gather(
-            x, routing.order, routing.metadata, out, inverse, topk, shared, first
+            x, routing.order, routing.metadata, out, inverse, topk
         )
         return out, inverse
 

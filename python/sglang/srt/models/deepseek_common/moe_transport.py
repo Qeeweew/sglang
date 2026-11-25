@@ -5,7 +5,6 @@ from contextlib import contextmanager, nullcontext
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.dsv41 import parallel as _dsv41_parallel
 from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import (
@@ -41,7 +40,6 @@ _is_hip = is_hip()
 SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 
 
-@_dsv41_parallel.adapt_shared_before_gather
 def shared_expert_runs_locally(moe):
     """Whether the replicated shared expert can run before the DP gather."""
     return (

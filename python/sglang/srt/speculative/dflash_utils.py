@@ -1217,6 +1217,7 @@ def build_speculative_verify_target_probs(
             # the raw logits and scale only the selected values.
             topk_logits, topk_indices = radix_topk(next_token_logits, max_top_k)
             topk_logits = topk_logits / expanded_temperature
+            unmasked_topk_scaled = topk_logits
             if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
                 ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[
                     None, :
@@ -1225,6 +1226,7 @@ def build_speculative_verify_target_probs(
                 topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
 
             topk_probs = F.softmax(topk_logits, dim=-1)
+            full_lse = None
             if need_top_p:
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
@@ -1236,12 +1238,20 @@ def build_speculative_verify_target_probs(
                     ).squeeze(-1)
                 else:
                     # Preserve the existing rounding for seeded sampling and other backends.
+                    full_lse = torch.logsumexp(scaled_logits, dim=-1)
                     topk_mass = torch.exp(
-                        torch.logsumexp(topk_logits, dim=-1)
-                        - torch.logsumexp(scaled_logits, dim=-1)
+                        torch.logsumexp(topk_logits, dim=-1) - full_lse
                     )
                     adjusted_top_ps = torch.clamp(repeated_top_ps / topk_mass, max=1.0)
                 topk_probs = _dflash_top_p_renorm_prob(topk_probs, adjusted_top_ps)
+            if device.type == "npu" and full_lse is not None:
+                next_token_logits._dsv41_spec_logprob_cache = (
+                    sampling_info.temperatures,
+                    expanded_temperature,
+                    unmasked_topk_scaled,
+                    topk_indices,
+                    full_lse,
+                )
 
             target_probs = topk_probs.new_zeros(next_token_logits.shape)
             target_probs.scatter_(1, topk_indices, topk_probs)

@@ -1,4 +1,4 @@
-"""Fixed-budget MoE windows preserve routing masks and shared-expert owners."""
+"""Fixed-budget MoE windows preserve routing masks."""
 
 import os
 from types import SimpleNamespace
@@ -12,26 +12,23 @@ from sglang.srt.runtime_context import get_forward
 
 
 @pytest.mark.parametrize(
-    "rows,stride,counts,valid,owner",
+    "rows,stride,counts,valid",
     [
-        (16384, None, None, None, None),
-        (32768, None, None, 27111, slice(4090, 9200)),
-        (1025, None, None, 903, slice(None)),
-        (1000, 200, [123, 0, 200, 1, 175], None, slice(401, 510)),
-        (1035, 345, [258, 100, 344], None, slice(338, 352)),
+        (16384, None, None, None),
+        (32768, None, None, 27111),
+        (1025, None, None, 903),
+        (1000, 200, [123, 0, 200, 1, 175], None),
+        (1035, 345, [258, 100, 344], None),
     ],
 )
-def test_window_output_slices_and_masks(
-    monkeypatch, rows, stride, counts, valid, owner
-):
+def test_window_output_slices_and_masks(monkeypatch, rows, stride, counts, valid):
     budget = 256
     monkeypatch.setattr(moe, "NO_SYNC_PREFILL_TOKENS", budget)
     hidden = (torch.arange(rows) % 63).to(torch.bfloat16).reshape(-1, 1)
     image_mask = (torch.arange(rows) % 7 == 0).int()
     seen = []
-    shared_parts = []
 
-    def run(x, dp_counts, dp_stride, valid_rows, mask, owned, *, out, window_budget):
+    def run(x, dp_counts, dp_stride, valid_rows, mask, *, out, window_budget):
         size = x.shape[0]
         assert 0 < size <= window_budget <= budget
         seen.append((out.untyped_storage().data_ptr(), out.storage_offset(), size))
@@ -44,16 +41,12 @@ def test_window_output_slices_and_masks(
         else:
             live = live >= 0
         out.copy_(torch.where(live[:, None], x + mask[:, None], 0))
-        shared = None
-        if owned is not None and x[owned].shape[0]:
-            shared = x[owned] * 2
-            shared_parts.append(shared)
-        return out, shared
+        return out
 
     with patch.object(
         torch.Tensor, "item", side_effect=AssertionError("read device scalar")
     ):
-        routed, shared = moe._run_expert_windows(
+        routed = moe._run_expert_windows(
             hidden,
             run,
             counts=torch.tensor(counts, dtype=torch.int64)
@@ -64,7 +57,6 @@ def test_window_output_slices_and_masks(
             if valid is not None
             else None,
             image_mask=image_mask,
-            owned=owner,
         )
     expected_live = torch.ones(rows, dtype=torch.bool)
     if counts is not None:
@@ -80,12 +72,6 @@ def test_window_output_slices_and_masks(
         assert storage == routed.data_ptr() and offset == start
         start += size
     assert start == rows
-    if owner is not None:
-        torch.testing.assert_close(shared, hidden[owner] * 2)
-        if len(shared_parts) == 1:
-            assert shared is shared_parts[0]
-    else:
-        assert shared is None
 
 
 def _resident_experts(g32):
@@ -169,17 +155,17 @@ class _Gate:
 
 @pytest.mark.skipif(os.getenv("SGLANG_DSV41_TEST_NPU") != "1", reason="opt-in 910B")
 @pytest.mark.parametrize(
-    "g32,rows,budget,stride,counts,valid,owner",
+    "g32,rows,budget,stride,counts,valid",
     [
-        (False, 16384, 8192, None, None, None, None),
-        (False, 32768, 8192, None, None, None, slice(9000, 9200)),
-        (False, 1025, 256, None, None, 778, slice(0, 0)),
-        (True, 1040, 256, 208, [208, 1, 0, 207, 200], None, slice(120, 302)),
-        (True, 1035, 256, 345, [300, 42, 344], None, None),
+        (False, 16384, 8192, None, None, None),
+        (False, 32768, 8192, None, None, None),
+        (False, 1025, 256, None, None, 778),
+        (True, 1040, 256, 208, [208, 1, 0, 207, 200], None),
+        (True, 1035, 256, 345, [300, 42, 344], None),
     ],
 )
 def test_native_windowed_moe_matches_unwindowed(
-    monkeypatch, g32, rows, budget, stride, counts, valid, owner
+    monkeypatch, g32, rows, budget, stride, counts, valid
 ):
     from sglang.srt import runtime_context
     from sglang.srt.hardware_backend.npu.dsv41.kernels.ops.router import Router
@@ -237,11 +223,10 @@ def test_native_windowed_moe_matches_unwindowed(
             hidden,
             batch,
             input_ids_global=ids,
-            skip_shared_experts=owner is not None,
-            return_moe_output=owner is None,
-            joint_shared_slice=owner,
+            skip_shared_experts=True,
+            return_moe_output=True,
         )
-        return result if owner is not None else (result.routed, result.shared)
+        return (result.routed, result.shared)
 
     token = parallel._in_moe.set(True)
     try:
@@ -276,12 +261,14 @@ def test_peer_combine_keeps_single_window_fast_path():
     hidden = torch.empty((12, 1))
     deferred = object()
     with get_forward().scoped(npu_defer_route_combine=True):
-        assert moe._run_expert_windows(
-            hidden,
-            lambda *args: (deferred, None),
-            counts=None,
-            stride=None,
-            valid=None,
-            image_mask=None,
-            owned=None,
-        ) == (deferred, None)
+        assert (
+            moe._run_expert_windows(
+                hidden,
+                lambda *args: deferred,
+                counts=None,
+                stride=None,
+                valid=None,
+                image_mask=None,
+            )
+            is deferred
+        )

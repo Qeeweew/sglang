@@ -24,7 +24,7 @@ from sglang.srt.runtime_context import (
 )
 
 # The TP2 payload starts after the 16-worker IPC control page (layout.h).
-_GROUP_GATHER_CAPACITY = 8 * 1024 * 1024 - (5 * 16 + 3) * 512
+_GROUP_GATHER_CAPACITY = 8 * 1024 * 1024 - (5 * 40 + 3) * 512
 
 
 class PeerCommunicator:
@@ -222,13 +222,6 @@ class DeferredMoE:
 class PeerMoE(PeerCommunicator):
     world = 8
 
-    def gather(self, input, output):
-        from sglang.kernels.ops.communication.npu_peer_collectives import (
-            npu_peer_moe_gather,
-        )
-
-        return npu_peer_moe_gather(input, output, self.handle)
-
     def finish(self, partial, shared, rows):
         from sglang.kernels.ops.communication.npu_peer_collectives import (
             npu_peer_moe_return,
@@ -261,7 +254,7 @@ def moe_communicator(input, group, *, attention_tp=None):
     ):
         return None
     tp = get_parallel().attn_tp_size if attention_tp is None else attention_tp
-    if not 0 < input.shape[0] <= 64 * tp or get_forward().multi_stream:
+    if not 0 < input.shape[0] <= 128 * tp or get_forward().multi_stream:
         return None
     key = f"dsv41_peer_moe:{id(group.cpu_group)}:{input.device}:tp{tp}"
     comm = get_buffer(key, lambda: PeerMoE(group.cpu_group, input.device, tp))
@@ -322,7 +315,7 @@ def try_draft_stage(stage, positions, hidden_states, batch, previous_pre):
     group_sharded = getattr(batch, "_dsv41_group_moe_rows", None) is not None
     attention_tp = 1 if group_sharded else get_parallel().attn_tp_size
     if (
-        not 0 < hidden_states.shape[0] <= 64 * attention_tp
+        not 0 < hidden_states.shape[0] <= 128 * attention_tp
         or not moe_sequence_parallel_enabled(get_parallel())
         or get_forward().multi_stream
     ):
@@ -348,11 +341,19 @@ def try_draft_stage(stage, positions, hidden_states, batch, previous_pre):
         residual, normalized = operator().post_combine(
             y, hidden_states, pre, post_mix, comb, weight
         )
-    with get_forward().scoped(npu_defer_moe_post=True):
+    from . import mhc as _dsv41_mhc
+
+    with (
+        get_forward().scoped(npu_defer_moe_post=True),
+        _dsv41_mhc.moe_stats_scope(stage.ffn_hc, residual) as _draft_stats_box,
+    ):
         y = stage._run_moe_ffn_dp_sync(
             normalized, batch, input_ids=None, input_ids_global=None
         )
-    pre, post_mix, comb = mhc.mix_stats(stage.ffn_hc, residual, None)
+    if _draft_stats_box is not None and _draft_stats_box[2] is not None:
+        pre, post_mix, comb = _draft_stats_box[2]
+    else:
+        pre, post_mix, comb = mhc.mix_stats(stage.ffn_hc, residual, None)
     if isinstance(y, DeferredMoE):
         updated, _ = post(y, residual, pre, post_mix, comb, None)
     else:

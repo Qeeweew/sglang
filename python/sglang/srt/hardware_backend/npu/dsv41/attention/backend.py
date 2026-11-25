@@ -944,8 +944,16 @@ class DSV41AttentionBackend(AttentionBackend):
     def store_compressed_kv(self, layer, latent, rope_positions, slots):
         trig = gather_rope(layer.freqs_cis, rope_positions)
         if layer.indexer is not None and layer.indexer.owns_k:
+            import torch_npu
+
             index = layer.indexer
-            key = index.k_norm(index.wk(latent))
+            key_raw = index.wk(latent)
+            if hasattr(index.k_norm, "variance_epsilon"):
+                key = torch_npu.npu_rms_norm(
+                    key_raw, index.k_norm.weight, index.k_norm.variance_epsilon
+                )[0]
+            else:
+                key = index.k_norm(key_raw)
             codes, scale = self.position.quantize_key(
                 key.contiguous(), cos=trig.cos, sin=trig.sin
             )
@@ -1018,11 +1026,18 @@ class DSV41AttentionBackend(AttentionBackend):
             q, _ = index.wq_b(q_lora)
             q = q.view(-1, 32, 128).contiguous()
             pos = positions.long()
-            trig = (
-                gather_rope(layer.freqs_cis, pos)
-                if verify
-                else cached_rope(layer.freqs_cis, pos, forward_batch)
-            )
+            if verify:
+                vmemo = getattr(forward_batch, "_dsv41_verify_rope_memo", None)
+                if vmemo is None:
+                    vmemo = {}
+                    forward_batch._dsv41_verify_rope_memo = vmemo
+                vkey = (id(layer.freqs_cis), positions.data_ptr(), positions.shape)
+                trig = vmemo.get(vkey)
+                if trig is None:
+                    trig = gather_rope(layer.freqs_cis, pos)
+                    vmemo[vkey] = trig
+            else:
+                trig = cached_rope(layer.freqs_cis, pos, forward_batch)
             codes, qscale = self.position.quantize_query(q, cos=trig.cos, sin=trig.sin)
             weight, _ = index.weights_proj(x)
             weight = (weight.float() * index.head_weight_scale).half().contiguous()
