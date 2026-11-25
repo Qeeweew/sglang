@@ -11,6 +11,65 @@ from sglang.srt.hardware_backend.npu.dsv41.attention.request_window import (
 )
 
 
+def test_reused_position_buffer_uses_current_rope():
+    """Verify must rotate Indexer Q using the positions written by the latest forward."""
+    from sglang.srt.hardware_backend.npu.dsv41.attention.backend import (
+        DSV41AttentionBackend,
+    )
+    from sglang.srt.hardware_backend.npu.dsv41.attention.projections import prime_rope
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+
+    positions = torch.tensor([0, 1])
+    angles = torch.arange(3, dtype=torch.float32)[:, None].expand(-1, 32)
+    layer = SimpleNamespace(
+        layer_id=0,
+        compress_ratio=1,
+        compressor=None,
+        freqs_cis=torch.polar(torch.ones_like(angles), angles),
+        indexer=SimpleNamespace(
+            wq_b=lambda q: (q, None),
+            weights_proj=lambda x: (x, None),
+            head_weight_scale=1.0,
+        ),
+    )
+    observed = []
+
+    def quantize_query(q, *, cos, sin):
+        observed.append(torch.complex(cos, sin))
+        return q, None
+
+    index_pool = SimpleNamespace(
+        index_k_buffer=[torch.empty(128, 128)],
+        index_scale_buffer=[torch.empty(128)],
+    )
+    backend = SimpleNamespace(
+        forward_metadata=SimpleNamespace(
+            tail_source=None,
+            plans={0: SimpleNamespace(mode=3, run=lambda *args, **kwargs: None)},
+            indices={1: torch.empty(2, 1, 512, dtype=torch.int32)},
+            rows=2,
+        ),
+        position=SimpleNamespace(quantize_query=quantize_query),
+        pool=SimpleNamespace(
+            index_pools={1: index_pool},
+            layer_mapping={0: SimpleNamespace(compress_layer_id=0)},
+        ),
+    )
+    batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+    for live_positions in (torch.tensor([0, 1]), torch.tensor([1, 2])):
+        positions.copy_(live_positions)
+        prime_rope([layer], batch, positions)
+        DSV41AttentionBackend.forward_low_ratio_sources(
+            backend,
+            layer=layer,
+            x=torch.zeros(2, 32),
+            q_lora=torch.zeros(2, 32 * 128),
+            positions=positions,
+            forward_batch=batch,
+        )
+        torch.testing.assert_close(observed[-1], layer.freqs_cis[live_positions])
+
+
 @pytest.mark.parametrize("width,role", [(1, "forward"), (6, "commit")])
 def test_grouped_swa_commit_follows_request_across_lanes(monkeypatch, width, role):
     capacity, layers = 128, 3
