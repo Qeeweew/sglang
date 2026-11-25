@@ -1,6 +1,6 @@
 """Row ownership within a mirrored 910B attention group."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import prod
 
 import torch
@@ -330,6 +330,8 @@ class MoeRows:
     split_at_moe: bool
     global_input_ids: torch.Tensor | None = None
     rank_counts_cpu: tuple[int, ...] | None = None
+    # Compacted rows use dataclasses.replace and must derive their own mask.
+    image_mask: torch.Tensor | None = field(default=None, init=False)
 
 
 def prepare_moe_rows(
